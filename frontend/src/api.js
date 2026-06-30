@@ -3,15 +3,17 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 // Ask a question with LIVE status updates (streaming).
 // callbacks: onStatus(msg), onResult(data), onError(msg)
-export async function streamQuestion(question, sessionId, { onStatus, onResult, onError }) {
+export async function streamQuestion(question, sessionId, { onStatus, onResult, onError, signal }) {
   let res
   try {
     res = await fetch(`${API_URL}/chat/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question, session_id: sessionId }),
+      signal,
     })
-  } catch {
+  } catch (e) {
+    if (e?.name === 'AbortError') return
     onError('Cannot reach the server.')
     return
   }
@@ -23,21 +25,25 @@ export async function streamQuestion(question, sessionId, { onStatus, onResult, 
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let idx
-    while ((idx = buffer.indexOf('\n\n')) >= 0) {
-      const raw = buffer.slice(0, idx).replace(/^data: /, '').trim()
-      buffer = buffer.slice(idx + 2)
-      if (!raw) continue
-      let evt
-      try { evt = JSON.parse(raw) } catch { continue }
-      if (evt.type === 'status') onStatus(evt.message)
-      else if (evt.type === 'result') onResult(evt.data)
-      else if (evt.type === 'error') onError(evt.message)
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = buffer.indexOf('\n\n')) >= 0) {
+        const raw = buffer.slice(0, idx).replace(/^data: /, '').trim()
+        buffer = buffer.slice(idx + 2)
+        if (!raw) continue
+        let evt
+        try { evt = JSON.parse(raw) } catch { continue }
+        if (evt.type === 'status') onStatus(evt.message)
+        else if (evt.type === 'result') onResult(evt.data)
+        else if (evt.type === 'error') onError(evt.message)
+      }
     }
+  } catch (e) {
+    if (e?.name !== 'AbortError') onError('Connection interrupted.')
   }
 }
 
@@ -69,6 +75,16 @@ export async function exportData(query, format) {
   a.click()
   a.remove()
   URL.revokeObjectURL(url)
+}
+
+// Upload an image or file to the backend. Returns { file_id, filename, ... }.
+// Used by the composer's image/file pickers; see /upload in app/api/main.py.
+export async function uploadFile(file) {
+  const form = new FormData()
+  form.append('file', file)
+  const res = await fetch(`${API_URL}/upload`, { method: 'POST', body: form })
+  if (!res.ok) throw new Error(`Upload failed (${res.status}).`)
+  return res.json()
 }
 
 export async function checkHealth() {

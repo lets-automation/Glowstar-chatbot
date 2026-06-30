@@ -94,10 +94,13 @@ def ask_groq(
                     "Sorry, I had trouble forming that query. Please try "
                     "rephrasing the question."
                 )
+            # ok=False: the turn failed (no real answer), so the UI must not
+            # offer export even though some SQL may have run before the failure.
             return {
                 "answer": answer,
                 "sql_used": sql_used,
                 "rows_returned": last_row_count,
+                "ok": False,
             }
 
         msg = response.choices[0].message
@@ -173,6 +176,7 @@ def ask_groq(
             ),
         }
     )
+    synth_ok = True
     try:
         final = client.chat.completions.create(
             model=model, messages=messages, temperature=0.3, max_tokens=1024
@@ -181,6 +185,7 @@ def ask_groq(
     except Exception as exc:
         log_interaction(question, sql_used, last_row_count, error=str(exc))
         answer = ""
+        synth_ok = False  # couldn't form the final answer -> suppress export
 
     log_interaction(question, sql_used, last_row_count)
     return {
@@ -188,4 +193,5 @@ def ask_groq(
         "sql_used": sql_used,
         "rows_returned": last_row_count,
         "widgets": widgets,
+        "ok": synth_ok,
     }
