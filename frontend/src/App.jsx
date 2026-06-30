@@ -1,180 +1,147 @@
-import { useState, useRef, useEffect } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import { streamQuestion, exportData, checkHealth } from './api'
-import { Widget } from './SandboxedWidget'
+import { useEffect, useState } from 'react'
+import Sidebar from './components/Sidebar'
+import TopBar from './components/TopBar'
+import Hero from './components/Hero'
+import Thread from './components/Thread'
+import { useGlowstarRuntime } from './runtime/useGlowstarRuntime'
 
-// Markdown overrides: open external links safely; let wide tables scroll.
-const MD_COMPONENTS = {
-  a: ({ node, ...props }) => (
-    <a target="_blank" rel="noopener noreferrer" {...props} />
-  ),
-  table: ({ node, ...props }) => (
-    <div className="table-wrap"><table {...props} /></div>
-  ),
+const USER = {
+  name: 'Chintan',
+  avatar: 'https://api.dicebear.com/9.x/glass/svg?seed=Chintan&backgroundColor=A582EA,C9B6F5',
 }
 
-const STARTERS = [
-  'How many packets are on jangad?',
-  'Total final-packet value',
-  'How many employees are from Surat?',
-  'Total attendance punches this month',
-]
-
-// Session memory: one id per browser session (sessionStorage clears when the
-// app/tab is closed -> fresh memory next time; persists across reloads).
-function getSessionId() {
-  let id = sessionStorage.getItem('aastha_session')
-  if (!id) {
-    id = crypto?.randomUUID?.() || 'sess-' + Date.now() + '-' + Math.floor(Math.random() * 1e6)
-    sessionStorage.setItem('aastha_session', id)
-  }
-  return id
-}
+let attachSeq = 0
 
 export default function App() {
-  const [messages, setMessages] = useState([])
+  const rt = useGlowstarRuntime()
   const [input, setInput] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [status, setStatus] = useState('')
-  const [online, setOnline] = useState(null)
-  const sessionId = useRef(getSessionId()).current
-  const endRef = useRef(null)
+  const [attachments, setAttachments] = useState([])
+  const [collapsed, setCollapsed] = useState(false)
+  const [isMobile, setIsMobile] = useState(false)
 
-  useEffect(() => { checkHealth().then(setOnline) }, [])
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, status])
+  // Below 860px the sidebar collapses and, when opened, floats as an overlay
+  // instead of squeezing the main column.
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 860px)')
+    const apply = () => {
+      setIsMobile(mq.matches)
+      setCollapsed(mq.matches)
+    }
+    apply()
+    mq.addEventListener('change', apply)
+    return () => mq.removeEventListener('change', apply)
+  }, [])
 
-  async function send(text) {
-    const question = (text ?? input).trim()
-    if (!question || loading) return
-    setInput('')
-    setMessages((m) => [...m, { role: 'user', content: question }])
-    setLoading(true)
-    setStatus('Starting…')
+  const hasChat = rt.messages.length > 0
 
-    await streamQuestion(question, sessionId, {
-      onStatus: (msg) => setStatus(msg),
-      onResult: (data) => {
-        setMessages((m) => [...m, {
-          role: 'assistant',
-          userQuestion: question,
-          content: data.answer,
-          suggestions: data.suggestions || [],
-          citation: data.citation || '',
-          exportQuery: data.export_query || null,
-          widgets: data.widgets || [],
-          feedback: null,
-        }])
-        setLoading(false); setStatus('')
-      },
-      onError: (msg) => {
-        setMessages((m) => [...m, { role: 'assistant', error: msg }])
-        setLoading(false); setStatus('')
-      },
+  function addAttachments(files) {
+    const next = files.map((file) => ({
+      id: `att-${attachSeq++}`,
+      file,
+      name: file.name,
+      kind: file.type.startsWith('image/') ? 'image' : 'file',
+      preview: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
+    }))
+    setAttachments((a) => [...a, ...next])
+  }
+
+  function removeAttachment(id) {
+    setAttachments((a) => {
+      const gone = a.find((x) => x.id === id)
+      if (gone?.preview) URL.revokeObjectURL(gone.preview)
+      return a.filter((x) => x.id !== id)
     })
   }
 
-  function onSubmit(e) { e.preventDefault(); send() }
+  function submit() {
+    if (!input.trim() && attachments.length === 0) return
+    const text = input
+    const files = attachments
+    setInput('')
+    setAttachments([])
+    rt.send(text, files)
+  }
 
-  async function handleExport(query, format) {
-    try { await exportData(query, format) } catch { alert('Export failed') }
+  function clearAttachments() {
+    attachments.forEach((a) => a.preview && URL.revokeObjectURL(a.preview))
+    setAttachments([])
+  }
+
+  function newChat() {
+    rt.newChat()
+    setInput('')
+    clearAttachments()
+    if (isMobile) setCollapsed(true)
+  }
+
+  function selectThread(id) {
+    rt.selectThread(id)
+    setInput('')
+    clearAttachments()
+    if (isMobile) setCollapsed(true)
+  }
+
+  // Shared composer wiring for both the hero and the docked thread view.
+  const composerProps = {
+    value: input,
+    onChange: setInput,
+    onSubmit: submit,
+    isStreaming: rt.isStreaming,
+    onStop: rt.stop,
+    attachments,
+    onAttach: addAttachments,
+    onRemoveAttachment: removeAttachment,
   }
 
   return (
-    <div className="app">
-      <header className="header">
-        <div className="header-title">
-          <span className="logo" aria-hidden="true">
-            <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M12 2.6c.5 3.9 1.5 4.9 5.4 5.4-3.9.5-4.9 1.5-5.4 5.4-.5-3.9-1.5-4.9-5.4-5.4 3.9-.5 4.9-1.5 5.4-5.4z" />
-              <path d="M18.4 13.2c.3 2 .8 2.5 2.8 2.8-2 .3-2.5.8-2.8 2.8-.3-2-.8-2.5-2.8-2.8 2-.3 2.5-.8 2.8-2.8z" opacity="0.7" />
-            </svg>
-          </span>
-          <h1>GlowStar</h1>
-          <span className={`status ${online ? 'up' : 'down'}`}>
-            {online === null ? 'connecting' : online ? 'online' : 'offline'}
-          </span>
+    <div className="relative flex h-screen w-full overflow-hidden bg-bg">
+      {/* Soft lavender ambient bloom at the outer edges / right side */}
+      <div
+        className="pointer-events-none absolute inset-0 -z-0"
+        style={{
+          background:
+            'radial-gradient(80% 60% at 100% 0%, var(--bg-ambient) 0%, transparent 55%), radial-gradient(70% 50% at 0% 100%, #EFE7F4 0%, transparent 60%)',
+        }}
+      />
+
+      {/* Backdrop behind the mobile overlay sidebar */}
+      {!collapsed && isMobile && (
+        <div
+          className="fixed inset-0 z-40 bg-black/30"
+          onClick={() => setCollapsed(true)}
+          aria-hidden="true"
+        />
+      )}
+
+      {!collapsed && (
+        <div className={isMobile ? 'fixed inset-y-0 left-0 z-50 shadow-xl' : 'relative z-10'}>
+          <Sidebar
+            threads={rt.threads}
+            activeId={rt.activeId}
+            onNewChat={newChat}
+            onCollapse={() => setCollapsed(true)}
+            onSelect={selectThread}
+            onDelete={rt.deleteThread}
+          />
         </div>
-        <p>Your GlowStar assistant for packets, labour, jangad, attendance and more — just ask.</p>
-      </header>
+      )}
 
-      <main className="chat">
-        {messages.length === 0 && (
-          <div className="empty">
-            <p>Hello 👋 &nbsp;Here are a few things you can ask me:</p>
-            <div className="suggestions">
-              {STARTERS.map((s) => (
-                <button key={s} className="chip" onClick={() => send(s)}>{s}</button>
-              ))}
-            </div>
-          </div>
-        )}
+      <main className="relative z-10 flex min-w-0 flex-1 flex-col">
+        <TopBar user={USER} collapsed={collapsed} onExpand={() => setCollapsed(false)} />
 
-        {messages.map((m, i) => (
-          <div key={i} className={`msg ${m.role}`}>
-            <div className={`bubble ${m.widgets?.length ? 'wide' : ''}`}>
-              {m.error ? (
-                <span className="error">⚠️ {m.error}</span>
-              ) : (
-                <>
-                  {m.content && (
-                    m.role === 'assistant' ? (
-                      <div className="content markdown">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
-                          {m.content}
-                        </ReactMarkdown>
-                      </div>
-                    ) : (
-                      <div className="content">{m.content}</div>
-                    )
-                  )}
-
-                  {m.widgets?.map((w, wi) => (
-                    <Widget
-                      key={wi}
-                      code={w.code}
-                      title={w.title}
-                      onPrompt={(text) => send(text)}
-                    />
-                  ))}
-
-                  {m.citation && <div className="citation">{m.citation}</div>}
-
-                  {m.role === 'assistant' && m.exportQuery && (
-                    <div className="actions">
-                      <button className="exp" onClick={() => handleExport(m.exportQuery, 'excel')}>⬇ Excel</button>
-                      <button className="exp" onClick={() => handleExport(m.exportQuery, 'pdf')}>⬇ PDF</button>
-                    </div>
-                  )}
-
-                  {m.suggestions?.length > 0 && (
-                    <div className="followups">
-                      {m.suggestions.map((s) => (
-                        <button key={s} className="chip small" onClick={() => send(s)}>{s}</button>
-                      ))}
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          </div>
-        ))}
-
-        {loading && (
-          <div className="msg assistant">
-            <div className="bubble">
-              <span className="typing"><span className="spinner" /> {status || 'Working…'}</span>
-            </div>
-          </div>
-        )}
-        <div ref={endRef} />
+        <div className="min-h-0 flex-1">
+          {hasChat ? (
+            <Thread
+              messages={rt.messages}
+              isStreaming={rt.isStreaming}
+              status={rt.status}
+              composerProps={composerProps}
+            />
+          ) : (
+            <Hero userName={USER.name} composerProps={composerProps} onPickPrompt={setInput} />
+          )}
+        </div>
       </main>
-
-      <form className="composer" onSubmit={onSubmit}>
-        <input value={input} onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask a question…" disabled={loading} />
-        <button type="submit" disabled={loading || !input.trim()}>Send</button>
-      </form>
     </div>
   )
 }

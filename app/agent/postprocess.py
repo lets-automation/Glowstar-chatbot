@@ -66,13 +66,17 @@ def enrich(result: dict, now: datetime | None = None) -> dict:
     """
     clean, suggestions = extract_suggestions(result.get("answer", ""))
     sql_used = result.get("sql_used", [])
+    ok = result.get("ok", True)
     return {
         "answer": clean,
         "suggestions": suggestions,
         "citation": build_citation(sql_used, now),
-        "export_query": export_query(sql_used),
+        # Only offer export on a turn that actually succeeded — otherwise the
+        # exported file would contain results the chat couldn't present.
+        "export_query": export_query(sql_used) if ok else None,
         "sql_used": sql_used,
         "rows_returned": result.get("rows_returned", 0),
+        "ok": ok,
         # Inline visuals the model drew via show_widget; rendered in a sandboxed iframe.
         "widgets": result.get("widgets", []),
     }

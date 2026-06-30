@@ -93,6 +93,7 @@ def ask_anthropic(
             err = str(exc).lower()
             log_interaction(question, sql_used, last_row_count, error=str(exc))
             busy = "rate" in err or "429" in err or "quota" in err
+            # ok=False: the turn failed, so the UI must not offer export.
             return {
                 "answer": (
                     "The assistant is busy right now. Please try again shortly."
@@ -101,6 +102,7 @@ def ask_anthropic(
                 ),
                 "sql_used": sql_used,
                 "rows_returned": last_row_count,
+                "ok": False,
             }
 
         messages.append({"role": "assistant", "content": response.content})

@@ -15,7 +15,7 @@ Run it with:
 Then open the auto-docs at http://127.0.0.1:8000/docs
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -58,6 +58,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
+    ok: bool = True
     suggestions: list[str] = []
     citation: str = ""
     export_query: str | None = None
@@ -119,6 +120,7 @@ def chat(request: ChatRequest):
 
     return ChatResponse(
         answer=result["answer"],
+        ok=result.get("ok", True),
         suggestions=result.get("suggestions", []),
         citation=result.get("citation", ""),
         export_query=result.get("export_query"),
@@ -168,6 +170,41 @@ def chat_stream(request: ChatRequest):
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    """
+    Accept an image or file attachment from the chat composer and store it.
+
+    Saves to outputs/uploads/<file_id><ext> and returns a reference the client
+    keeps on the message. NOTE: this only persists the upload — feeding its
+    contents into the agent's reasoning (e.g. OCR a certificate image, or read
+    an Excel for extra context) is a deliberate next step, not done here.
+    """
+    import os
+    import uuid
+
+    # Basic guardrails: cap size and keep only the extension from the name.
+    MAX_BYTES = 15 * 1024 * 1024  # 15 MB
+    data = await file.read()
+    if len(data) > MAX_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 15 MB).")
+
+    upload_dir = os.path.join("outputs", "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    file_id = uuid.uuid4().hex
+    ext = os.path.splitext(file.filename or "")[1][:10]
+    path = os.path.join(upload_dir, f"{file_id}{ext}")
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+    return {
+        "file_id": file_id,
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "size": len(data),
+    }
 
 
 @app.post("/feedback")
