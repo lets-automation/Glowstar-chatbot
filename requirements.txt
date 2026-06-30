@@ -1,0 +1,21 @@
+# Core build dependencies
+anthropic
+groq
+fastapi
+uvicorn
+sqlalchemy
+pyodbc
+pydantic
+python-dotenv
+
+# Phase 6 - artifact generation
+openpyxl
+reportlab
+matplotlib
+
+# Phase 7 - semantic search (optional; needs Voyage + Pinecone keys)
+voyageai
+pinecone
+
+# Phase 8 - internal demo UI
+streamlit
