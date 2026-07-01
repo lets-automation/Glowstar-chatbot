@@ -13,8 +13,8 @@ export default function Hero({ userName, composerProps, onPickPrompt }) {
     <div className="scroll-quiet h-full overflow-y-auto">
       <div className="flex min-h-full items-center justify-center px-4 py-8 sm:px-6">
         <div className="flex w-full max-w-[680px] flex-col items-center lg:max-w-[780px] xl:max-w-[880px]">
-          {/* 3D orb — responsive box, fills with the canvas */}
-          <div className="animate-orb-float h-36 w-36 sm:h-48 sm:w-48 xl:h-60 xl:w-60">
+          {/* 3D orb — responsive box, the canvas fills it (orb has its own motion) */}
+          <div className="h-44 w-44 sm:h-56 sm:w-56 xl:h-64 xl:w-64">
             <Orb />
           </div>
 

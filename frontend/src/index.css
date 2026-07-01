@@ -90,6 +90,28 @@ body {
 .markdown tbody tr:nth-child(even) td { background: #FBFAFE; }
 .markdown td:not(:first-child), .markdown th:not(:first-child) { font-variant-numeric: tabular-nums; }
 
+/* Orb glow — ported verbatim from the original standalone page (.glow + pulse). */
+.orb-glow {
+  position: absolute;
+  width: 76%;
+  height: 76%;
+  border-radius: 50%;
+  background: radial-gradient(circle,
+    rgba(150, 108, 232, 0.42) 0%,
+    rgba(140, 98, 228, 0.18) 42%,
+    rgba(150, 108, 232, 0.00) 70%);
+  filter: blur(26px);
+  animation: orb-pulse 6s ease-in-out infinite;
+  z-index: 0;
+}
+@keyframes orb-pulse {
+  0%, 100% { transform: scale(0.96); opacity: 0.82; }
+  50%      { transform: scale(1.07); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .orb-glow { animation: none; }
+}
+
 /* Quiet lavender scrollbars */
 .scroll-quiet::-webkit-scrollbar { width: 9px; height: 9px; }
 .scroll-quiet::-webkit-scrollbar-thumb {
