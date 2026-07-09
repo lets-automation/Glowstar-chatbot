@@ -1,0 +1,114 @@
+# GlowStar chatbot - full stack: frontend, backend, database, redis.
+#
+# Quick start:
+#   docker compose up --build
+#   open http://localhost:8080
+#
+# First-time database setup (this stack does NOT invent/seed fake ERP data -
+# it starts an EMPTY SQL Server and expects your real AasthaErp backup):
+#   1. Drop your .bak file into ./db_backup/ (mounted into the db container).
+#   2. Restore it - either via SSMS connecting to localhost,1433 (sa / the
+#      DB_SA_PASSWORD from .env), or from a shell:
+#        docker compose exec db /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa \
+#          -P "$DB_SA_PASSWORD" -C -Q "RESTORE DATABASE AasthaErp FROM DISK = \
+#          '/var/opt/mssql/backup/YOUR_FILE.bak' WITH MOVE 'AasthaErp' TO \
+#          '/var/opt/mssql/data/AasthaErp.mdf', MOVE 'AasthaErp_log' TO \
+#          '/var/opt/mssql/data/AasthaErp_log.ldf'"
+#      (the logical file names after MOVE depend on your .bak - check with
+#      RESTORE FILELISTONLY FROM DISK = '...' first if unsure.)
+#   3. Create at least one chatbot login:
+#        docker compose exec backend python -m scripts.manage_users create \
+#          <username> <password> "<Display Name>"
+
+services:
+  # OPTIONAL self-contained database. NOT started by default — the backend
+  # connects to your real SQL Server (see the backend service). Start this only
+  # if you want a bundled copy instead:  docker compose --profile bundled-db up
+  # (then also point the backend's DB_SERVER back to `db`).
+  db:
+    profiles: ["bundled-db"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${DB_SA_PASSWORD}
+    volumes:
+      - mssql_data:/var/opt/mssql
+      - ./db_backup:/var/opt/mssql/backup
+    ports:
+      - "1433:1433"  # exposed so you can restore your .bak via SSMS from the host
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # SQL Server needs >= 2 GB; give headroom but cap so it can't eat the host.
+    mem_limit: 4g
+    cpus: "2.0"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    mem_limit: 512m
+    cpus: "0.5"
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    env_file:
+      - .env
+    environment:
+      # Connect to the REAL SQL Server on the host, as the read-only glowstar_ro
+      # login. These override the host-oriented values from .env (env_file loses
+      # to environment on the same key). On a Linux server, change DB_SERVER to
+      # the database's real hostname/IP. To use the bundled db container instead,
+      # set DB_SERVER: db, DB_USER: sa, DB_PASSWORD: ${DB_SA_PASSWORD}.
+      DB_SERVER: host.docker.internal
+      DB_NAME: AasthaErp
+      DB_USER: glowstar_ro
+      DB_PASSWORD: ${DB_RO_PASSWORD}
+      REDIS_URL: redis://redis:6379/0
+    # Make host.docker.internal resolve on Linux too (it's automatic on Docker
+    # Desktop for Windows/Mac, but this keeps the file portable).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"  # direct access to /docs; the frontend also reaches this by service name
+    volumes:
+      - uploads_data:/app/outputs
+      - logs_data:/app/logs
+    mem_limit: 1g
+    cpus: "1.5"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    mem_limit: 256m
+    cpus: "0.5"
+    restart: unless-stopped
+
+volumes:
+  mssql_data:
+  redis_data:
+  uploads_data:
+  logs_data:

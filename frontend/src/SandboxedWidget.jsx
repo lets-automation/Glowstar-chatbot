@@ -30,7 +30,7 @@ const TOKENS = `
   --surface-2:#fcfcfb; --surface-1:#f4f3ef; --surface-0:#eeede8;
   --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#898781;
   --border:rgba(11,11,11,.1); --border-strong:rgba(11,11,11,.18);
-  --bg-accent:#faeccb; --text-accent:#8a5a12; --border-accent:#e6c071;
+  --bg-accent:#F1EAFE; --text-accent:#8B5CF6; --border-accent:#C9B6F5;
   --bg-success:#e4f3ea; --text-success:#0a7d44; --border-success:#86c9a4;
   --bg-warning:#fbf0d8; --text-warning:#8a6310; --border-warning:#e6c878;
   --bg-danger:#fbe6e6; --text-danger:#b0322f; --border-danger:#e89b99;
@@ -64,6 +64,15 @@ function buildSrcDoc(code) {
   return `<!doctype html><html><head>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${CSP}">
+<script>
+/* Registered BEFORE the widget code so even its syntax errors are caught.
+   capture:true also catches failed resource loads (blocked/missing CDN). */
+window.addEventListener("error", function(e){
+  var msg = e && e.message ? String(e.message)
+    : (e && e.target && e.target.src ? "Failed to load: " + e.target.src : "Script error");
+  try { parent.postMessage({source:"widget", type:"error", message: msg}, "*"); } catch(_) {}
+}, true);
+<\/script>
 <style>${TOKENS}</style></head><body>
 ${code}
 <script>
@@ -89,6 +98,7 @@ ${code}
 export function SandboxedWidget({ code, onPrompt, onLink, minHeight = 80 }) {
   const ref = useRef(null)
   const [height, setHeight] = useState(minHeight)
+  const [scriptError, setScriptError] = useState(null)
   const srcDoc = useMemo(() => buildSrcDoc(code), [code])
 
   useEffect(() => {
@@ -103,6 +113,8 @@ export function SandboxedWidget({ code, onPrompt, onLink, minHeight = 80 }) {
         onPrompt?.(d.text)
       } else if (d.type === 'link') {
         onLink ? onLink(d.url) : window.open(d.url, '_blank', 'noopener,noreferrer')
+      } else if (d.type === 'error') {
+        setScriptError(d.message || 'Script error')
       }
     }
     window.addEventListener('message', onMsg)
@@ -110,15 +122,21 @@ export function SandboxedWidget({ code, onPrompt, onLink, minHeight = 80 }) {
   }, [onPrompt, onLink, minHeight])
 
   return (
-    <iframe
-      ref={ref}
-      title="widget"
-      /* allow-scripts WITHOUT allow-same-origin = null origin (cannot read parent
-         cookies / localStorage / DOM). NEVER add allow-same-origin. */
-      sandbox="allow-scripts"
-      srcDoc={srcDoc}
-      style={{ width: '100%', height, border: 'none', display: 'block', colorScheme: 'normal' }}
-    />
+    <>
+      <iframe
+        ref={ref}
+        title="widget"
+        /* allow-scripts WITHOUT allow-same-origin = null origin (cannot read parent
+           cookies / localStorage / DOM). NEVER add allow-same-origin. */
+        sandbox="allow-scripts"
+        srcDoc={srcDoc}
+        style={{ width: '100%', height, border: 'none', display: 'block', colorScheme: 'normal' }}
+      />
+      {/* Never show a silent blank box: if the widget's script failed, say so. */}
+      {scriptError && (
+        <div className="widget-error">⚠️ This visual failed to render ({scriptError})</div>
+      )}
+    </>
   )
 }
 

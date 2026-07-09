@@ -2,8 +2,8 @@ import { PanelLeftOpen } from 'lucide-react'
 
 /*
  * TopBar — minimal. Sidebar re-open button on the left (when collapsed); the
- * signed-in user's name in the right corner (name only — no email, no logout,
- * no model selector / share / export / upgrade).
+ * user's name in the right corner (name only — no email, no logout, no model
+ * selector / share / export / upgrade). No login, so nothing to sign out of.
  */
 export default function TopBar({ user, collapsed, onExpand }) {
   return (

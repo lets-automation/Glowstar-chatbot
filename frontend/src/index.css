@@ -112,6 +112,37 @@ body {
   .orb-glow { animation: none; }
 }
 
+/* Inline model-drawn widgets (charts/graphs) — sandboxed iframe container. */
+.widget {
+  margin-top: 14px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(17, 17, 17, .04), 0 6px 24px rgba(120, 90, 200, .06);
+}
+.widget iframe { display: block; }
+.widget-error {
+  padding: 8px 12px;
+  font-size: 0.78rem;
+  color: #b0322f;
+  background: #fbe6e6;
+  border-top: 1px solid var(--border);
+}
+.widget-fallback { margin-top: 12px; font-size: 0.8rem; color: var(--text-muted); }
+.widget-fallback summary { cursor: pointer; color: #c0492f; }
+.widget-fallback pre {
+  background: #F7F5FC;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 11px;
+  overflow-x: auto;
+  font-size: 0.75rem;
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* Quiet lavender scrollbars */
 .scroll-quiet::-webkit-scrollbar { width: 9px; height: 9px; }
 .scroll-quiet::-webkit-scrollbar-thumb {

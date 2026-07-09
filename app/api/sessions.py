@@ -1,42 +1,58 @@
 """
 sessions.py
 -----------
-Simple in-memory conversation memory, keyed by session_id.
+Conversation memory, keyed by session_id, backed by Redis.
 
 Lets the chatbot remember recent turns so follow-up questions work
 ("...and break that down by colour?"). We store only the final
 question/answer text per turn (not the internal tool calls).
 
-PRODUCTION NOTE: this is in-memory, so history is lost on restart and is
-NOT shared across multiple server workers/processes. For a multi-worker
-production deployment, back this with Redis (same get/add interface).
+WHY REDIS (not in-memory): the frontend mints a brand-new session_id for
+every new chat thread and threads persist indefinitely in the browser's
+localStorage, so an in-memory dict of sessions never stops growing - a slow
+memory leak on any long-running server. Redis with a TTL fixes both: memory
+is bounded (each session expires after SESSION_TTL_SECONDS of inactivity) and
+history survives a backend restart, so a mid-conversation redeploy doesn't
+wipe follow-up context.
 """
 
-from collections import deque
+import json
+
+from app.core.redis_client import get_redis
 
 # How many past turns (Q + A pairs) to remember per session.
 MAX_TURNS = 6
 
-# session_id -> deque of {"role": "user"|"assistant", "content": str}
-_SESSIONS: dict[str, deque] = {}
+# Idle sessions expire after this long (refreshed on every new turn).
+SESSION_TTL_SECONDS = 24 * 60 * 60  # 24h - comfortably past a workday
+
+_KEY = "chat:session:{session_id}"
 
 
 def get_history(session_id: str | None) -> list[dict]:
     """Return the remembered messages for a session (oldest first)."""
     if not session_id:
         return []
-    return list(_SESSIONS.get(session_id, []))
+    raw = get_redis().get(_KEY.format(session_id=session_id))
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []  # corrupt/unexpected value - fail open to no history, not a crash
 
 
 def add_turn(session_id: str | None, question: str, answer: str) -> None:
     """Record one completed turn (user question + assistant answer)."""
     if not session_id:
         return
-    hist = _SESSIONS.setdefault(session_id, deque(maxlen=MAX_TURNS * 2))
+    hist = get_history(session_id)
     hist.append({"role": "user", "content": question})
     hist.append({"role": "assistant", "content": answer})
+    hist = hist[-(MAX_TURNS * 2):]  # keep only the most recent turns
+    get_redis().set(_KEY.format(session_id=session_id), json.dumps(hist), ex=SESSION_TTL_SECONDS)
 
 
 def clear_session(session_id: str) -> None:
     """Forget a session's history."""
-    _SESSIONS.pop(session_id, None)
+    get_redis().delete(_KEY.format(session_id=session_id))

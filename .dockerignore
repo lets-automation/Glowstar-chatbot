@@ -1,0 +1,23 @@
+# Never bake secrets or local state into an image layer.
+.env
+.env.*
+!.env.docker.example
+
+# Local dev artifacts - irrelevant or huge inside a container.
+venv/
+node_modules/
+frontend/dist/
+frontend/node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+outputs/
+logs/
+.git/
+.gitignore
+
+# Editor/OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -49,8 +49,8 @@ _DEFAULT = [
 # rate/config lookup tables (tblBonusRate, tblReportRate, ...) on score ties.
 _PRIMARY = {
     "tblPacketHistory", "tblFinalPacket", "tblPacket", "tblPacketIssue",
-    "tblLabourResult", "tblPlanMaster", "tblJangadPackets", "tblPacketPoint",
-    "tblEmployee", "tblEmpDetail",
+    "tblLabourResult", "tblPlanMaster", "tblPlanReport", "tblJangadPackets",
+    "tblPacketPoint", "tblEmployee", "tblEmpDetail",
 }
 
 

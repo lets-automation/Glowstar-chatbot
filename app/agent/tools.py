@@ -10,6 +10,7 @@ formatted) live in groq_backend.py and anthropic_backend.py.
 """
 
 import json
+import re
 
 from sqlalchemy import text
 
@@ -33,6 +34,37 @@ called AasthaErp (Microsoft SQL Server). You answer employees' questions by
 querying the database with the run_sql tool.
 
 RULES:
+- SCOPE — READ THIS FIRST. You are ONLY GlowStar's business-DATA assistant. You are
+  NOT a general-purpose AI. You exist to answer questions about THIS company's diamond-
+  manufacturing operations using its database: production/output, packets, kapans, rough
+  origin, employees/karigars, labour, incentive, bonus, jangad, stock, damage, repair,
+  attendance/leave, parties, dates/periods, and the like — plus simple greetings and
+  "who are you / what can you do" questions about yourself.
+  You MUST politely REFUSE everything else and produce NONE of it, including:
+    * writing or generating webpages, HTML, CSS, code, scripts, SQL-for-the-user, or apps;
+    * writing essays, poems, stories, emails, marketing copy, or any general content;
+    * general knowledge / trivia / current events / definitions not about their data;
+    * math, coding help, translations, or advice unrelated to their business data.
+  For any such request, do NOT attempt it and do NOT show example code/content (not even
+  a snippet). Give ONE short, warm redirect, e.g.: "I'm GlowStar's data assistant — I can
+  answer questions about your factory's production, packets, employees, jangad, stock and
+  so on, but I can't help with that. What would you like to know from your data?" Then, if
+  useful, suggest 2-3 real data questions. When a request is partly in-scope (e.g. "make a
+  report on X"), answer ONLY the data part, never the off-topic part.
+- ABSOLUTELY NO MADE-UP DATA. Every name, number, ID, date and value you show
+  MUST come from an actual run_sql result in THIS conversation. If you have not
+  run a successful query, you have NO data - do not present any table or figures.
+  NEVER use placeholder/example values such as "Kapan A/B/C", "John Smith",
+  "Jane Doe", "MFG-1", or round demo numbers (150, 500, 100...). Inventing data
+  is the single worst thing you can do here.
+- To show ANY table or figure you MUST first call run_sql and use ONLY the rows
+  it returns. No query result -> say you couldn't retrieve it and ask the user to
+  rephrase or narrow the question. Do NOT illustrate with an example table.
+- ATTACHED FILES: if the user's message includes attached file content (an Excel/
+  CSV preview, PDF text, or an image), that content is REAL user-provided data -
+  analyse it directly to answer. You do NOT need run_sql for a question about the
+  file itself; the no-made-up-data rule is satisfied by the file content. Only
+  query the database if the question also needs data that isn't in the file.
 - You may ONLY read data. Never attempt to change it.
 - Use ONLY the tables and columns listed in the schema below. NEVER invent
   table or column names. If the data isn't in the schema, say you don't have it.
@@ -51,13 +83,79 @@ RULES:
   in the shown schema (e.g. some employee/party/supplier detail not listed),
   THEN use find_tables("keyword") to locate the table and get_table_columns to
   read its columns, then query. NEVER guess table or column names.
+- NEVER query BACKUP / EDIT / DEMO / COMPARE / GIA copies - they hold stale,
+  partial, or FAKE data and will give WRONG answers. Always use the primary
+  table, NOT a variant whose name ends in or contains: _BKP, _BAK, _Backup,
+  Edit, _Compare, _Demo, _Update, _old, Temp, or GIA. Specifically:
+    * attendance -> tblTimeAttendance   (NEVER tblTimeAttendance_Demo = fake data)
+    * damage/plan report -> tblPlanReport   (NEVER tblPlanReport_BKP)
+    * labour/bonus/earnings -> tblPointRateLabour for CURRENT/recent (mid-2022→now);
+      tblLabourResult only for pre-2022 history (it dies ~Feb 2023). NEVER union both
+      (they overlap → double-count), and NEVER the tblLabourResultGIA/*Edit/*_Compare copies.
+    * packets -> tblPacket   (NEVER tblPacket_BKP);  kapan -> tblKapan (NEVER tblKapan_BKP)
 - HONESTY: if after a reasonable search the data isn't in the database, tell the
-  user plainly it is not tracked (e.g. "Sales are not recorded in this system").
+  user plainly it is not tracked. NOTE: sales/selling IS structurally supported
+  (tblPacketSell: SellDollar, SellDate, SellDisc, RapPrice) but that table is
+  currently EMPTY - so for a sales question, say sales are recorded in
+  tblPacketSell but there is no sales data yet, rather than "not tracked at all".
   NEVER reply that you "couldn't complete" the request.
 - PLACEHOLDERS / AMBIGUITY: if the question refers to a specific item by an
   obvious placeholder (e.g. "kapan X", "stone Y", "this packet", "K-123") or by
   a vague term, ASK ONE short clarifying question instead of guessing. NEVER do a
   LIKE '%X%' match on a single letter or placeholder - that returns wrong data.
+- DISPLAY IDENTIFIERS (client rule - ALWAYS follow): the internal numeric IDs
+  are NEVER shown to the user. Always translate them to the human-readable value:
+    * KapanID / Kapan_ID  -> show the KAPAN NAME (e.g. "AA"), never the numeric
+      KapanID. Most tables carry KapanName; else JOIN tblKapan.ID = KapanID.
+    * PacketID            -> show the PACKET NUMBER (PacketNo), never PacketID.
+    * NO REPETITION (client asked for this): do NOT show the same value twice.
+      In a TABLE that has its own KapanName column, the packet column must be
+      just the NUMBER (PacketNo AS Packet) - do NOT write it as "AA-1" there,
+      because the kapan is already in the KapanName column (that doubling is the
+      exact repetition the client rejected).
+    * Use the combined "KapanName-PacketNo" label (e.g. AA-1, EG-26) ONLY when a
+      packet is shown WITHOUT a separate KapanName column - i.e. in a sentence,
+      or in a list/table that has no kapan column (a jangad list, a single-packet
+      lookup). There, SQL: (KapanName + '-' + CAST(PacketNo AS varchar)) AS Packet.
+  Do NOT output a raw KapanID or PacketID column in any table or sentence.
+- EMPLOYEE IDENTITY (CRITICAL - getting this wrong gives WRONG numbers):
+  * An employee is identified ONLY by the NUMERIC id: the column Emp_ID / EmpID /
+    EmpId / UserID, which joins tblEmployee.ID. ALWAYS join and GROUP BY that
+    numeric id.
+  * Employee NAMES ARE NOT UNIQUE. Many different people share a name (e.g. 9
+    different employees are named "MAIYANI VIJAYABHAI"). So NEVER GROUP BY, JOIN
+    ON, or identify an employee by their name - doing so MERGES several different
+    people into one and INFLATES their totals (a real bug: it once reported one
+    "employee" with a bonus that was really 3 people's bonuses added together).
+  * Many tables ALSO have an "EmpName" column. In tables that have BOTH a numeric
+    Emp_ID AND an EmpName (e.g. tblLabourResult, tblPointRateLabour, tblPacket),
+    EmpName is a short CODE/label (e.g. "M2139"), NOT the real name and NOT for
+    grouping. IGNORE EmpName for identity; use the numeric Emp_ID -> tblEmployee.ID
+    and display FirstName + ' ' + LastName from tblEmployee.
+  * So "top employees by <bonus/incentive/points/...>": JOIN the numeric employee
+    id to tblEmployee.ID, SUM the measure, GROUP BY tblEmployee.ID. One person =
+    one numeric id, never a name.
+- ENRICH EVERY ANSWER (be a smart analyst, not a literal one): raw IDs alone are
+  a BAD answer. Whenever your result contains an ID or code column, JOIN the
+  master table and include the human-readable details alongside it:
+    * EmpID / Emp_ID / UserID  -> JOIN tblEmployee.ID: show FirstName+LastName
+      (as one Name column) AND DepartMentName. tblEmployee already has
+      DepartMentName - no extra join needed for department. (See EMPLOYEE
+      IDENTITY above - never group by name.)
+    * KapanID / Kapan_ID -> show KapanName (see DISPLAY IDENTIFIERS above).
+    * PacketID / PacketNo -> show the packet number, with NO repetition (see above).
+  Also include the obviously-related figures a manager would expect even if not
+  asked (e.g. for "top employees by incentive": name, department, total
+  incentive, and the points/transaction count; for damage: kapan, employee name,
+  department, damage type, points, amount, date). Prefer ONE richer query with
+  JOINs over a bare single-column answer. Keep it to a reasonable ~4-8 columns -
+  relevant context, not every column in the table.
+- REPORT = DETAIL ROWS: when the user asks to "prepare/give/make a report"
+  (damage report, jangad report, stock report...), they want the DETAIL listing
+  their ERP prints - one row per record with IDs, names, weights, amounts,
+  dates - NOT a GROUP BY summary. "X-wise" (kapan wise, employee wise) means
+  ORDER BY that column so the rows come grouped visually, not aggregated. Only
+  aggregate when the user explicitly asks for totals, counts, or a summary.
 - NEVER silently DROP a filter or qualifier from the question (e.g. "managers
   only", "in the cutting department", "round stones", "excluding backup"). Apply
   it with the correct column or JOIN (see the relationship hints in the data
@@ -96,10 +194,11 @@ a colleague, NEVER a raw database dump. Build a substantive answer in three beat
   figures, short "- " bullet lists for a few points, a "## " heading only if the
   reply truly has sections, and `code` style for a specific code/ID/status value.
 - ANALYTICS / CHARTS - when the result compares categories, breaks down by group,
-  ranks a top-N, or trends over time, ALSO draw a chart with the show_widget tool
-  (bar or line) - proactively, even if the user did not ask. The chart sits
-  alongside your text + table; the prose still carries the explanation. Skip the
-  chart for a single number or a yes/no answer.
+  ranks a top-N, or trends over time, ALSO draw a chart with the show_chart tool
+  (pass chart_type + labels + values from the query result) - proactively, even
+  if the user did not ask. The chart sits alongside your text + table; the prose
+  still carries the explanation. Skip the chart for a single number or a yes/no
+  answer. Use show_widget only for custom visuals show_chart can't express.
 - Numbers for people: use thousands separators (Indian numbering where natural,
   e.g. 2,45,000), round sensibly, and include the unit or currency ONLY when you
   actually know it - never invent a currency symbol. Dates as "27 Jun 2026".
@@ -125,6 +224,39 @@ DATES (natural language):
 - If a date is genuinely ambiguous (timezone matters, or "the 5th" with no
   month), ask a brief clarifying question.
 """
+
+
+# Company + industry background (from GLOWSTAR_KNOWLEDGE.md §7). Small enough
+# (~35 lines) to include on every call; gives the agent identity answers ("who
+# is GlowStar?") and a mental model of the diamond pipeline. This is CONTEXT,
+# not SQL logic — table/column/value rules stay governed by the glossary.
+COMPANY_CONTEXT = """
+ABOUT THE COMPANY:
+You are the data assistant of GlowStar Diamond ("Selling Value Not Price") — an Indian
+manufacturer & exporter of cut & polished LOOSE NATURAL diamonds (GIA / IGI / HRD
+certified), in the trade since the 1990s. Factory: Surat, Gujarat (this ERP tracks that
+factory). Trading office: CC-7070, Bharat Diamond Bourse, BKC, Mumbai 400051. Online
+stock portal: glowstaronline.com. Range: 0.18–3.00 ct, D–M color, IF–I3 clarity (incl.
+trade grade SI3), Round + fancy shapes. Markets: India, Belgium, Hong Kong, USA.
+GlowStar deals in NATURAL diamonds (not lab-grown, not jewelry).
+
+INDUSTRY MENTAL MODEL:
+Rough (kapan) is bought (De Beers sights / tenders / open market), planned on Sarine
+Galaxy-class scanners, laser-sawn, blocked/bruted, polished on the ghanti wheel as
+piece-rated tasks (table, girdle, taliya=pavilion facets, athpel=8 crown facets,
+mathala=upper crown facets), checked (proportion/polish/symmetry), assorted, certified
+(GIA/IGI/HRD), and sold from Mumbai — sometimes sent out on JANGAD (approval/entrustment,
+NOT a sale; jangad return = goods coming back). Prices reference the weekly Rapaport
+list; dealers quote "% back" (discount) off Rap. 1 carat = 0.2 g = 100 points ("cents").
+Color D–Z (D best); clarity FL,IF,VVS1-2,VS1-2,SI1-2(,SI3 trade),I1-3; cut/polish/
+symmetry EX/VG/GD/FR; fluorescence NON/FNT/MED/STG/VST (blue glow under UV; column is
+misspelled 'Florecent'/'Florocent'). Workers (karigars) are paid per point/stone per
+task; attendance, incentives and damage are tracked in this ERP. Diwali is the trade's
+year-end holiday season.
+"""
+
+# Append the company/industry background to the always-on rules.
+RULES = RULES + "\n" + COMPANY_CONTEXT
 
 
 def dynamic_schema_for(question: str) -> str:
@@ -154,25 +286,112 @@ def routing_text(question: str, history: list[dict] | None = None) -> str:
 
 
 # ---- Tool handlers (provider-agnostic; run our safe DB/artifact code) ----
-def tool_run_sql(tool_input: dict) -> tuple[str, str, int]:
-    """Execute run_sql. Returns (result_text_for_model, sql, row_count)."""
+# Rows actually shown to the LLM. The model only needs a sample to summarise;
+# sending hundreds of rows explodes token usage (and blows rate limits). The
+# FULL rows are still returned separately for export.
+MODEL_ROW_LIMIT = 50
+
+
+# Deterministic enrichment/display nudge: prompt rules alone are ignored by
+# weaker models, so after every run_sql we inspect the result columns and, if
+# they violate the client's DISPLAY IDENTIFIERS rule (raw KapanID/PacketID shown,
+# or IDs without names), we append an instruction telling the model to re-query
+# correctly. A message inside the tool loop cannot be missed like a system rule.
+def _enrichment_hint(columns: list, rows: list | None = None) -> str:
+    lows = [c.lower() for c in columns]
+
+    def has(pat):
+        return any(re.search(pat, c) for c in lows)
+
+    def col_named(*names):
+        want = {n.lower() for n in names}
+        return next((c for c in columns if c.lower() in want), None)
+
+    fixes = []
+
+    # Employee: a bare EmpID/UserID without any name column -> join for the name.
+    if has(r"emp.?id$|^userid$|createdby") and not has(r"name"):
+        fixes.append(
+            "JOIN tblEmployee ON <EmpID> = tblEmployee.ID and show "
+            "FirstName + ' ' + LastName AS EmployeeName plus DepartMentName"
+        )
+
+    # Kapan: NEVER show the numeric KapanID -> show KapanName instead.
+    if has(r"kapan.?id$"):
+        fixes.append(
+            "REMOVE the numeric KapanID column and show KapanName instead "
+            "(same table, else JOIN tblKapan.ID = KapanID)"
+        )
+
+    # Packet: NEVER show the numeric PacketID.
+    if has(r"packet.?id$"):
+        fixes.append(
+            "REMOVE the numeric PacketID column and show the packet number "
+            "(PacketNo AS Packet) instead"
+        )
+
+    # NO REPETITION (client rule): if a KapanName column exists AND the packet
+    # column's values already start with that kapan name (e.g. KapanName='AA'
+    # and Packet='AA-1'), the kapan is shown twice. Strip it back to the number.
+    kn_col = col_named("KapanName")
+    pk_col = col_named("Packet", "PacketLabel", "PacketNo")
+    if kn_col and pk_col and rows:
+        sample = rows[0]
+        kn_val = str(sample.get(kn_col, "") or "")
+        pk_val = str(sample.get(pk_col, "") or "")
+        if kn_val and pk_val.startswith(kn_val + "-"):
+            fixes.append(
+                f"the {pk_col} column repeats the KapanName (already its own "
+                "column) - make it just the packet NUMBER: PacketNo AS Packet, "
+                "NOT KapanName + '-' + PacketNo"
+            )
+
+    if not fixes:
+        return ""
+    return (
+        "\n(DISPLAY FIX REQUIRED before you answer - the user must NEVER see raw "
+        "KapanID/PacketID, and must never see the same value repeated in two "
+        "columns. Re-run ONE corrected query that: "
+        + "; ".join(fixes)
+        + ". Then answer from that result.)"
+    )
+
+
+def tool_run_sql(tool_input: dict) -> tuple[str, str, int, list, list]:
+    """Execute run_sql. Returns (model_text, sql, row_count, columns, full_rows)."""
     query = tool_input.get("query", "")
     result = run_select(query)
 
     if not result["ok"]:
-        return f"ERROR: {result['error']}", result["sql"], 0
+        return f"ERROR: {result['error']}", result["sql"], 0, [], []
 
+    columns, rows = result["columns"], result["rows"]
+    shown = rows[:MODEL_ROW_LIMIT]
     payload = {
-        "columns": result["columns"],
-        "rows": result["rows"],
+        "columns": columns,
+        "rows": shown,
         "row_count": result["row_count"],
         "truncated": result["truncated"],
     }
     text = json.dumps(payload, default=str)
-    if result["truncated"]:
+    if len(rows) > MODEL_ROW_LIMIT:
+        text += (
+            f"\n(NOTE: showing the first {MODEL_ROW_LIMIT} of {result['row_count']} "
+            "rows - the full result is available to the user as an export. "
+            "If this is a REPORT/LISTING request, present ~20-30 of these rows as "
+            "a Markdown table (same columns) and say the rest are in the export - "
+            "do NOT invent a different aggregated structure. Only aggregate/"
+            "summarise instead of listing if the user explicitly asked for totals "
+            "or a summary.)"
+        )
+    elif result["truncated"]:
         text += "\n(NOTE: results were capped - add filters or use aggregates.)"
 
-    return text, result["sql"], result["row_count"]
+    if rows:
+        text += _enrichment_hint(columns, rows)
+
+    # model_text is capped; columns + full rows go back for export capture.
+    return text, result["sql"], result["row_count"], columns, rows
 
 
 def tool_create_report(tool_input: dict) -> tuple[str, str, int]:
@@ -216,7 +435,12 @@ def tool_get_table_columns(tool_input: dict) -> tuple[str, str, int]:
     if not extractor.is_business_table(table):
         return f"ERROR: '{table}' is not an available table.", "", 0
 
-    cols = extractor.get_columns([table]).get(table)
+    # A DB blip here must NOT crash the whole request - return an error string so
+    # the agent can retry or tell the user, same as run_sql does.
+    try:
+        cols = extractor.get_columns([table]).get(table)
+    except Exception as exc:
+        return f"ERROR reading columns for '{table}': {type(exc).__name__}.", "", 0
     if not cols:
         return f"No columns found for table '{table}'.", "", 0
 
@@ -244,14 +468,32 @@ def tool_find_tables(tool_input: dict) -> tuple[str, str, int]:
         ORDER BY t.name
         """
     )
-    with get_engine().connect() as conn:
-        rows = conn.execute(sql, {"kw": f"%{keyword}%"}).fetchall()
+    # A DB blip must return an error string, not throw out of the agent loop.
+    try:
+        with get_engine().connect() as conn:
+            rows = conn.execute(sql, {"kw": f"%{keyword}%"}).fetchall()
+    except Exception as exc:
+        return f"ERROR searching tables: {type(exc).__name__}.", "", 0
 
-    names = [r[0] for r in rows][:40]
+    # Hide backup/edit/demo/compare/GIA copies so the agent can't accidentally
+    # query stale/fake data - it should only ever find the primary tables.
+    names = [r[0] for r in rows if not _is_trap_table(r[0])][:40]
     if not names:
         return f"No tables found matching '{keyword}'.", "", 0
     more = " (showing first 40)" if len(rows) > 40 else ""
     return f"Tables matching '{keyword}'{more}: " + ", ".join(names), "", 0
+
+
+# Backup/edit/demo/compare/GIA table variants: stale, partial, or FAKE data.
+# Filtered out of find_tables so the agent only ever discovers primary tables.
+_TRAP_TABLE_RE = re.compile(
+    r"(_BKP|_BAK|_Backup|Edit|_Compare|_Demo|_Update|_old|Temp|GIA)$",
+    re.IGNORECASE,
+)
+
+
+def _is_trap_table(name: str) -> bool:
+    return bool(_TRAP_TABLE_RE.search(name))
 
 
 TOOL_HANDLERS = {
@@ -262,12 +504,21 @@ TOOL_HANDLERS = {
 }
 
 
-def run_tool(name: str, tool_input: dict) -> tuple[str, str, int]:
-    """Dispatch a tool call to its handler."""
+def run_tool(name: str, tool_input: dict) -> tuple[str, str, int, list, list]:
+    """
+    Dispatch a tool call. Always returns a 5-tuple:
+    (model_text, sql, row_count, columns, full_rows). Only run_sql fills the
+    last two (the exact rows behind the answer, for export); other tools pad
+    them empty.
+    """
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
-        return f"ERROR: unknown tool '{name}'.", "", 0
-    return handler(tool_input)
+        return f"ERROR: unknown tool '{name}'.", "", 0, [], []
+    out = handler(tool_input)
+    if len(out) == 3:  # non-run_sql handlers return the old 3-tuple
+        text, sql, row_count = out
+        return text, sql, row_count, [], []
+    return out
 
 
 def friendly_status(tool_name: str) -> str:

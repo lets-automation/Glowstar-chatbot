@@ -38,8 +38,21 @@ def _build_connection_url() -> str:
 
 
 # The "engine" is the shared, reusable gateway to the database.
-# pool_pre_ping=True quietly checks the connection is alive before each use.
-engine: Engine = create_engine(_build_connection_url(), pool_pre_ping=True)
+#  - pool_pre_ping: quietly check a connection is alive before use (auto-recover
+#    from a dropped connection instead of erroring).
+#  - pool_size/max_overflow: bound concurrent connections so a burst of requests
+#    can't exhaust the pool and hang; pool_timeout fails fast (10s) rather than
+#    blocking forever when all connections are busy.
+#  - pool_recycle: drop connections older than 30 min (avoids stale-socket
+#    errors from server-side idle timeouts).
+engine: Engine = create_engine(
+    _build_connection_url(),
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=10,
+    pool_recycle=1800,
+)
 
 
 def get_engine() -> Engine:

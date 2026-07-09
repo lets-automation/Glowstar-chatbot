@@ -40,6 +40,10 @@ class Settings:
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
+    # Google Gemini (free-tier FALLBACK for Groq — big per-minute budget).
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
     # Max columns shown per table in the schema context.
     # TEMPORARY token-saving cap for the free tier. Set SCHEMA_MAX_COLS=0
     # (no cap) once on Claude / paid tier for fuller, more accurate context.
@@ -49,6 +53,36 @@ class Settings:
     VOYAGE_API_KEY: str = os.getenv("VOYAGE_API_KEY", "")
     PINECONE_API_KEY: str = os.getenv("PINECONE_API_KEY", "")
     PINECONE_INDEX: str = os.getenv("PINECONE_INDEX", "aastha-semantic")
+
+    # --- Redis (chat sessions, user accounts, rate-limit counters) ---
+    # "redis" is the service name inside Docker Compose; "localhost" for local dev.
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+    # --- Authentication master switch ---
+    # OFF by default: the chatbot runs standalone with NO login screen and open
+    # API access (correct for a localhost/embedded deployment). The client turns
+    # this ON (AUTH_ENABLED=true) when they want the built-in username/password
+    # login, or when wiring the API's token check into their CRM's SSO. All the
+    # auth machinery below stays in place either way.
+    AUTH_ENABLED: bool = os.getenv("AUTH_ENABLED", "false").lower() in ("1", "true", "yes")
+
+    # --- Authentication (individual user logins, JWT) ---
+    # MUST be overridden in .env for any real deployment - this default is only
+    # so local dev doesn't crash before it's set. Generate one long random value
+    # (e.g. `python -c "import secrets; print(secrets.token_hex(32))"`) and keep
+    # it secret - anyone with it can forge valid login tokens.
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "")
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", str(12 * 60)))  # 12h workday
+
+    # --- Rate limiting (per authenticated user, Redis-backed) ---
+    RATE_LIMIT_PER_MINUTE: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", "20"))
+
+    # --- CORS ---
+    # Comma-separated origins allowed to call the API, e.g.
+    # "https://chat.glowstardiam.com,http://localhost:5173". Defaults to "*"
+    # for local dev only - set this explicitly for any real deployment.
+    CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "*")
 
 
 # A single shared settings object the whole app imports.

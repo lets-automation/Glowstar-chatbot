@@ -6,13 +6,33 @@ Used when LLM_PROVIDER=groq (the free-tier testing setup).
 """
 
 import json
+import re
 
 from groq import Groq
 
+from app.agent import attachments as attachments_mod
 from app.agent import tools, widget
 from app.agent._retry import call_with_retry
 from app.config import settings
 from app.core.logging_util import log_interaction
+
+
+def _user_content(question: str, file_context: dict | None):
+    """
+    Build the first user message. With attachments it's a content-part list
+    (OpenAI/Groq multimodal): file text + image_url parts + the question.
+    Without attachments it's a plain string.
+    """
+    if not attachments_mod.has_content(file_context):
+        return question
+    parts = [{"type": "text", "text": attachments_mod.build_preamble(file_context)}]
+    for img in file_context.get("images", []):
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{img['media_type']};base64,{img['data']}"},
+        })
+    parts.append({"type": "text", "text": question})
+    return parts
 
 # Tools in OpenAI/Groq "function" format, built from the shared specs. show_widget
 # is appended so the model can draw inline visuals instead of describing them.
@@ -25,7 +45,12 @@ _GROQ_TOOLS = [
             "parameters": spec["schema"],
         },
     }
-    for spec in (*tools.TOOL_SPECS, widget.SHOW_WIDGET_TOOL_SPEC)
+    for spec in (
+        *tools.TOOL_SPECS,
+        widget.SHOW_WIDGET_TOOL_SPEC,
+        widget.SHOW_CHART_TOOL_SPEC,
+        widget.SHOW_DASHBOARD_TOOL_SPEC,
+    )
 ]
 
 
@@ -35,15 +60,46 @@ def _client() -> Groq:
     return Groq(api_key=settings.GROQ_API_KEY)
 
 
+def _looks_like_unrun_sql(text: str) -> bool:
+    """True if the reply EMBEDS a SELECT query — i.e. the model wrote the SQL in
+    its answer instead of calling the run_sql tool. Some Groq models (notably
+    llama-4-scout) do this on list/ranking questions, so no query runs and the
+    user sees no data. Detecting it lets us force an actual execution."""
+    if not text:
+        return False
+    low = text.lower()
+    return "select" in low and "from" in low
+
+
+# The user asked for an analytics dashboard/overview. Weak models often answer
+# such questions in plain text and skip the show_dashboard tool entirely; when
+# this matches and no dashboard was built, we nudge one corrective round.
+DASHBOARD_ASKED_RE = re.compile(
+    r"\b(dashboards?|analytics?|overview|analysis|analyse|analyze)\b", re.IGNORECASE
+)
+
+DASHBOARD_NUDGE = (
+    "The user asked for an analytics view, but you have not called the "
+    "show_dashboard tool, so they see no dashboard. Do it NOW: if you need "
+    "more figures, run 1-3 more quick aggregate run_sql queries (e.g. a "
+    "monthly trend, a breakdown by department/category); then call "
+    "show_dashboard ONCE with 3-6 KPI tiles and 1-2 sections built ONLY from "
+    "numbers your run_sql queries actually returned. Then give a short text "
+    "summary."
+)
+
+
 def ask_groq(
     question: str,
     model: str,
     history: list[dict] | None = None,
     on_event=None,
+    file_context: dict | None = None,
 ) -> dict:
     """Answer a question via Groq. Returns {answer, sql_used, rows_returned}."""
     client = _client()
     history = history or []
+    file_grounded = attachments_mod.has_content(file_context)
 
     def emit(msg):
         if on_event:
@@ -60,29 +116,59 @@ def ask_groq(
             + tools.system_prompt_for(routing_text),
         },
         *history,
-        {"role": "user", "content": question},
+        {"role": "user", "content": _user_content(question, file_context)},
     ]
 
     sql_used: list[str] = []
     last_row_count = 0
     widgets: list[dict] = []  # visuals emitted via show_widget, shown to the user
+    data_columns: list[str] = []  # columns/rows from the LAST successful run_sql,
+    data_rows: list[dict] = []    # captured so export uses the exact data shown
+
+    nudged_to_execute = False  # have we already forced a stalled model to run its SQL?
+    nudged_dashboard = False   # have we already asked it to build the requested dashboard?
+    force_tool = False         # require a tool call on the NEXT request (set by the nudge)
+    dashboard_built = False    # did show_dashboard actually render this turn?
+    retried_bad_tool_call = False  # one retry when Groq rejects a tool call's arguments
 
     emit("Analyzing your question…")
     for _ in range(tools.MAX_TOOL_ROUNDS):
         try:
+            choice = "required" if force_tool else "auto"
+            force_tool = False  # one-shot
             response = call_with_retry(
                 lambda: client.chat.completions.create(
                     model=model,
                     messages=messages,
                     tools=_GROQ_TOOLS,
-                    tool_choice="auto",
-                    temperature=0.3,  # mild warmth for human-sounding prose; SQL stays guarded
+                    tool_choice=choice,
+                    temperature=0,  # deterministic: same question -> same SQL, no drift
                     max_tokens=1024,
                 )
             )
         except Exception as exc:
             # Don't crash. Give a clear message depending on the cause.
             err = str(exc).lower()
+            # A REJECTED TOOL CALL (arguments didn't match the tool's schema,
+            # e.g. numbers where strings are required) is recoverable: tell the
+            # model exactly what Groq rejected and let it retry once, instead
+            # of failing the whole turn.
+            if (
+                "tool_use_failed" in err or "tool call validation failed" in err
+            ) and not retried_bad_tool_call:
+                retried_bad_tool_call = True
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your last tool call was REJECTED because its arguments "
+                        f"did not match the tool's schema: {str(exc)[:600]} ... "
+                        "Fix the arguments (label arrays must contain STRINGS; "
+                        "value arrays must contain NUMBERS) and make the SAME "
+                        "tool call again with the same data."
+                    ),
+                })
+                emit("Retrying…")
+                continue
             log_interaction(question, sql_used, last_row_count, error=str(exc))
             if "rate_limit" in err or "429" in err or "quota" in err:
                 answer = (
@@ -107,12 +193,57 @@ def ask_groq(
 
         if not msg.tool_calls:
             answer = msg.content or ""
+            # Model-quirk guard: if the reply EMBEDS a SELECT but no query has
+            # actually run (and this isn't a file-only answer), the model wrote
+            # SQL instead of calling run_sql. Force one execution round instead
+            # of returning a data-less "here's the query" reply to the user.
+            if (
+                not sql_used
+                and not file_grounded
+                and not nudged_to_execute
+                and _looks_like_unrun_sql(answer)
+            ):
+                nudged_to_execute = True
+                force_tool = True
+                messages.append({"role": "assistant", "content": answer})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You wrote a SQL query but did not run it, so I have no "
+                        "data to show. Call the run_sql tool NOW to execute the "
+                        "EXACT query you just wrote above (do not rewrite or "
+                        "simplify it), then answer from the actual rows it "
+                        "returns. Do not put SQL in your reply."
+                    ),
+                })
+                emit("Running the query…")
+                continue
+            # Dashboard guard: the question asked for analytics/overview/
+            # dashboard/analysis but the model finished without building one
+            # (weak models skip optional visual tools). Nudge one corrective
+            # round; requires data to have been queried (sql_used) so the
+            # dashboard can't be built from invented numbers.
+            if (
+                not dashboard_built
+                and not nudged_dashboard
+                and sql_used
+                and not file_grounded
+                and DASHBOARD_ASKED_RE.search(question or "")
+            ):
+                nudged_dashboard = True
+                messages.append({"role": "assistant", "content": answer})
+                messages.append({"role": "user", "content": DASHBOARD_NUDGE})
+                emit("Building your dashboard…")
+                continue
             log_interaction(question, sql_used, last_row_count)
             return {
                 "answer": answer.strip(),
                 "sql_used": sql_used,
                 "rows_returned": last_row_count,
                 "widgets": widgets,
+                "data_columns": data_columns,
+                "data_rows": data_rows,
+                "file_grounded": file_grounded,
             }
 
         # Record the assistant turn (with its tool calls).
@@ -145,7 +276,7 @@ def ask_groq(
                 # Not a DB tool: the "result" is a UI artifact for the user. Capture
                 # it and feed back a minimal tool result so the cycle stays valid.
                 emit("Rendering a visual…")
-                code = args.get("widget_code")
+                code = widget.ensure_chart_lib(args.get("widget_code"))
                 if code:
                     widgets.append({"title": args.get("title", "widget"), "code": code})
                 messages.append(
@@ -153,11 +284,44 @@ def ask_groq(
                 )
                 continue
 
+            if tc.function.name == widget.SHOW_CHART_TOOL_SPEC["name"]:
+                # Deterministic chart: the model gives data, we build correct HTML.
+                emit("Rendering a chart…")
+                try:
+                    code = widget.build_chart_html(args)
+                    widgets.append({"title": args.get("title", "chart"), "code": code})
+                    outcome = "rendered"
+                except Exception as exc:
+                    outcome = f"ERROR: {exc}"
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": outcome}
+                )
+                continue
+
+            if tc.function.name == widget.SHOW_DASHBOARD_TOOL_SPEC["name"]:
+                # Deterministic dashboard: the model gives data, we build the page.
+                emit("Building your dashboard…")
+                try:
+                    code = widget.build_dashboard_html(args)
+                    widgets.append({"title": args.get("title", "dashboard"), "code": code})
+                    outcome = "rendered"
+                    dashboard_built = True
+                except Exception as exc:
+                    outcome = f"ERROR: {exc}"
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": outcome}
+                )
+                continue
+
             emit(tools.friendly_status(tc.function.name))
-            result_text, sql, row_count = tools.run_tool(tc.function.name, args)
+            result_text, sql, row_count, cols_full, rows_full = tools.run_tool(tc.function.name, args)
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
+                # Capture the FULL rows from a successful run_sql (the model only
+                # sees a sample) so export is the exact, complete data.
+                if tc.function.name == "run_sql" and rows_full:
+                    data_columns, data_rows = cols_full, rows_full
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result_text}
             )
@@ -179,7 +343,7 @@ def ask_groq(
     synth_ok = True
     try:
         final = client.chat.completions.create(
-            model=model, messages=messages, temperature=0.3, max_tokens=1024
+            model=model, messages=messages, temperature=0, max_tokens=1024
         )
         answer = (final.choices[0].message.content or "").strip()
     except Exception as exc:
@@ -194,4 +358,7 @@ def ask_groq(
         "rows_returned": last_row_count,
         "widgets": widgets,
         "ok": synth_ok,
+        "data_columns": data_columns,
+        "data_rows": data_rows,
+        "file_grounded": file_grounded,
     }

@@ -3,7 +3,8 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Sparkles, Paperclip, Download, FileSpreadsheet, FileText, Loader2 } from 'lucide-react'
 import Composer from './Composer'
-import { exportData } from '../api'
+import { Widget } from '../SandboxedWidget'
+import { exportRows } from '../api'
 
 // Markdown overrides: open links safely; let wide result tables scroll.
 const MD_COMPONENTS = {
@@ -17,7 +18,7 @@ const MD_COMPONENTS = {
  * Markdown. An Export control appears only when the backend returned an
  * export query for that answer (i.e. there's tabular data worth exporting).
  */
-export default function Thread({ messages, isStreaming, status, composerProps }) {
+export default function Thread({ messages, isStreaming, status, composerProps, onWidgetPrompt }) {
   const endRef = useRef(null)
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -62,13 +63,26 @@ export default function Thread({ messages, isStreaming, status, composerProps })
                           {m.content}
                         </ReactMarkdown>
                       </div>
-                      {m.exportQuery && <ExportControl query={m.exportQuery} />}
+                      {/* Inline charts/graphs the model drew (sandboxed iframe) */}
+                      {m.widgets?.map((w, wi) => (
+                        <Widget key={wi} code={w.code} title={w.title} onPrompt={onWidgetPrompt} />
+                      ))}
+                      {/* Export only on a successful answer with real captured data
+                          (never on a stopped/errored/empty turn). */}
+                      {m.ok !== false && m.exportRows?.length > 0 && (
+                        <ExportControl columns={m.exportColumns} rows={m.exportRows} />
+                      )}
                     </>
-                  ) : (
+                  ) : isStreaming ? (
                     <div className="flex items-center gap-2 text-[0.86rem] text-text-muted">
                       <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-line border-t-accent" />
                       {status || 'Thinking…'}
                     </div>
+                  ) : (
+                    // Empty assistant message but NOT streaming (e.g. a turn cut
+                    // off by a tab close/refresh) -> an honest note, not a
+                    // spinner that would otherwise hang forever.
+                    <div className="text-[0.86rem] italic text-text-muted">No response — please try again.</div>
                   )}
                 </div>
               </div>
@@ -88,16 +102,16 @@ export default function Thread({ messages, isStreaming, status, composerProps })
   )
 }
 
-// Conditional export — Excel / PDF. Only rendered when a message carries an
-// export query. Downloads via the backend /export endpoint.
-function ExportControl({ query }) {
+// Conditional export — Excel / PDF. Exports the EXACT rows shown (a stable
+// snapshot via /export_rows), so the file is identical every download.
+function ExportControl({ columns, rows }) {
   const [busy, setBusy] = useState(null) // 'excel' | 'pdf' | null
 
   async function run(format) {
     if (busy) return
     setBusy(format)
     try {
-      await exportData(query, format)
+      await exportRows(columns || [], rows || [], format)
     } catch {
       alert('Export failed — make sure the backend is running.')
     } finally {
