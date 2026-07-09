@@ -70,9 +70,14 @@ def run_select(
 
     try:
         with get_engine().connect() as conn:
-            # Set a query timeout on the underlying pyodbc connection.
+            # Set a query timeout on the RAW pyodbc connection (pyodbc's
+            # Connection.timeout = SQL_ATTR_QUERY_TIMEOUT, in seconds). Setting it
+            # on SQLAlchemy's connection PROXY (conn.connection) is a no-op - it
+            # doesn't forward to pyodbc - so an expensive SELECT would run
+            # unbounded. Reach the underlying dbapi connection instead.
             try:
-                conn.connection.timeout = timeout
+                raw = getattr(conn.connection, "dbapi_connection", None) or conn.connection
+                raw.timeout = timeout
             except Exception:
                 pass  # not fatal if the driver ignores it
 

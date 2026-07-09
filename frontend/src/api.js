@@ -154,6 +154,49 @@ export async function exportRows(columns, rows, format, title = 'Report') {
   URL.revokeObjectURL(url)
 }
 
+// --- Chat history (server-side threads -> same history on every device) ---
+// All of these THROW on any failure; the runtime catches and falls back to
+// per-browser localStorage (see useGlowstarRuntime + lib/chatStore).
+
+// Sidebar metadata only: [{ id, title, createdAt, updatedAt }], newest first.
+export async function apiListThreads() {
+  const res = await fetch(`${API_URL}/threads`, { headers: authHeaders() })
+  handle401(res.status)
+  if (!res.ok) throw new Error(`Thread list failed (${res.status}).`)
+  const body = await res.json()
+  return Array.isArray(body.threads) ? body.threads : []
+}
+
+// One full thread, messages included.
+export async function apiGetThread(id) {
+  const res = await fetch(`${API_URL}/threads/${encodeURIComponent(id)}`, {
+    headers: authHeaders(),
+  })
+  handle401(res.status)
+  if (!res.ok) throw new Error(`Thread load failed (${res.status}).`)
+  return res.json()
+}
+
+// Create/replace a whole thread (the backend upserts by id).
+export async function apiSaveThread({ id, title, messages, createdAt }) {
+  const res = await fetch(`${API_URL}/threads/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ title, messages, createdAt }),
+  })
+  handle401(res.status)
+  if (!res.ok) throw new Error(`Thread save failed (${res.status}).`)
+}
+
+export async function apiDeleteThread(id) {
+  const res = await fetch(`${API_URL}/threads/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  })
+  handle401(res.status)
+  if (!res.ok) throw new Error(`Thread delete failed (${res.status}).`)
+}
+
 export async function checkHealth() {
   try {
     const res = await fetch(`${API_URL}/health`)

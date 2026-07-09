@@ -40,6 +40,11 @@ MAX_ROWS = 50           # sample rows per sheet shown to the model
 MAX_COLS = 40           # columns listed before we truncate
 MAX_PDF_CHARS = 12_000  # ~3k tokens of PDF text
 MAX_IMAGE_DIM = 1536    # downscale bigger images before base64
+READ_CAP = 5_000        # max rows READ into memory per sheet (DoS guard)
+# Reject a spreadsheet whose DECOMPRESSED contents exceed this: a small (<15MB)
+# xlsx is a zip and can decompress to gigabytes ("zip bomb"), OOM-ing the worker
+# if pandas reads it whole.
+MAX_DECOMPRESSED = 60 * 1024 * 1024  # 60 MB
 
 _IMAGE_EXT = {
     ".png": "image/png",
@@ -66,17 +71,36 @@ def _resolve(file_id: str) -> str | None:
     return matches[0]
 
 
+def _too_big_decompressed(path: str) -> bool:
+    """True if this xlsx (a zip) decompresses beyond MAX_DECOMPRESSED - a zip-bomb
+    guard so a small file can't OOM the worker when pandas reads it whole."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            return sum(i.file_size for i in z.infolist()) > MAX_DECOMPRESSED
+    except (zipfile.BadZipFile, OSError):
+        return False  # not a zip (e.g. legacy .xls) - let the reader handle it
+
+
 def _tabular_text(path: str, filename: str, kind: str) -> str:
-    """Excel/CSV -> a readable preview + numeric summary."""
+    """Excel/CSV -> a readable preview + numeric summary. Reads at most READ_CAP
+    rows per sheet into memory (the model only needs a preview, and an unbounded
+    read is a DoS vector)."""
     import pandas as pd
 
     if kind == "csv":
         try:
-            sheets = {"data": pd.read_csv(path)}
+            sheets = {"data": pd.read_csv(path, nrows=READ_CAP)}
         except UnicodeDecodeError:
-            sheets = {"data": pd.read_csv(path, encoding="latin-1")}
+            sheets = {"data": pd.read_csv(path, encoding="latin-1", nrows=READ_CAP)}
     else:
-        sheets = pd.read_excel(path, sheet_name=None)  # dict: {sheet_name: df}
+        if _too_big_decompressed(path):
+            return (
+                f"FILE: {filename} — spreadsheet is too large to analyse safely "
+                "(its decompressed contents exceed the size limit). Please send a "
+                "smaller extract."
+            )
+        sheets = pd.read_excel(path, sheet_name=None, nrows=READ_CAP)  # dict
 
     parts = [f"FILE: {filename}"]
     for name, df in sheets.items():
@@ -157,6 +181,7 @@ def process_attachments(attachments: list[dict] | None) -> dict:
     text_parts: list[str] = []
     images: list[dict] = []
     notes: list[str] = []
+    has_doc = False  # did any DOCUMENT (sheet/pdf/text) contribute real content?
 
     for att in attachments or []:
         file_id = att.get("file_id") or att.get("fileId")
@@ -170,10 +195,13 @@ def process_attachments(attachments: list[dict] | None) -> dict:
         try:
             if ext in (".xlsx", ".xls"):
                 text_parts.append(_tabular_text(path, name, "excel"))
+                has_doc = True
             elif ext == ".csv":
                 text_parts.append(_tabular_text(path, name, "csv"))
+                has_doc = True
             elif ext == ".pdf":
                 text_parts.append(_pdf_text(path, name))
+                has_doc = True
             elif ext in _IMAGE_EXT:
                 images.append(_image_block(path, _IMAGE_EXT[ext]))
                 text_parts.append(f"FILE: {name} (image — see attached image below)")
@@ -182,6 +210,7 @@ def process_attachments(attachments: list[dict] | None) -> dict:
                 with open(path, "r", encoding="utf-8", errors="replace") as fh:
                     body = fh.read(MAX_PDF_CHARS)
                 text_parts.append(f"FILE: {name}\n{body}")
+                has_doc = True
         except Exception as exc:
             notes.append(f"{name}: could not read ({type(exc).__name__}: {exc})")
 
@@ -189,12 +218,24 @@ def process_attachments(attachments: list[dict] | None) -> dict:
         "text": "\n\n".join(text_parts).strip(),
         "images": images,
         "notes": notes,
+        "has_doc": has_doc,
     }
 
 
 def has_content(bundle: dict | None) -> bool:
-    """True if the bundle carries anything the model can actually analyse."""
+    """True if the bundle carries anything the model can actually analyse
+    (document text OR an image). Used to decide whether to build a multimodal
+    message at all."""
     return bool(bundle and (bundle.get("text") or bundle.get("images")))
+
+
+def grounds_data(bundle: dict | None) -> bool:
+    """True only if the attachment supplies DOCUMENT text/data that can legitimately
+    ground a numeric answer (sheet/CSV/PDF/text). An IMAGE-only upload does NOT:
+    a random attached image must not exempt a fabricated data table from the anti-
+    fabrication guard. (Image VISION prose is unaffected - prose triggers no guard;
+    only a data table/visual with no run_sql behind it is caught.)"""
+    return bool(bundle and bundle.get("has_doc"))
 
 
 def build_preamble(bundle: dict) -> str:

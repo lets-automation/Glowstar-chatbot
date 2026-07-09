@@ -89,7 +89,7 @@ def ask_anthropic(
     """Answer a question via Claude. Returns {answer, sql_used, rows_returned}."""
     client = _client()
     history = history or []
-    file_grounded = attachments_mod.has_content(file_context)
+    file_grounded = attachments_mod.grounds_data(file_context)
 
     def emit(msg):
         if on_event:
@@ -162,7 +162,7 @@ def ask_anthropic(
                 code = widget.ensure_chart_lib((block.input or {}).get("widget_code"))
                 if code:
                     widgets.append(
-                        {"title": (block.input or {}).get("title", "widget"), "code": code}
+                        {"title": (block.input or {}).get("title", "widget"), "code": code, "kind": "widget"}
                     )
                 tool_results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": "rendered"}
@@ -175,7 +175,7 @@ def ask_anthropic(
                 try:
                     code = widget.build_chart_html(block.input or {})
                     widgets.append(
-                        {"title": (block.input or {}).get("title", "chart"), "code": code}
+                        {"title": (block.input or {}).get("title", "chart"), "code": code, "kind": "chart"}
                     )
                     outcome = "rendered"
                 except Exception as exc:
@@ -191,7 +191,7 @@ def ask_anthropic(
                 try:
                     code = widget.build_dashboard_html(block.input or {})
                     widgets.append(
-                        {"title": (block.input or {}).get("title", "dashboard"), "code": code}
+                        {"title": (block.input or {}).get("title", "dashboard"), "code": code, "kind": "dashboard"}
                     )
                     outcome = "rendered"
                 except Exception as exc:

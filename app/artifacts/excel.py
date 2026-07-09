@@ -25,14 +25,26 @@ from app.artifacts.charts import CHART_MAX_ROWS, pick_chart_columns
 _BAR_COLOR = "2A78D6"
 
 
+# Leading characters that spreadsheet apps interpret as the start of a FORMULA.
+# A DB/user value like "=1+1" or "=cmd|'/c calc'!A0" would otherwise execute on
+# open (CSV/DDE formula injection), so we neutralise them with a leading quote.
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
 def _clean(value):
     """
-    Strip XML-illegal control characters from string cells. Legacy ERP free-text
-    fields sometimes contain control bytes (0x00-0x1F etc.) that openpyxl rejects
-    with IllegalCharacterError, which would otherwise crash the whole export.
+    Make a value safe to write to a cell:
+    - strip XML-illegal control characters (legacy ERP free-text fields contain
+      control bytes 0x00-0x1F that openpyxl rejects with IllegalCharacterError,
+      crashing the whole export);
+    - defuse FORMULA INJECTION: a string beginning with = + - @ (or tab/CR) is
+      prefixed with a single quote so the spreadsheet treats it as literal text,
+      never an executable formula.
     """
     if isinstance(value, str):
-        return ILLEGAL_CHARACTERS_RE.sub("", value)
+        value = ILLEGAL_CHARACTERS_RE.sub("", value)
+        if value[:1] in _FORMULA_TRIGGERS:
+            value = "'" + value
     return value
 
 

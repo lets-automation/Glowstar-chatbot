@@ -53,6 +53,44 @@ def add_turn(session_id: str | None, question: str, answer: str) -> None:
     get_redis().set(_KEY.format(session_id=session_id), json.dumps(hist), ex=SESSION_TTL_SECONDS)
 
 
+def replace_history(session_id: str | None, hist: list[dict]) -> None:
+    """Overwrite a session's remembered turns (used to WARM Redis from the
+    durable thread store — see history_from_messages). Trims to MAX_TURNS and
+    refreshes the TTL, exactly like add_turn, so subsequent follow-ups keep
+    accumulating on top instead of finding an empty session again."""
+    if not session_id:
+        return
+    hist = hist[-(MAX_TURNS * 2):]
+    get_redis().set(_KEY.format(session_id=session_id), json.dumps(hist), ex=SESSION_TTL_SECONDS)
+
+
+def history_from_messages(messages: list[dict]) -> list[dict]:
+    """Rebuild follow-up context from a persisted thread's messages.
+
+    The chat thread pool (Postgres) is durable and cross-device, but this Redis
+    session memory has a 24h TTL and only the last few turns. So when a user
+    REOPENS an older thread (past the TTL, after an eviction, or the next day),
+    the full conversation is on screen but the model has no memory of it. This
+    reconstructs the same {role, content} shape get_history() returns, straight
+    from what's visibly in the thread, so the bot doesn't 'forget' a chat the
+    user can still see.
+
+    Only real user/assistant TEXT turns are kept — transient UI banners, empty
+    placeholders, and the '_Stopped._' marker are skipped so they don't pollute
+    the model's context.
+    """
+    hist: list[dict] = []
+    for m in messages or []:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        if m.get("transient") or content == "_Stopped._":
+            continue
+        hist.append({"role": role, "content": content})
+    return hist[-(MAX_TURNS * 2):]
+
+
 def clear_session(session_id: str) -> None:
     """Forget a session's history."""
     get_redis().delete(_KEY.format(session_id=session_id))

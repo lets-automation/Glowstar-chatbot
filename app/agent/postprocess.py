@@ -143,7 +143,7 @@ def fallback_chart(question: str, result: dict) -> dict | None:
         })
     except Exception:
         return None
-    return {"title": value_col, "code": code}
+    return {"title": value_col, "code": code, "kind": "chart"}
 
 
 def enrich(result: dict, now: datetime | None = None, question: str = "") -> dict:
@@ -172,7 +172,16 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
         (bool(sql_used) and (rows_returned > 0 or bool(data_rows)))
         or result.get("file_grounded", False)
     )
-    if not grounded and looks_like_data_table(clean):
+    # A chart or dashboard presents NUMBERS just like a table does, so a data
+    # visual with no run_sql (and no grounding file) behind it is exactly as
+    # fabricated as a bare invented table - catch both. (A plain show_widget
+    # visual, kind='widget', may legitimately need no DB data, so it isn't a
+    # trigger; but it's still stripped in the ungrounded branch below.)
+    data_visual = any(
+        (w or {}).get("kind") in ("chart", "dashboard")
+        for w in (result.get("widgets") or [])
+    )
+    if not grounded and (looks_like_data_table(clean) or data_visual):
         return {
             "answer": _UNGROUNDED_MSG,
             "suggestions": [],

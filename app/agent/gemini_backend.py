@@ -101,7 +101,7 @@ def ask_gemini(
 ) -> dict:
     """Answer a question via Gemini. Same return shape as the other backends."""
     client = _client()
-    file_grounded = attachments_mod.has_content(file_context)
+    file_grounded = attachments_mod.grounds_data(file_context)
 
     def emit(msg):
         if on_event:
@@ -204,7 +204,7 @@ def ask_gemini(
                 emit("Rendering a visual…")
                 code = widget.ensure_chart_lib(args.get("widget_code"))
                 if code:
-                    widgets.append({"title": args.get("title", "widget"), "code": code})
+                    widgets.append({"title": args.get("title", "widget"), "code": code, "kind": "widget"})
                 responses.append(
                     types.Part.from_function_response(name=name, response={"result": "rendered"})
                 )
@@ -215,7 +215,7 @@ def ask_gemini(
                 emit("Rendering a chart…")
                 try:
                     code = widget.build_chart_html(args)
-                    widgets.append({"title": args.get("title", "chart"), "code": code})
+                    widgets.append({"title": args.get("title", "chart"), "code": code, "kind": "chart"})
                     outcome = "rendered"
                 except Exception as exc:
                     outcome = f"ERROR: {exc}"
@@ -229,7 +229,7 @@ def ask_gemini(
                 emit("Building your dashboard…")
                 try:
                     code = widget.build_dashboard_html(args)
-                    widgets.append({"title": args.get("title", "dashboard"), "code": code})
+                    widgets.append({"title": args.get("title", "dashboard"), "code": code, "kind": "dashboard"})
                     outcome = "rendered"
                     dashboard_built = True
                 except Exception as exc:

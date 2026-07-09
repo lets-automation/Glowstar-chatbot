@@ -47,6 +47,29 @@ services:
     cpus: "2.0"
     restart: unless-stopped
 
+  # Chat-history store: server-side threads so every browser/device sees the
+  # same shared history (frontend/src talks to it via the backend's /threads
+  # endpoints). Published ONLY on loopback so a venv-run backend or psql can
+  # reach it during local dev - not reachable from other machines.
+  history-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: glowstar_history
+      POSTGRES_USER: glowstar
+      POSTGRES_PASSWORD: ${HISTORY_DB_PASSWORD}
+    volumes:
+      - history_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U glowstar -d glowstar_history"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    mem_limit: 512m
+    cpus: "0.5"
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
@@ -78,6 +101,9 @@ services:
       DB_USER: glowstar_ro
       DB_PASSWORD: ${DB_RO_PASSWORD}
       REDIS_URL: redis://redis:6379/0
+      # Cross-device chat history lives in the history-db Postgres container.
+      # The password must be URL-safe (letters/digits) - it is embedded here.
+      HISTORY_DB_URL: postgresql+psycopg2://glowstar:${HISTORY_DB_PASSWORD}@history-db:5432/glowstar_history
     # Make host.docker.internal resolve on Linux too (it's automatic on Docker
     # Desktop for Windows/Mac, but this keeps the file portable).
     extra_hosts:
@@ -85,8 +111,15 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    ports:
-      - "8000:8000"  # direct access to /docs; the frontend also reaches this by service name
+      history-db:
+        condition: service_healthy
+    # NOT published to the host network: the frontend/nginx already reaches the
+    # backend by its service name ("backend:8000") on the internal compose
+    # network. Publishing 8000 on 0.0.0.0 exposed the auth-optional API (and, if
+    # enabled, /docs) directly, bypassing the single-origin nginx front door.
+    # For local debugging only, bind to loopback: `127.0.0.1:8000:8000`.
+    expose:
+      - "8000"
     volumes:
       - uploads_data:/app/outputs
       - logs_data:/app/logs
@@ -110,5 +143,6 @@ services:
 volumes:
   mssql_data:
   redis_data:
+  history_data:
   uploads_data:
   logs_data:
