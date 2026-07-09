@@ -1,0 +1,46 @@
+# Backend image: FastAPI + the agent. Needs the Microsoft ODBC Driver 18 for
+# SQL Server (pyodbc talks to AasthaErp through it) - that's the fiddly part
+# below, everything else is a normal Python image.
+FROM python:3.12-slim
+
+# --- Microsoft ODBC Driver 18 for SQL Server ---
+# python:3.12-slim is Debian "bookworm" - the repo URL below is bookworm-specific.
+# unixodbc-dev is needed so pyodbc can compile against the ODBC headers.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl gnupg2 ca-certificates build-essential \
+    && curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+    && curl -sSL https://packages.microsoft.com/config/debian/12/prod.list \
+        | sed 's/\[arch=/[signed-by=\/usr\/share\/keyrings\/microsoft-prod.gpg arch=/' \
+        > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
+        msodbcsql18 unixodbc-dev \
+    && apt-get purge -y --auto-remove gnupg2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps first so this layer is cached across code changes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# .env is NOT copied into the image (see .dockerignore) - all configuration
+# comes from docker-compose's `environment:` / `env_file:` at run time, so
+# secrets never end up baked into an image layer.
+
+# Run as an unprivileged user (not root). outputs/ and logs/ are written at
+# runtime, so give the app user ownership of the working dir.
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/outputs /app/logs \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# No --reload here (that's dev-only) - one clean, stable worker.
+CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

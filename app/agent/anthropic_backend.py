@@ -8,10 +8,29 @@ available for best accuracy. The big schema block is prompt-cached.
 
 import anthropic
 
+from app.agent import attachments as attachments_mod
 from app.agent import tools, widget
 from app.agent._retry import call_with_retry
 from app.config import settings
 from app.core.logging_util import log_interaction
+
+
+def _user_content(question: str, file_context: dict | None):
+    """First user message: file text + image blocks + the question (Claude format)."""
+    if not attachments_mod.has_content(file_context):
+        return question
+    blocks = [{"type": "text", "text": attachments_mod.build_preamble(file_context)}]
+    for img in file_context.get("images", []):
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": img["media_type"],
+                "data": img["data"],
+            },
+        })
+    blocks.append({"type": "text", "text": question})
+    return blocks
 
 # Tools in Anthropic format, built from the shared specs. show_widget is appended
 # so the model can draw inline visuals instead of describing them in prose.
@@ -21,7 +40,12 @@ _ANTHROPIC_TOOLS = [
         "description": spec["description"],
         "input_schema": spec["schema"],
     }
-    for spec in (*tools.TOOL_SPECS, widget.SHOW_WIDGET_TOOL_SPEC)
+    for spec in (
+        *tools.TOOL_SPECS,
+        widget.SHOW_WIDGET_TOOL_SPEC,
+        widget.SHOW_CHART_TOOL_SPEC,
+        widget.SHOW_DASHBOARD_TOOL_SPEC,
+    )
 ]
 
 
@@ -60,10 +84,12 @@ def ask_anthropic(
     model: str,
     history: list[dict] | None = None,
     on_event=None,
+    file_context: dict | None = None,
 ) -> dict:
     """Answer a question via Claude. Returns {answer, sql_used, rows_returned}."""
     client = _client()
     history = history or []
+    file_grounded = attachments_mod.has_content(file_context)
 
     def emit(msg):
         if on_event:
@@ -72,11 +98,13 @@ def ask_anthropic(
     emit("Analyzing your question…")
     routing_text = tools.routing_text(question, history)
     system = _system_blocks(routing_text)
-    messages = [*history, {"role": "user", "content": question}]
+    messages = [*history, {"role": "user", "content": _user_content(question, file_context)}]
 
     sql_used: list[str] = []
     last_row_count = 0
     widgets: list[dict] = []  # visuals emitted via show_widget, shown to the user
+    data_columns: list[str] = []  # columns/rows from the LAST successful run_sql,
+    data_rows: list[dict] = []    # captured so export uses the exact data shown
 
     for _ in range(tools.MAX_TOOL_ROUNDS):
         try:
@@ -87,6 +115,7 @@ def ask_anthropic(
                     system=system,
                     tools=_ANTHROPIC_TOOLS,
                     messages=messages,
+                    temperature=0,
                 )
             )
         except Exception as exc:
@@ -117,6 +146,9 @@ def ask_anthropic(
                 "sql_used": sql_used,
                 "rows_returned": last_row_count,
                 "widgets": widgets,
+                "data_columns": data_columns,
+                "data_rows": data_rows,
+                "file_grounded": file_grounded,
             }
 
         tool_results = []
@@ -127,7 +159,7 @@ def ask_anthropic(
                 # Not a DB tool: the "result" is a UI artifact for the user. Capture
                 # it and return a minimal tool_result so the tool cycle stays valid.
                 emit("Rendering a visual…")
-                code = (block.input or {}).get("widget_code")
+                code = widget.ensure_chart_lib((block.input or {}).get("widget_code"))
                 if code:
                     widgets.append(
                         {"title": (block.input or {}).get("title", "widget"), "code": code}
@@ -136,11 +168,45 @@ def ask_anthropic(
                     {"type": "tool_result", "tool_use_id": block.id, "content": "rendered"}
                 )
                 continue
+
+            if block.name == widget.SHOW_CHART_TOOL_SPEC["name"]:
+                # Deterministic chart: the model gives data, we build correct HTML.
+                emit("Rendering a chart…")
+                try:
+                    code = widget.build_chart_html(block.input or {})
+                    widgets.append(
+                        {"title": (block.input or {}).get("title", "chart"), "code": code}
+                    )
+                    outcome = "rendered"
+                except Exception as exc:
+                    outcome = f"ERROR: {exc}"
+                tool_results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": outcome}
+                )
+                continue
+
+            if block.name == widget.SHOW_DASHBOARD_TOOL_SPEC["name"]:
+                # Deterministic dashboard: the model gives data, we build the page.
+                emit("Building your dashboard…")
+                try:
+                    code = widget.build_dashboard_html(block.input or {})
+                    widgets.append(
+                        {"title": (block.input or {}).get("title", "dashboard"), "code": code}
+                    )
+                    outcome = "rendered"
+                except Exception as exc:
+                    outcome = f"ERROR: {exc}"
+                tool_results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": outcome}
+                )
+                continue
             emit(tools.friendly_status(block.name))
-            result_text, sql, row_count = tools.run_tool(block.name, block.input)
+            result_text, sql, row_count, cols_full, rows_full = tools.run_tool(block.name, block.input)
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
+                if block.name == "run_sql" and rows_full:
+                    data_columns, data_rows = cols_full, rows_full
             tool_results.append(
                 {
                     "type": "tool_result",
@@ -163,13 +229,15 @@ def ask_anthropic(
             ),
         }
     )
+    synth_ok = True
     try:
         final = client.messages.create(
-            model=model, max_tokens=1024, system=system, messages=messages
+            model=model, max_tokens=1024, system=system, messages=messages, temperature=0
         )
         answer = "".join(b.text for b in final.content if b.type == "text").strip()
     except Exception:
         answer = ""
+        synth_ok = False
 
     log_interaction(question, sql_used, last_row_count)
     return {
@@ -177,4 +245,8 @@ def ask_anthropic(
         "sql_used": sql_used,
         "rows_returned": last_row_count,
         "widgets": widgets,
+        "ok": synth_ok,
+        "data_columns": data_columns,
+        "data_rows": data_rows,
+        "file_grounded": file_grounded,
     }

@@ -1,6 +1,7 @@
 # Core build dependencies
 anthropic
 groq
+google-genai  # Gemini backend (free-tier fallback for Groq)
 fastapi
 uvicorn
 python-multipart  # required by FastAPI for file uploads (/upload)
@@ -9,10 +10,20 @@ pyodbc
 pydantic
 python-dotenv
 
+# Authentication (individual user logins) + Redis (sessions, users, rate limits)
+redis
+bcrypt        # password hashing
+pyjwt         # JWT access tokens
+
 # Phase 6 - artifact generation
 openpyxl
 reportlab
 matplotlib
+
+# File-attachment analysis (Excel/CSV/PDF/image upload -> agent)
+pandas    # Excel/CSV parsing + summary stats
+pypdf     # PDF text extraction
+pillow    # image downscaling before vision
 
 # Phase 7 - semantic search (optional; needs Voyage + Pinecone keys)
 voyageai

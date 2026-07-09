@@ -26,8 +26,34 @@ export function loadThreads() {
 export function saveThreads(threads) {
   try {
     localStorage.setItem(KEY, JSON.stringify(threads))
+    return
   } catch {
-    /* quota / private-mode — history just won't persist this session */
+    /* likely quota: big export snapshots can exceed localStorage's ~5MB */
+  }
+  // Fallback 1: keep history but trim bulky export rows to a small preview.
+  try {
+    const slim = threads.map((t) => ({
+      ...t,
+      messages: (t.messages || []).map((m) =>
+        m.exportRows?.length > 50
+          ? { ...m, exportRows: m.exportRows.slice(0, 50), exportTruncated: true }
+          : m,
+      ),
+    }))
+    localStorage.setItem(KEY, JSON.stringify(slim))
+    return
+  } catch {
+    /* still too big */
+  }
+  // Fallback 2: keep only the 10 most recent threads, titles intact.
+  try {
+    const minimal = threads.slice(0, 10).map((t) => ({
+      ...t,
+      messages: (t.messages || []).map(({ exportRows, exportColumns, widgets, ...m }) => m),
+    }))
+    localStorage.setItem(KEY, JSON.stringify(minimal))
+  } catch {
+    /* private mode / storage disabled — history won't persist this session */
   }
 }
 

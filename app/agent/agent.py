@@ -11,7 +11,13 @@ Switching providers is a one-line change in .env (LLM_PROVIDER + the key).
 The shared rules, schema prompt, and tool handlers live in tools.py.
 """
 
-from app.agent import anthropic_backend, groq_backend, postprocess
+from app.agent import (
+    anthropic_backend,
+    attachments as attachments_mod,
+    gemini_backend,
+    groq_backend,
+    postprocess,
+)
 from app.config import settings
 
 
@@ -20,29 +26,44 @@ def ask(
     history: list[dict] | None = None,
     model: str | None = None,
     on_event=None,
+    attachments: list[dict] | None = None,
 ) -> dict:
     """
     Answer a natural-language question using the configured LLM provider.
 
-    history:  optional prior turns for conversation memory.
-    on_event: optional callback(status_str) called as tools run (for live UI).
+    history:     optional prior turns for conversation memory.
+    on_event:    optional callback(status_str) called as tools run (for live UI).
+    attachments: optional uploaded files [{file_id, filename}] to analyse.
 
     Returns the enriched response:
       { answer, suggestions[], citation, export_query, sql_used[], rows_returned }
     """
     provider = settings.LLM_PROVIDER.lower()
 
-    if provider == "anthropic":
+    # Read the uploaded files ONCE (into text + image blocks) so every backend
+    # receives the same ready-to-use content instead of re-parsing.
+    file_context = None
+    if attachments:
+        if on_event:
+            on_event("Reading your file(s)…")
+        file_context = attachments_mod.process_attachments(attachments)
+
+    if provider in ("anthropic", "claude"):
         raw = anthropic_backend.ask_anthropic(
-            question, model or settings.ANTHROPIC_MODEL, history, on_event
+            question, model or settings.ANTHROPIC_MODEL, history, on_event, file_context
+        )
+    elif provider == "gemini":
+        raw = gemini_backend.ask_gemini(
+            question, model or settings.GEMINI_MODEL, history, on_event, file_context
         )
     else:
         raw = groq_backend.ask_groq(
-            question, model or settings.GROQ_MODEL, history, on_event
+            question, model or settings.GROQ_MODEL, history, on_event, file_context
         )
 
-    # Add suggestions, citation, and export query (deterministic, no LLM cost).
-    return postprocess.enrich(raw)
+    # Add suggestions, citation, export query, and the chart backstop
+    # (deterministic, no LLM cost).
+    return postprocess.enrich(raw, question=question)
 
 
 # Quick manual check: `python -m app.agent.agent`

@@ -5,6 +5,9 @@ import Hero from './components/Hero'
 import Thread from './components/Thread'
 import { useGlowstarRuntime } from './runtime/useGlowstarRuntime'
 
+// Name shown in the top-right corner. No login screen — the chatbot runs
+// standalone. (API access control lives in the backend behind AUTH_ENABLED,
+// off by default; a CRM/SSO integration would supply identity there.)
 const USER = {
   name: 'Chintan',
   avatar: 'https://api.dicebear.com/9.x/glass/svg?seed=Chintan&backgroundColor=A582EA,C9B6F5',
@@ -136,6 +139,7 @@ export default function App() {
               isStreaming={rt.isStreaming}
               status={rt.status}
               composerProps={composerProps}
+              onWidgetPrompt={(text) => rt.send(text)}
             />
           ) : (
             <Hero userName={USER.name} composerProps={composerProps} onPickPrompt={setInput} />

@@ -33,6 +33,7 @@ KEY_TABLES = [
     "tblJangadPackets",
     "tblPlanMaster",
     "tblPlanMasterOptional",
+    "tblPlanReport",
     "tblLabourRate",
     "tblPointRateLabour",
     "tblLabourResult",
@@ -46,6 +47,42 @@ KEY_TABLES = [
     "tblEmployee",
     "tblEmpDetail",
 ]
+
+
+# When the column list must be capped, keep the columns the agent actually
+# needs to write rich answers: keys it can JOIN on and the human-readable /
+# business columns (names, weights, amounts, dates, types...). Without this,
+# the cap used to cut columns in raw table order, hiding e.g. PreWt/NewWt or
+# a Name column - so the agent couldn't enrich answers it otherwise would.
+_PRIORITY_PATTERNS = (
+    "name", "no", "code", "type", "status", "date", "time",
+    "wt", "weight", "carat", "point", "amount", "amt", "rate", "value",
+    "qty", "pcs", "price", "credit", "debit",
+    "shape", "color", "colour", "florecent", "fluor", "tension", "tansion",
+    "cut", "purity", "clarity",
+    "emp", "kapan", "packet", "dept",
+)
+
+
+def _col_priority(col_name: str) -> int:
+    low = col_name.lower()
+    if low == "id":  # primary key - always keep
+        return -1
+    for rank, pat in enumerate(_PRIORITY_PATTERNS):
+        if pat in low:
+            return rank
+    return len(_PRIORITY_PATTERNS)
+
+
+def _cap_columns(cols: list[dict], max_cols: int) -> list[dict]:
+    """Pick the most useful max_cols columns, shown in original table order."""
+    if len(cols) <= max_cols:
+        return cols
+    ranked = sorted(
+        range(len(cols)),
+        key=lambda i: (_col_priority(cols[i]["name"]), i),
+    )[:max_cols]
+    return [cols[i] for i in sorted(ranked)]
 
 
 def _relationships_for(table: str, foreign_keys: list[dict]) -> list[str]:
@@ -98,7 +135,7 @@ def build_schema_context(table_names: list[str] | None = None) -> str:
 
         # MAX_COLS_PER_TABLE = 0 means "no cap" (show all columns).
         if MAX_COLS_PER_TABLE and len(cols) > MAX_COLS_PER_TABLE:
-            shown_cols = cols[:MAX_COLS_PER_TABLE]
+            shown_cols = _cap_columns(cols, MAX_COLS_PER_TABLE)
             col_text = ", ".join(f"{c['name']} ({c['type']})" for c in shown_cols)
             col_text += f", ... (+{len(cols) - MAX_COLS_PER_TABLE} more columns)"
         else:
