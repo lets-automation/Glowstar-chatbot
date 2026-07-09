@@ -58,6 +58,14 @@ class Settings:
     # "redis" is the service name inside Docker Compose; "localhost" for local dev.
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+    # --- Chat-history store (Postgres; cross-device threads) ---
+    # SQLAlchemy URL of the history database, e.g.
+    #   postgresql+psycopg2://glowstar:<password>@history-db:5432/glowstar_history
+    # Compose injects the in-network URL automatically (docker-compose.yml).
+    # EMPTY (the default) disables server-side history: the /threads endpoints
+    # return 503 and the frontend falls back to per-browser localStorage.
+    HISTORY_DB_URL: str = os.getenv("HISTORY_DB_URL", "")
+
     # --- Authentication master switch ---
     # OFF by default: the chatbot runs standalone with NO login screen and open
     # API access (correct for a localhost/embedded deployment). The client turns
@@ -79,10 +87,24 @@ class Settings:
     RATE_LIMIT_PER_MINUTE: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", "20"))
 
     # --- CORS ---
-    # Comma-separated origins allowed to call the API, e.g.
-    # "https://chat.glowstardiam.com,http://localhost:5173". Defaults to "*"
-    # for local dev only - set this explicitly for any real deployment.
-    CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "*")
+    # Comma-separated origins allowed to call the API cross-origin, e.g.
+    # "https://chat.glowstardiam.com". The Docker deployment serves the frontend
+    # AND proxies /api from the SAME origin (nginx :8080), so it needs no CORS at
+    # all; CORS only matters for local dev where Vite (:5173) calls the API
+    # (:8000) cross-origin. The default is therefore the local dev origins - NOT
+    # "*". For a real deployment set this to the exact CRM/frontend origin(s).
+    # A wildcard "*" is refused credentials in main.py (a wildcard + credentials
+    # would let ANY website read this auth-optional API).
+    CORS_ORIGINS: str = os.getenv(
+        "CORS_ORIGINS", "http://localhost:5173,http://localhost:3000"
+    )
+
+    # Expose the interactive API docs (/docs, /redoc, /openapi.json)? OFF by
+    # default so an internet-reachable backend does not advertise its whole API
+    # surface to anonymous callers. Turn on for local development only.
+    API_DOCS_ENABLED: bool = os.getenv("API_DOCS_ENABLED", "false").lower() in (
+        "1", "true", "yes",
+    )
 
 
 # A single shared settings object the whole app imports.

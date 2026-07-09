@@ -16,6 +16,17 @@ logs/
 .git/
 .gitignore
 
+# NEVER bake the operator's data/backups or generated reports into the image
+# ("COPY . ." would otherwise ship the real AasthaErp backup + exports).
+db_backup/
+artifacts/
+*.bak
+*.mdf
+*.ldf
+*.xlsx
+*.pdf
+tests/
+
 # Editor/OS cruft
 .vscode/
 .idea/

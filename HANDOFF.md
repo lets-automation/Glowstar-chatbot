@@ -336,3 +336,87 @@ analytics overview of our production this year", "Kapan NS26 analysis").
 
 **Budget state after this session:** BOTH Groq keys at daily cap (rolling reset ~1h); Gemini key#2
 in container (~18 req left), key#3 partially used locally. One dashboard turn ≈ 5-6 Gemini requests.
+
+---
+
+## APPENDIX — Cross-device chat history (2026-07-09, built)
+
+**Decision (user-confirmed):** server-side history in a new **Postgres** container, **one shared
+"team" pool** (no login; anyone opening the site sees all chats — accepted for the small client
+team). A `user_key` column (default `'team'`) future-proofs per-user scoping without a migration.
+
+**Backend:**
+- `history-db` service in `docker-compose.yml`: `postgres:16-alpine`, volume `history_data`,
+  published **loopback-only** (`127.0.0.1:5432`) for venv/psql dev; backend gets
+  `HISTORY_DB_URL` injected (URL-safe password `HISTORY_DB_PASSWORD` in `.env`).
+- `app/core/history.py`: SQLAlchemy-core store, ONE JSONB doc per thread (`chat_threads`),
+  epoch-ms timestamps (round-trips frontend `Date.now()`), lazy engine + `create_all` on first
+  use, portable update-then-insert upsert (tests run the same code on in-memory sqlite).
+- `app/api/main.py`: `GET/PUT/DELETE /threads[/{id}]` — id charset-constrained, 5 MB/thread cap
+  (413), whole-thread upsert, 503 when unconfigured/unreachable (frontend then falls back).
+- `app/core/rate_limit.py`: refactored to `make_rate_limiter(scope, per_minute)`;
+  `enforce_history_rate_limit` = separate `history:` bucket at 120/min so browsing history never
+  eats the 20/min LLM budget (and vice versa). `enforce_rate_limit` unchanged in behaviour.
+- New dep `psycopg2-binary==2.9.10` (installed in venv too).
+
+**Frontend (`useGlowstarRuntime.js` + `api.js` + `chatStore.js`):**
+- Mount: `GET /threads` (metadata only) → server mode; opening a chat lazy-fetches its messages;
+  every turn does a debounced (600 ms) whole-thread `PUT`; delete calls `DELETE`.
+- **One-time migration:** first load pushes existing localStorage threads to the server, then sets
+  `glowstar.threads.migrated.v1` (so wiping server history can't resurrect them).
+- **Fallback:** any listing failure → old per-browser localStorage behaviour, silently.
+- Safety details: `send()` blocked while a thread's messages are loading (can't base a turn on an
+  empty placeholder and save over real history); transient error banners never persist; deleting a
+  thread cancels its pending debounced save; export rows trimmed to 1000/message on save (backend
+  cap is 5 MB/thread).
+- This SUPERSEDES the old "multi-tab last-write-wins / localStorage quota" flagged items in §5 for
+  the primary path (last-write-wins still applies BETWEEN devices editing the same thread; fine).
+
+**Known limits (accepted):** no live sync between open devices (refresh to see another device's
+new chats); delete on one device doesn't push to an already-open other device; shared pool = no
+privacy between staff (that's the chosen model).
+
+**Tests:** `tests/test_history.py` (sqlite in-memory, covers store CRUD + endpoints + 413/422/503
+paths + memory reconstruction). Suite now **25 pass / 1 skip**.
+
+**AUDIT (2026-07-09, 155-agent adversarial workflow: 7 dims × 3-skeptic verify + completeness critic).**
+49 raw findings → ~17 distinct after dedup. 3 HIGH-priority items FIXED this session (verified):
+1. **"Bot forgets" (memory divergence).** Threads are durable in Postgres but LLM memory was Redis-only
+   (24h TTL, 6 turns) → reopening an old/cross-device thread showed full history the model had no
+   recollection of. FIX: `app/api/main.py::_load_history` — if the Redis session is empty, rebuild
+   follow-up context from the durable thread messages (`sessions.history_from_messages`) and warm Redis.
+   `DELETE /threads` now also `clear_session`s. Verified in-container: expired session → rebuilt from PG.
+2. **X-Forwarded-For rate-limit bypass** (`app/core/rate_limit.py::_client_ip`). First XFF hop is
+   client-controlled (nginx APPENDS the real peer), so a rotating fake header minted unlimited buckets →
+   the 20/min (chat) + 120/min (history) caps were void with no auth. FIX: prefer nginx's `X-Real-IP`,
+   else the LAST XFF hop. Proven: rotating spoof now collapses to one constant key. NOTE: this was a
+   PRE-EXISTING weakness (the guest→IP keying predates the history feature; my refactor only inherited it).
+3. **First turn lost in the mount-probe window** (`useGlowstarRuntime.js`). Before the async probe
+   resolved, `serverModeRef` was null so a turn persisted nowhere, then `setThreads(list)` REPLACED state
+   and dropped it. FIX: `mergeThreads` (never clobber a window-created chat) + flush-persist once mode is
+   known + set mode BEFORE migration + only `markMigrated()` when EVERY push lands (also fixes the
+   partial-migration-orphan medium finding).
+
+**SECOND FIX BATCH (2026-07-09, "history hardening" — all verified, tests 32 pass / 1 skip):**
+- **Silent data loss FIXED.** Server-mode save failures were swallowed with no backup, and a tab closing
+  within the 600ms debounce lost the turn. Now `frontend/src/lib/chatStore.js` has an UNSYNCED backup
+  (`glowstar.unsynced.v1`): a failed PUT stashes the thread locally; a `pagehide`/`visibilitychange`
+  flush stashes threads still debouncing OR mid-PUT (via `inFlightRef`); mount reconciliation retries
+  them and clears on success. A save confirmed on the server clears its backup.
+- **Delete-undone-by-in-flight-PUT FIXED.** `deletedIdsRef` — a PUT that lands after a DELETE re-deletes
+  the row; pending/backup entries for a deleted id are dropped.
+- **Byte-accurate size cap** (`app/api/main.py` put_thread): measures UTF-8 BYTES incl. title, so
+  multi-byte (Gujarati/emoji) can't store ~3× the 5 MB cap. Verified: 12 MB multibyte PUT → 413.
+- **Thread-id collision FIXED** (`useGlowstarRuntime.js` `newThreadId`): `crypto.randomUUID()` instead of
+  `Date.now()+rand(1e4)`, so two devices can't collide onto one id and merge two chats.
+- **Redis-down → graceful** (`app/core/rate_limit.py`): the limiter FAILS OPEN on Redis errors (logged)
+  instead of an unhandled 500. Verified: stopped redis → GET/PUT /threads still 200.
+- New tests: `tests/test_rate_limit.py` (XFF anti-spoof, fail-open, 429, scope isolation — also covers the
+  previously-untested default /chat limiter) + byte-cap + memory-reconstruction cases in test_history.py.
+
+Remaining audit items (NOT yet fixed, ranked): unauthenticated GET/PUT/DELETE any thread = no
+ownership/tampering (partly by-design for the shared pool — needs soft-delete/tombstones to be safe) +
+unbounded thread COUNT growth (no eviction/cap); split-brain after a mid-life probe failure (migrated flag
+sticks → fallback-mode threads never sync); cross-device concurrent same-thread PUT is last-write-wins;
+nginx `/threads` inherits the 300s SSE timeout. Full deduped list + severities in the session summary +
+[[glowstar-history-audit]] memory.

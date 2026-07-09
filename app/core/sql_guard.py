@@ -21,22 +21,26 @@ DEFAULT_ROW_CAP = 1000
 # Words that mean "this query changes data or runs commands" -> always reject.
 # Matched as whole words, case-insensitive.
 _FORBIDDEN = [
-    # data modification
-    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "MERGE",
-    "CREATE", "INTO",
+    # data modification (UPDATETEXT/WRITETEXT are separate keywords - they do NOT
+    # contain a word boundary after "UPDATE"/"WRITE", so list them explicitly)
+    "INSERT", "UPDATE", "UPDATETEXT", "WRITETEXT", "DELETE", "DROP", "ALTER",
+    "TRUNCATE", "MERGE", "CREATE", "INTO",
     # command / privilege execution
     "EXEC", "EXECUTE", "GRANT", "REVOKE", "DENY", "RECONFIGURE", "SHUTDOWN",
     # admin / file / external data access
     "BACKUP", "RESTORE", "DBCC", "BULK", "WAITFOR",
-    "OPENROWSET", "OPENQUERY", "OPENDATASOURCE",
-    # stored-procedure prefixes
-    "SP_", "XP_",
+    "OPENROWSET", "OPENQUERY", "OPENDATASOURCE", "OPENJSON",
 ]
 
 _FORBIDDEN_RE = re.compile(
     r"\b(" + "|".join(re.escape(w) for w in _FORBIDDEN) + r")\b",
     re.IGNORECASE,
 )
+
+# Stored-procedure names (sp_executesql, xp_cmdshell, ...). A "\bSP_\b" pattern
+# NEVER matches these (there is no word boundary between "_" and the next letter),
+# so match the PREFIX followed by name chars instead.
+_PROC_RE = re.compile(r"\b(?:sp|xp)_\w+", re.IGNORECASE)
 
 
 def is_read_only(sql: str) -> tuple[bool, str]:
@@ -68,6 +72,11 @@ def is_read_only(sql: str) -> tuple[bool, str]:
     match = _FORBIDDEN_RE.search(without_trailing)
     if match:
         return False, f"Forbidden keyword found: {match.group(1).upper()}"
+
+    # Must not call a stored procedure (sp_.../xp_...).
+    proc = _PROC_RE.search(without_trailing)
+    if proc:
+        return False, f"Stored-procedure calls are not allowed: {proc.group(0)}"
 
     return True, "ok"
 

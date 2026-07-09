@@ -1,33 +1,41 @@
-# Core build dependencies
-anthropic
-groq
-google-genai  # Gemini backend (free-tier fallback for Groq)
-fastapi
-uvicorn
-python-multipart  # required by FastAPI for file uploads (/upload)
-sqlalchemy
-pyodbc
-pydantic
-python-dotenv
+# Pinned for reproducible builds (was fully unpinned: `docker compose build`
+# would resolve the latest of every package at build time, so two builds could
+# ship different, untested code). Versions = what this project was tested on.
+# Bump deliberately and re-test.
+
+# Core
+anthropic==0.112.0
+groq==1.5.0
+google-genai==2.10.0        # Gemini backend (free-tier fallback for Groq)
+fastapi==0.138.1
+uvicorn==0.49.0
+python-multipart==0.0.32    # required by FastAPI for file uploads (/upload)
+sqlalchemy==2.0.51
+pyodbc==5.3.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+
+# Chat-history store (cross-device threads; the history-db Postgres container)
+psycopg2-binary==2.9.10
 
 # Authentication (individual user logins) + Redis (sessions, users, rate limits)
-redis
-bcrypt        # password hashing
-pyjwt         # JWT access tokens
+redis==8.0.1
+bcrypt==5.0.0               # password hashing
+pyjwt==2.13.0               # JWT access tokens
 
 # Phase 6 - artifact generation
-openpyxl
-reportlab
-matplotlib
+openpyxl==3.1.5
+reportlab==5.0.0
+matplotlib==3.11.0
 
 # File-attachment analysis (Excel/CSV/PDF/image upload -> agent)
-pandas    # Excel/CSV parsing + summary stats
-pypdf     # PDF text extraction
-pillow    # image downscaling before vision
+pandas==3.0.3              # Excel/CSV parsing + summary stats
+pypdf==6.14.2             # PDF text extraction
+pillow==12.2.0            # image downscaling before vision
 
 # Phase 7 - semantic search (optional; needs Voyage + Pinecone keys)
-voyageai
-pinecone
+voyageai==0.4.1
+pinecone==9.1.0
 
 # Phase 8 - internal demo UI
-streamlit
+streamlit==1.58.0

