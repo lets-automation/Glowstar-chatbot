@@ -6,6 +6,7 @@
 # Core
 anthropic==0.112.0
 groq==1.5.0
+openai==2.45.0              # Ollama backend (local/offline testing via OpenAI-compatible API)
 google-genai==2.10.0        # Gemini backend (free-tier fallback for Groq)
 fastapi==0.138.1
 uvicorn==0.49.0
