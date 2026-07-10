@@ -54,7 +54,15 @@ _GROQ_TOOLS = [
 ]
 
 
-def _client() -> Groq:
+def _client():
+    # Local Ollama: OpenAI-compatible endpoint on this machine — no key, no
+    # internet, no quota. Use the real OpenAI SDK here, NOT the Groq client:
+    # the Groq SDK hardcodes Groq's "/openai/v1/…" request path and would 404
+    # against Ollama. The OpenAI client honours base_url correctly, and exposes
+    # the identical chat.completions.create surface this backend relies on.
+    if settings.LLM_PROVIDER.lower() == "ollama":
+        from openai import OpenAI
+        return OpenAI(api_key="ollama", base_url=settings.OLLAMA_BASE_URL)
     if not settings.GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in .env.")
     return Groq(api_key=settings.GROQ_API_KEY)

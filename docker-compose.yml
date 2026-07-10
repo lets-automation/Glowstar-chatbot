@@ -139,6 +139,10 @@ services:
       # Cross-device chat history lives in the history-db Postgres container.
       # The password must be URL-safe (letters/digits) - it is embedded here.
       HISTORY_DB_URL: postgresql+psycopg2://glowstar:${HISTORY_DB_PASSWORD}@history-db:5432/glowstar_history
+      # Local-model testing (set LLM_PROVIDER=ollama in .env): Ollama runs on the
+      # HOST, so the container must reach it via host.docker.internal, NOT the
+      # container's own localhost. Ignored unless LLM_PROVIDER=ollama.
+      OLLAMA_BASE_URL: http://host.docker.internal:11434/v1
     # Make host.docker.internal resolve on Linux too (it's automatic on Docker
     # Desktop for Windows/Mac, but this keeps the file portable).
     extra_hosts:

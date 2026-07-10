@@ -56,6 +56,12 @@ def ask(
         raw = gemini_backend.ask_gemini(
             question, model or settings.GEMINI_MODEL, history, on_event, file_context
         )
+    elif provider == "ollama":
+        # Local model via Ollama's OpenAI-compatible API — reuses the Groq
+        # backend (same tool-calling dialect); _client() points at Ollama.
+        raw = groq_backend.ask_groq(
+            question, model or settings.OLLAMA_MODEL, history, on_event, file_context
+        )
     else:
         raw = groq_backend.ask_groq(
             question, model or settings.GROQ_MODEL, history, on_event, file_context

@@ -44,6 +44,13 @@ class Settings:
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+    # Ollama (LOCAL, offline testing). Runs a model on this machine via Ollama's
+    # OpenAI-compatible endpoint — no API key, no internet, no daily quota. Set
+    # LLM_PROVIDER=ollama to use it (routed through the Groq backend, which speaks
+    # the same tool-calling dialect). Run `ollama pull <model>` first.
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+
     # Max columns shown per table in the schema context.
     # TEMPORARY token-saving cap for the free tier. Set SCHEMA_MAX_COLS=0
     # (no cap) once on Claude / paid tier for fuller, more accurate context.
