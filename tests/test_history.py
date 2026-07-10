@@ -78,6 +78,70 @@ def test_store_crud_roundtrip(store):
     assert history.delete_thread("t-1") is False  # already gone
 
 
+def test_soft_delete_is_recoverable(store):
+    """Delete tombstones the thread (excluded from list/get) but restore brings
+    it back — so a delete in the shared no-auth pool isn't instantly destructive."""
+    history.upsert_thread("t-sd", _MSGS, title="soft")
+    assert history.delete_thread("t-sd") is True
+    assert history.get_thread("t-sd") is None            # hidden from get
+    assert [t["id"] for t in history.list_threads()] == []  # and from the list
+    assert history.delete_thread("t-sd") is False         # already deleted
+
+    assert history.restore_thread("t-sd") is True         # undo
+    assert history.get_thread("t-sd") is not None
+    assert [t["id"] for t in history.list_threads()] == ["t-sd"]
+    assert history.restore_thread("t-sd") is False        # nothing to restore now
+
+
+def test_purge_removes_old_tombstones(store, monkeypatch):
+    """A soft-deleted thread older than the retention window is hard-purged
+    (opportunistically, on the next delete) so tombstones can't accumulate."""
+    monkeypatch.setattr(history, "SOFT_DELETE_RETENTION_MS", 1000)  # 1s window
+    # Insert a thread and force its tombstone far into the past.
+    history.upsert_thread("t-old", _MSGS, title="old")
+    engine = history.get_engine()
+    with engine.begin() as conn:
+        conn.execute(
+            history.chat_threads.update()
+            .where(history.chat_threads.c.id == "t-old")
+            .values(deleted_at=1)  # epoch-ms=1 -> ancient
+        )
+    # Any later delete triggers the opportunistic purge.
+    history.upsert_thread("t-trigger", _MSGS, title="trigger")
+    history.delete_thread("t-trigger")
+    # The ancient tombstone is gone for good -> not even restorable.
+    assert history.restore_thread("t-old") is False
+
+
+def test_thread_count_cap_refuses_new_threads(store, monkeypatch):
+    monkeypatch.setattr(history, "MAX_THREADS", 2)
+    history.upsert_thread("t-1", _MSGS, title="1")
+    history.upsert_thread("t-2", _MSGS, title="2")
+    with pytest.raises(history.ThreadLimitError):
+        history.upsert_thread("t-3", _MSGS, title="3")  # over cap -> refused
+    # Updating an EXISTING thread must still work at the cap.
+    history.upsert_thread("t-1", _MSGS + [{"role": "user", "content": "more"}], title="1")
+    # A soft-delete frees a slot -> a new thread fits again.
+    history.delete_thread("t-2")
+    history.upsert_thread("t-3", _MSGS, title="3")
+    assert {t["id"] for t in history.list_threads()} == {"t-1", "t-3"}
+
+
+def test_cap_maps_to_507_endpoint(store, monkeypatch):
+    monkeypatch.setattr(history, "MAX_THREADS", 1)
+    assert client.put("/threads/t-a", json={"messages": _MSGS}).status_code == 200
+    assert client.put("/threads/t-b", json={"messages": _MSGS}).status_code == 507
+
+
+def test_restore_endpoint(store):
+    client.put("/threads/t-r", json={"title": "r", "messages": _MSGS})
+    client.delete("/threads/t-r")
+    assert client.get("/threads/t-r").status_code == 404
+    assert client.post("/threads/t-r/restore").json() == {"restored": True}
+    assert client.get("/threads/t-r").status_code == 200
+    assert client.post("/threads/t-nope/restore").status_code == 404
+
+
 def test_store_lists_newest_first(store):
     history.upsert_thread("t-old", _MSGS, title="old")
     history.upsert_thread("t-new", _MSGS, title="new")

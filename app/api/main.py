@@ -561,6 +561,13 @@ def put_thread(
         history.upsert_thread(
             thread_id, req.messages, title=req.title, created_at=req.createdAt
         )
+    except history.ThreadLimitError:
+        # History is full (bounds a disk-fill DoS). The frontend treats any
+        # non-2xx as "fall back to localStorage", so the chat isn't lost.
+        raise HTTPException(
+            status_code=507,
+            detail="Chat history is full. Delete old chats to make room.",
+        )
     except Exception:
         raise _history_unavailable("save")
     return {"status": "saved"}
@@ -585,6 +592,23 @@ def remove_thread(
     except Exception:
         logger.warning("could not clear session memory for %s", thread_id, exc_info=True)
     return {"deleted": existed}
+
+
+@app.post("/threads/{thread_id}/restore")
+def restore_thread(
+    thread_id: str = _THREAD_ID, user: dict = Depends(enforce_history_rate_limit)
+):
+    """Undo a soft-delete within the retention window (a delete only tombstones
+    the thread — see history.delete_thread). Enables an 'undo delete' without a
+    schema change; no UI wired to it yet."""
+    _history_ready()
+    try:
+        restored = history.restore_thread(thread_id)
+    except Exception:
+        raise _history_unavailable("restore")
+    if not restored:
+        raise HTTPException(status_code=404, detail="No recoverable thread with that id.")
+    return {"restored": True}
 
 
 @app.post("/export")
