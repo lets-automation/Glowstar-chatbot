@@ -23,6 +23,10 @@ _STOP = {
     "what", "total", "count", "list", "show", "give", "me", "number", "all",
     "much", "there", "and", "by", "with", "which", "do", "does", "records",
     "record", "data", "have", "has", "was", "were", "this", "that", "get",
+    # Pronouns carry no routing signal but appear in many questions ("how many
+    # do WE have", "who are OUR clients") and would spuriously match any note
+    # containing them - so ignore them.
+    "we", "our", "us", "my", "your",
 }
 
 # Map a few synonyms to the word used in the schema/glossary.
@@ -30,6 +34,9 @@ _STOP = {
 _SYN = {
     "labor": "labour", "emp": "employee", "worker": "employee",
     "staff": "employee", "pkt": "packet", "stone": "packet",
+    # Gujlish role word for worker/employee (Surat diamond floor) — without this,
+    # "karigar" questions fell through to the default table list (Layer-2 Q51).
+    "karigar": "employee", "kaarigar": "employee",
     "wt": "weight", "qty": "quantity",
     # All fluorescence spellings (question + the DB's two misspellings) map to
     # one token so they match each other during routing.
@@ -50,8 +57,14 @@ _DEFAULT = [
 _PRIMARY = {
     "tblPacketHistory", "tblFinalPacket", "tblPacket", "tblPacketIssue",
     "tblLabourResult", "tblPlanMaster", "tblPlanReport", "tblJangadPackets",
-    "tblPacketPoint", "tblEmployee", "tblEmpDetail",
+    "tblPacketPoint", "tblEmployee", "tblEmpDetail", "tblKapan",
 }
+
+# One-row-per-entity MASTER tables. On a score tie they should beat their own
+# derived/history siblings (e.g. tblPacket over tblPacketHistory/tblFinalPacket,
+# tblKapan over packet tables) so a plain "packets/kapans …" question always
+# includes the master and doesn't get it bumped out of the top-k (Layer-2 Q33).
+_MASTER = {"tblPacket", "tblKapan", "tblEmployee"}
 
 
 def _norm(word: str) -> str:
@@ -117,6 +130,9 @@ def select_tables(question: str, k: int = 4) -> list[str]:
             # Prefer main transactional tables over rate/config lookup tables.
             if table in _PRIMARY:
                 score += 2
+            # Break ties toward the one-row-per-entity master (see _MASTER).
+            if table in _MASTER:
+                score += 1
             scores[table] = score
 
     ranked = sorted(scores, key=lambda t: scores[t], reverse=True)[:k]

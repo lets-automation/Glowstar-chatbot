@@ -375,6 +375,30 @@ DATA_NOTES = [
     "Plan', or finding 'Polish plans still pending GIA', means self-joining tblPlanMaster "
     "by Packet_ID across these RapVer stages — but CONFIRM with the client exactly which "
     "RapVer value = 'Marker Approved' before trusting that comparison.",
+    "AMBIGUOUS 'HOW MANY DIAMONDS' — the word 'diamonds' has no single unit here, so a "
+    "bare 'how many diamonds do we have' is AMBIGUOUS: it can mean PACKETS (tblPacket, "
+    "one row per packet), individual PIECES/stones (nang / Pcs counts), or FINISHED/"
+    "polished stones (tblFinalPacket). Do NOT fire one COUNT and present it as 'the number "
+    "of diamonds' — ASK which they mean (packets, pieces, or finished stones), or state "
+    "which you counted. ('Diamonds in stock' is different and IS answerable: "
+    "tblPacket.RunningProcess = 'IN Stock'.)",
+    "AMBIGUOUS 'VALUE / TOTAL VALUE' — 'value' maps to SEVERAL different money columns on "
+    "tblPacket/tblKapan (RoughValue, EstValue, Estimate, OEstimate, REstimate, Amount, "
+    "PAmount), which mean different things (rough vs estimated vs revised vs final). A bare "
+    "'what's our total value' is AMBIGUOUS — ASK whether they mean rough, estimated or "
+    "final value (and which column) rather than SUM one column and present a single "
+    "definitive number.",
+    "PROFIT / MARGIN / COST are NOT tracked — the packet tables store only a value/price "
+    "(Amount, Estimate) with NO cost basis (no purchase-cost, no cost-of-manufacture "
+    "column anywhere), so profit MARGIN cannot be computed. Do NOT fabricate a margin by "
+    "treating Estimate vs Amount as cost vs revenue. Explain that margin isn't derivable "
+    "without a cost figure, and offer the Amount/Estimate values that DO exist.",
+    "CERTIFICATE PDF / FILE — no certificate PDF, file, attachment or download link is "
+    "stored anywhere in this database (it is a SQL-over-data assistant, not a file store). "
+    "What DOES exist is the certificate METADATA on tblPacketDetail: ReportNo (the lab "
+    "report/certificate number) and Inscription. So for 'download/give the certificate PDF "
+    "for this stone', say no PDF/file is stored and OFFER the ReportNo / Inscription from "
+    "tblPacketDetail instead — never invent a download link.",
 ]
 
 # Tricky joins / relationships - how to apply filters that need another table.
@@ -649,7 +673,13 @@ TABLE_NOTES = {
         "status": "confirmed",
     },
     "tblPacketDetail": {
-        "note": "Detailed line items for a packet.",
+        "note": (
+            "Per-packet detail lines — holds the certificate / lab-report METADATA: "
+            "ReportNo (the certificate/report number) and Inscription. NOTE: no "
+            "certificate PDF / file / attachment is stored anywhere in the DB — for a "
+            "'certificate' or 'download the certificate' question, offer the ReportNo / "
+            "Inscription from here and say no file is stored."
+        ),
         "status": "verify",
     },
     "tblPacketPoint": {
@@ -888,10 +918,6 @@ TABLE_NOTES = {
         "note": "Worker attendance records.",
         "status": "verify",
     },
-    "tblJunk": {
-        "note": "Rejected/scrap diamond material.",
-        "status": "verify",
-    },
     "tblEmployee": {
         "note": (
             "Master employee records: FirstName, MiddleName, LastName, Code, "
@@ -906,6 +932,71 @@ TABLE_NOTES = {
             "Address1/2), phone, mobile, email. Links to tblEmployee via "
             "Emp_ID. To find employees by city, join tblEmployee.ID = "
             "tblEmpDetail.Emp_ID and filter on City."
+        ),
+        "status": "verify",
+    },
+    "tblKapan": {
+        "note": (
+            "THE kapan master — one row per kapan (a parcel/lot of ROUGH diamonds), "
+            "847 rows; count kapans here. Key columns: KapanName (unique display name — "
+            "always show this, never the numeric ID); AvgSize = the parcel / lot SIZE in "
+            "carats (this is the 'parcel size' / 'lot size' answer; default parcel=kapan); "
+            "IsFinished + FinishDate (use WHERE IsFinished=1 AND YEAR(FinishDate)=… for "
+            "'kapans finished this year/period'); CreatDate (creation, note the spelling); "
+            "RoughOrigin + Mine (rough source, inline text); RoughValue/EstValue. To show a "
+            "KAPAN NAME where another table carries only a numeric Kapan_ID, JOIN "
+            "tblKapan.ID = Kapan_ID."
+        ),
+        "status": "verify",
+    },
+    "tblCompany": {
+        "note": (
+            "The single company-profile row (GlowStar). Holds the company's own City "
+            "(= Surat), address and contact details. Use it whenever a question compares "
+            "something to 'the company' itself — e.g. 'workers who live in the SAME CITY "
+            "as the company': read the company City from tblCompany, then count "
+            "tblEmpDetail.City = that city. Do NOT hard-code 'Surat' — read it here."
+        ),
+        "status": "verify",
+    },
+    "tblEmpNativeAddress": {
+        "note": (
+            "Employees' NATIVE / home-town address — the ONLY place holding District, "
+            "Village and Taluka (tblEmpDetail has City/State but NO district). Join "
+            "tblEmpNativeAddress.EmpID = tblEmployee.ID (name = FirstName/MiddleName/"
+            "LastName on tblEmployee). Use for 'native place / native district / village / "
+            "taluka'. NOTE it is sparsely populated — only ~108 of ~2,412 employees have a "
+            "non-blank District (values are dirty/mixed-case), so say the district is "
+            "recorded for only a minority of employees rather than implying full coverage."
+        ),
+        "status": "verify",
+    },
+    "tblParty": {
+        "note": (
+            "Party master — job-work PARTIES / sub-contractors we send jangad/processes to "
+            "(Name, Type='Job Work', City, GST, IsOutSideParty), 51 rows. One of THREE "
+            "'client/customer'-type entities — see also tblSupplier (rough suppliers) and "
+            "tblBuyerName (buyers). 'Who are our clients/customers' is AMBIGUOUS across "
+            "these three: ask which is meant (parties vs suppliers vs buyers) rather than "
+            "picking one silently."
+        ),
+        "status": "verify",
+    },
+    "tblSupplier": {
+        "note": (
+            "Rough-diamond SUPPLIERS master (who we BUY rough from), ~50 rows. One of the "
+            "three 'client/customer/vendor'-type entities (with tblParty = job-work parties "
+            "and tblBuyerName = buyers). For 'who are our suppliers/vendors' use this; for a "
+            "generic 'clients/customers' question, clarify which entity is meant."
+        ),
+        "status": "verify",
+    },
+    "tblBuyerName": {
+        "note": (
+            "BUYERS master (who we SELL/consign to), ~8 rows. One of the three "
+            "'client/customer/buyer'-type entities (with tblParty = job-work parties and "
+            "tblSupplier = rough suppliers). For 'who are our buyers/customers/clients' this "
+            "is the buyer list; when the term is ambiguous, ask which entity is meant."
         ),
         "status": "verify",
     },

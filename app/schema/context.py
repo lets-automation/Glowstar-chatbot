@@ -46,6 +46,15 @@ KEY_TABLES = [
     "tblJunk",
     "tblEmployee",
     "tblEmpDetail",
+    # Added to close Layer-2 routing gaps (2026-07-10): these are the ONLY
+    # tables holding the answer for several real questions, but the router
+    # could not surface them because they weren't candidates here.
+    "tblKapan",            # kapan master: parcel size, finished-this-year, junk-by-kapan name
+    "tblCompany",          # single company row (city = Surat) — "same city as company"
+    "tblEmpNativeAddress", # native District/Village/Taluka (not in tblEmpDetail)
+    "tblParty",            # job-work parties / sub-contractors ("clients")
+    "tblSupplier",         # rough suppliers ("clients/suppliers")
+    "tblBuyerName",        # buyers ("clients/customers")
 ]
 
 
