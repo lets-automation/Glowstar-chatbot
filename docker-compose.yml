@@ -70,6 +70,41 @@ services:
     cpus: "0.5"
     restart: unless-stopped
 
+  # SAFETY NET: automatic backups of the chat-history DB. Runs pg_dump on a
+  # schedule (every 6h) to ./backups/history on the HOST, keeping the most recent
+  # 40 dumps (~10 days) and pruning older ones. This is what makes history
+  # recoverable no matter what erases it — an operator mistake, a bad deploy, or a
+  # disk problem — instead of being one accident away from gone. First backup runs
+  # immediately on startup. Restore instructions are in HANDOFF.md ("Restore chat
+  # history"). Same postgres image so pg_dump/pg_restore versions match the DB.
+  history-backup:
+    image: postgres:16-alpine
+    depends_on:
+      history-db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${HISTORY_DB_PASSWORD}
+    volumes:
+      - ./backups/history:/backups
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "history-backup: pg_dump every 6h to /backups, keeping the last 40";
+        while true; do
+          ts=$$(date +%Y%m%d-%H%M%S);
+          if pg_dump -h history-db -U glowstar -d glowstar_history -F c -f /backups/history-$$ts.dump; then
+            echo "history-backup: wrote history-$$ts.dump at $$(date)";
+          else
+            echo "history-backup: pg_dump FAILED" >&2;
+          fi;
+          ls -1t /backups/history-*.dump 2>/dev/null | tail -n +41 | xargs -r rm -f;
+          sleep 21600;
+        done
+    mem_limit: 256m
+    cpus: "0.25"
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]

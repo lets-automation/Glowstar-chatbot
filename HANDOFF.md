@@ -8,6 +8,19 @@ manufacturer. Python FastAPI backend + Vite/React frontend, deployed with Docker
 > not tell the client it's ready until the accuracy pass (below) is done. The client
 > was unimpressed once already — trust is the priority.
 
+> **⚠️ NEVER run destructive SQL / resets (DELETE/DROP/TRUNCATE, `docker compose down -v`)
+> against the live `history-db`. Use a throwaway database for tests.** On 2026-07-09 a
+> raw `DELETE FROM chat_threads` run during testing wiped all chat history; recovered
+> from browser localStorage. Safeguard added: the `history-backup` service auto-dumps the
+> chat DB every 6h to `./backups/history/`. **Restore chat history:**
+> ```
+> docker compose exec history-backup pg_restore -h history-db -U glowstar \
+>   -d glowstar_history --clean --if-exists /backups/history-YYYYMMDD-HHMMSS.dump
+> ```
+> (`--clean --if-exists` overwrites current state with the backup; `pg_restore --list
+> /backups/<file>` inspects a dump without restoring.) History now has TWO independent
+> backups: these dumps + each browser's localStorage copy. Verified: dumps round-trip.
+
 ---
 
 ## 1. How it runs RIGHT NOW
@@ -87,6 +100,23 @@ All in `app/agent/tools.py` (RULES) and `app/schema/glossary.py` (DATA_NOTES/JOI
 - **THE proof step (paid):** run `tests/test_accuracy.py` + the client's REAL questions on
   **Claude**, check each answer against ground truth (independent SQL). Only this lets you
   honestly say "these answers are verified." Save a slice of the $3 for right before the demo.
+
+### Accuracy-verification strategy (client runs on CLAUDE; 3 layers, 2026-07-09)
+The fixes live in PROVIDER-INDEPENDENT places (glossary/rules/guards), so most of "will the
+bugs recur on Claude" is verifiable WITHOUT spending Claude tokens:
+- **Layer 1 — DONE (free, permanent):** `tests/test_regression_datamodel.py` (26 tests) LOCKS every
+  data-model fix — trap-table filter, critical glossary guidance present (labour current-vs-dead,
+  repair≠CRUD-log, sales-empty, Emp_ID identity, attendance-unreliable, incentive-points,
+  COUNT DISTINCT), router surfaces the right tables, anti-fabrication guard fires. Proven to BITE
+  (fails when a fix is removed). Runs with no DB/LLM. Any future glossary/guard edit that breaks a
+  fix now goes red instead of silently regressing — on Claude too, since the guidance is identical.
+- **Layer 2 — free, TODO:** re-run the 12 real questions on the current provider vs independent
+  ground-truth SQL (verifies routing/logic end-to-end on the data; carries over to Claude).
+- **Layer 3 — tiny paid, at handover:** one 12-question run ON Claude (~$1–2, a slice of the $3, NOT
+  token-exhausting) to confirm Claude's exact SQL. Only this needs Claude; Layers 1–2 do not.
+- Provider switch to Claude is a config flip (LLM_PROVIDER=anthropic + key); the Groq/Gemini
+  correction-guards are harmless no-ops on Claude. Point backend at the client's LIVE DB (not the
+  frozen ~25-Jun snapshot) before real testing.
 - Lower-priority, flagged-not-fixed: multi-tab last-write-wins on chat history; localStorage
   quota-fallback silently dropping export data; widget CSP `img-src` could beacon data out;
   `/upload` buffers whole file before the 15MB check.
@@ -414,9 +444,20 @@ paths + memory reconstruction). Suite now **25 pass / 1 skip**.
 - New tests: `tests/test_rate_limit.py` (XFF anti-spoof, fail-open, 429, scope isolation — also covers the
   previously-untested default /chat limiter) + byte-cap + memory-reconstruction cases in test_history.py.
 
-Remaining audit items (NOT yet fixed, ranked): unauthenticated GET/PUT/DELETE any thread = no
-ownership/tampering (partly by-design for the shared pool — needs soft-delete/tombstones to be safe) +
-unbounded thread COUNT growth (no eviction/cap); split-brain after a mid-life probe failure (migrated flag
+**THIRD FIX BATCH (2026-07-09, "tamper/growth protection" — verified, tests 37 pass / 1 skip):**
+- **Soft-delete (recoverable).** `app/core/history.py`: DELETE now tombstones (`deleted_at` epoch-ms)
+  instead of hard-deleting, so a delete in the no-auth shared pool isn't instantly destructive; list/get
+  exclude tombstones. New `POST /threads/{id}/restore` undoes it within a 30-day window
+  (`HISTORY_SOFT_DELETE_DAYS`). Old tombstones are opportunistically hard-purged on the next delete (no
+  scheduler needed). Idempotent PG-only migration `_ensure_columns` adds the column to existing DBs on
+  first use (verified live). NOTE: true per-user ownership still isn't enforceable without login — this
+  makes deletes RECOVERABLE, which is the meaningful protection given the shared pool.
+- **Thread-count cap.** `MAX_THREADS` (default 10000, `HISTORY_MAX_THREADS`) bounds a disk-fill DoS: a
+  brand-NEW thread past the cap is refused with **507** (existing threads still save); the frontend then
+  falls back to localStorage. Verified: PUT over cap → 507, update-at-cap → 200, soft-delete frees a slot.
+- `restore_thread` endpoint has NO UI yet (an "undo delete" / admin-recover is the trivial follow-up).
+
+Remaining audit items (NOT yet fixed, ranked): split-brain after a mid-life probe failure (migrated flag
 sticks → fallback-mode threads never sync); cross-device concurrent same-thread PUT is last-write-wins;
-nginx `/threads` inherits the 300s SSE timeout. Full deduped list + severities in the session summary +
-[[glowstar-history-audit]] memory.
+nginx `/threads` inherits the 300s SSE timeout; no "undo delete" UI for the new restore endpoint. Full
+deduped list + severities in the session summary + [[glowstar-history-audit]] memory.

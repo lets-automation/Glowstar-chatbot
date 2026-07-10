@@ -18,6 +18,7 @@ the frontend's "save the whole thread" model (chatStore.js). Timestamps are
 epoch milliseconds to round-trip Date.now() values unchanged.
 """
 
+import os
 import threading
 import time
 
@@ -28,10 +29,13 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    and_,
     create_engine,
     delete as sa_delete,
+    func,
     insert as sa_insert,
     select as sa_select,
+    text as sa_text,
     update as sa_update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -54,11 +58,30 @@ chat_threads = Table(
     Column("messages", JSON().with_variant(JSONB(), "postgresql"), nullable=False),
     Column("created_at", BigInteger, nullable=False),  # epoch ms
     Column("updated_at", BigInteger, nullable=False),  # epoch ms
+    # Soft-delete tombstone: NULL = live, epoch-ms = when it was deleted. Because
+    # there's no login (one shared team pool), a delete can't be checked for
+    # ownership — so instead of destroying a teammate's chat instantly, we mark
+    # it and keep it recoverable for a window before purging.
+    Column("deleted_at", BigInteger, nullable=True),
 )
 
 # Cap the sidebar list so a years-old deployment can't ship an unbounded
 # payload to the browser on every page load.
 LIST_LIMIT = 200
+
+# Bound total growth so an unauthenticated caller can't fill the history DB
+# (disk-fill DoS). Generous — a real team never approaches it; an attacker
+# spamming PUTs is stopped. Beyond the cap, NEW threads are refused (existing
+# ones still save); the frontend then falls back to localStorage.
+MAX_THREADS = int(os.getenv("HISTORY_MAX_THREADS", "10000"))
+
+# How long a soft-deleted thread stays recoverable before it's hard-purged.
+SOFT_DELETE_RETENTION_MS = int(os.getenv("HISTORY_SOFT_DELETE_DAYS", "30")) * 24 * 3600 * 1000
+
+
+class ThreadLimitError(Exception):
+    """Raised by upsert_thread when the live-thread cap is reached (see MAX_THREADS)."""
+
 
 _engine = None
 _engine_lock = threading.Lock()
@@ -85,8 +108,20 @@ def get_engine():
                     max_overflow=5,
                 )
                 _metadata.create_all(engine)
+                _ensure_columns(engine)
                 _engine = engine
     return _engine
+
+
+def _ensure_columns(engine) -> None:
+    """Tiny idempotent migration: add columns introduced after a deployment's
+    table was first created (create_all only makes MISSING TABLES, not missing
+    columns). sqlite test DBs are created fresh from the model, so this is a
+    Postgres-only concern."""
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as conn:
+        conn.execute(sa_text("ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS deleted_at BIGINT"))
 
 
 def _now_ms() -> int:
@@ -94,7 +129,9 @@ def _now_ms() -> int:
 
 
 def list_threads() -> list[dict]:
-    """Sidebar metadata only (no message bodies), newest first."""
+    """Sidebar metadata only (no message bodies), newest first. Excludes
+    soft-deleted threads. Tiebreak on id so equal updated_at (epoch-ms
+    collisions) gives a stable, deterministic order."""
     stmt = (
         sa_select(
             chat_threads.c.id,
@@ -102,7 +139,8 @@ def list_threads() -> list[dict]:
             chat_threads.c.created_at,
             chat_threads.c.updated_at,
         )
-        .order_by(chat_threads.c.updated_at.desc())
+        .where(chat_threads.c.deleted_at.is_(None))
+        .order_by(chat_threads.c.updated_at.desc(), chat_threads.c.id.desc())
         .limit(LIST_LIMIT)
     )
     with get_engine().connect() as conn:
@@ -114,8 +152,11 @@ def list_threads() -> list[dict]:
 
 
 def get_thread(thread_id: str) -> dict | None:
-    """One full thread (messages included), or None if it doesn't exist."""
-    stmt = sa_select(chat_threads).where(chat_threads.c.id == thread_id)
+    """One full thread (messages included), or None if it doesn't exist or was
+    soft-deleted."""
+    stmt = sa_select(chat_threads).where(
+        and_(chat_threads.c.id == thread_id, chat_threads.c.deleted_at.is_(None))
+    )
     with get_engine().connect() as conn:
         row = conn.execute(stmt).first()
     if row is None:
@@ -153,7 +194,16 @@ def upsert_thread(
             sa_update(chat_threads).where(chat_threads.c.id == thread_id).values(**values)
         )
         if result.rowcount:
-            return
+            return  # existing thread (incl. a soft-deleted one) updated -> no cap check
+        # Brand-new thread: enforce the live-thread cap before inserting so an
+        # unauthenticated caller can't grow the DB without bound.
+        live = conn.execute(
+            sa_select(func.count())
+            .select_from(chat_threads)
+            .where(chat_threads.c.deleted_at.is_(None))
+        ).scalar_one()
+        if live >= MAX_THREADS:
+            raise ThreadLimitError(f"history at capacity ({MAX_THREADS} threads)")
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -173,7 +223,35 @@ def upsert_thread(
 
 
 def delete_thread(thread_id: str) -> bool:
-    """Delete a thread. Returns whether it existed."""
+    """Soft-delete a thread (recoverable — see restore_thread). Returns whether a
+    LIVE thread was deleted. Also opportunistically hard-purges tombstones past
+    the retention window, so soft-delete can't accumulate rows without bound
+    (there's no background scheduler in this app)."""
+    now = _now_ms()
     with get_engine().begin() as conn:
-        result = conn.execute(sa_delete(chat_threads).where(chat_threads.c.id == thread_id))
+        result = conn.execute(
+            sa_update(chat_threads)
+            .where(and_(chat_threads.c.id == thread_id, chat_threads.c.deleted_at.is_(None)))
+            .values(deleted_at=now)
+        )
+        conn.execute(
+            sa_delete(chat_threads).where(
+                and_(
+                    chat_threads.c.deleted_at.isnot(None),
+                    chat_threads.c.deleted_at < now - SOFT_DELETE_RETENTION_MS,
+                )
+            )
+        )
+    return bool(result.rowcount)
+
+
+def restore_thread(thread_id: str) -> bool:
+    """Undo a soft-delete (within the retention window). Returns whether a
+    soft-deleted thread was restored."""
+    with get_engine().begin() as conn:
+        result = conn.execute(
+            sa_update(chat_threads)
+            .where(and_(chat_threads.c.id == thread_id, chat_threads.c.deleted_at.isnot(None)))
+            .values(deleted_at=None)
+        )
     return bool(result.rowcount)
