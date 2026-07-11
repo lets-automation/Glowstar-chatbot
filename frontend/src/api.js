@@ -61,7 +61,15 @@ export async function streamQuestion(question, sessionId, { onStatus, onResult, 
   }
   handle401(res.status)
   if (!res.ok || !res.body) {
-    onError(res.status === 401 ? 'Your session expired — please log in again.' : `Request failed (${res.status}).`)
+    // Turn raw HTTP statuses into plain-language messages a business user
+    // understands — a bare "Request failed (429)" reads as a broken product.
+    const friendly =
+      res.status === 401 ? 'Your session expired — please log in again.'
+      : res.status === 429 ? "You're asking quickly — give it a few seconds and try again."
+      : res.status === 422 ? 'That question is too long — please shorten it and try again.'
+      : res.status === 503 ? 'The assistant is not fully configured yet — please contact support.'
+      : `Something went wrong (code ${res.status}) — please try again.`
+    onError(friendly)
     return
   }
 
@@ -148,6 +156,28 @@ export async function exportRows(columns, rows, format, title = 'Report') {
   const a = document.createElement('a')
   a.href = url
   a.download = format === 'pdf' ? 'report.pdf' : format === 'chart' ? 'chart.png' : 'report.xlsx'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+// Export a FULL analytics dashboard (all KPIs + every chart section + its data)
+// as one multi-section Excel/PDF — not just the single breakdown table. `dashboard`
+// is the show_dashboard payload the chat rendered.
+export async function exportDashboard(dashboard, format, title = 'Report') {
+  const res = await fetch(`${API_URL}/export_dashboard`, {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ dashboard, format, title }),
+  })
+  handle401(res.status)
+  if (!res.ok) throw new Error('Export failed')
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = format === 'pdf' ? 'dashboard.pdf' : 'dashboard.xlsx'
   document.body.appendChild(a)
   a.click()
   a.remove()

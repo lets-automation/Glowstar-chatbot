@@ -481,12 +481,15 @@ export function useGlowstarRuntime() {
             const rows = data.data_rows || []
             if (answer) {
               // Normal case: real prose answer (+ export if data-backed).
+              // exportQuery is kept so a REOPENED thread (whose stored snapshot
+              // may be trimmed) can re-run the exact query for the full file.
               patch({
                 content: answer,
                 ok: data.ok !== false,
                 widgets: data.widgets || [],
                 exportColumns: cols,
                 exportRows: rows,
+                exportQuery: data.export_query || null,
               })
             } else if (rows.length) {
               // Model gave no prose but the query returned data -> show the data
@@ -497,6 +500,7 @@ export function useGlowstarRuntime() {
                 widgets: data.widgets || [],
                 exportColumns: cols,
                 exportRows: rows,
+                exportQuery: data.export_query || null,
               })
             } else {
               // Nothing to show -> honest message, and NO export (chat==export).

@@ -4,7 +4,7 @@ import remarkGfm from 'remark-gfm'
 import { Sparkles, Paperclip, Download, FileSpreadsheet, FileText, Loader2 } from 'lucide-react'
 import Composer from './Composer'
 import { Widget } from '../SandboxedWidget'
-import { exportRows } from '../api'
+import { exportRows, exportDashboard, exportData } from '../api'
 
 // Markdown overrides: open links safely; let wide result tables scroll.
 const MD_COMPONENTS = {
@@ -73,10 +73,21 @@ export default function Thread({ messages, isStreaming, status, composerProps, o
                         <Widget key={wi} code={w.code} title={w.title} onPrompt={onWidgetPrompt} />
                       ))}
                       {/* Export only on a successful answer with real captured data
-                          (never on a stopped/errored/empty turn). */}
-                      {m.ok !== false && m.exportRows?.length > 0 && (
-                        <ExportControl columns={m.exportColumns} rows={m.exportRows} />
-                      )}
+                          (never on a stopped/errored/empty turn). A dashboard turn
+                          offers BOTH: the whole dashboard (KPIs + every chart) AND
+                          the underlying data rows — hiding either loses data. */}
+                      {m.ok !== false &&
+                        (m.widgets?.some((w) => w.kind === 'dashboard' && w.data) ||
+                          m.exportRows?.length > 0 ||
+                          (m.exportTruncated && m.exportQuery)) && (
+                          <ExportControl
+                            columns={m.exportColumns}
+                            rows={m.exportRows}
+                            dashboard={m.widgets?.find((w) => w.kind === 'dashboard' && w.data)?.data}
+                            truncated={!!m.exportTruncated}
+                            exportQuery={m.exportQuery}
+                          />
+                        )}
                     </>
                   ) : isStreaming ? (
                     <div className="flex items-center gap-2 text-[0.86rem] text-text-muted">
@@ -107,46 +118,62 @@ export default function Thread({ messages, isStreaming, status, composerProps, o
   )
 }
 
-// Conditional export — Excel / PDF. Exports the EXACT rows shown (a stable
-// snapshot via /export_rows), so the file is identical every download.
-function ExportControl({ columns, rows }) {
-  const [busy, setBusy] = useState(null) // 'excel' | 'pdf' | null
+// Conditional export — Excel / PDF.
+//   Data:      the EXACT rows behind the answer. If this thread was reopened and
+//              the stored snapshot was trimmed (exportTruncated), the button
+//              RE-RUNS the captured query via /export so the file is COMPLETE —
+//              a trimmed snapshot must never masquerade as the full download.
+//   Dashboard: the whole dashboard (KPIs + every chart section + its data)
+//              via /export_dashboard. A dashboard turn offers BOTH groups.
+function ExportControl({ columns, rows, dashboard, truncated, exportQuery }) {
+  const [busy, setBusy] = useState(null) // 'data-excel' | 'dash-pdf' | ... | null
 
-  async function run(format) {
+  async function run(kind, format) {
+    const key = `${kind}-${format}`
     if (busy) return
-    setBusy(format)
+    setBusy(key)
     try {
-      await exportRows(columns || [], rows || [], format)
+      if (kind === 'dash') {
+        await exportDashboard(dashboard, format)
+      } else if (truncated && exportQuery) {
+        // Stored snapshot is incomplete -> re-run the exact query for full data.
+        await exportData(exportQuery, format)
+      } else {
+        await exportRows(columns || [], rows || [], format)
+      }
     } catch {
-      alert('Export failed — make sure the backend is running.')
+      alert('Export failed — please try again in a moment.')
     } finally {
       setBusy(null)
     }
   }
 
+  const btn = (kind, format, Icon, label) => (
+    <button
+      type="button"
+      onClick={() => run(kind, format)}
+      disabled={!!busy}
+      className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-white px-2.5 py-1 text-[0.76rem] font-medium text-text transition hover:border-accent hover:text-accent disabled:opacity-50"
+    >
+      {busy === `${kind}-${format}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Icon className="h-3.5 w-3.5" />}
+      {label}
+    </button>
+  )
+
+  const hasData = rows?.length > 0 || (truncated && exportQuery)
+  // Old saved thread with a trimmed snapshot and no stored query: full data is
+  // unrecoverable — say so on the button instead of pretending it's complete.
+  const partial = truncated && !exportQuery
+  const dataLabel = (base) => (partial ? `${base} (first ${rows?.length || 0} rows)` : base)
   return (
-    <div className="mt-3 flex items-center gap-2">
+    <div className="mt-3 flex flex-wrap items-center gap-2">
       <span className="inline-flex items-center gap-1 text-[0.74rem] text-text-muted">
         <Download className="h-3.5 w-3.5" /> Export
       </span>
-      <button
-        type="button"
-        onClick={() => run('excel')}
-        disabled={!!busy}
-        className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-white px-2.5 py-1 text-[0.76rem] font-medium text-text transition hover:border-accent hover:text-accent disabled:opacity-50"
-      >
-        {busy === 'excel' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileSpreadsheet className="h-3.5 w-3.5" />}
-        Excel
-      </button>
-      <button
-        type="button"
-        onClick={() => run('pdf')}
-        disabled={!!busy}
-        className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-white px-2.5 py-1 text-[0.76rem] font-medium text-text transition hover:border-accent hover:text-accent disabled:opacity-50"
-      >
-        {busy === 'pdf' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileText className="h-3.5 w-3.5" />}
-        PDF
-      </button>
+      {hasData && btn('data', 'excel', FileSpreadsheet, dataLabel(dashboard ? 'Data Excel' : 'Excel'))}
+      {hasData && btn('data', 'pdf', FileText, dataLabel(dashboard ? 'Data PDF' : 'PDF'))}
+      {dashboard && btn('dash', 'excel', FileSpreadsheet, 'Dashboard Excel')}
+      {dashboard && btn('dash', 'pdf', FileText, 'Dashboard PDF')}
     </div>
   )
 }
