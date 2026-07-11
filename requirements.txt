@@ -34,6 +34,12 @@ pandas==3.0.3              # Excel/CSV parsing + summary stats
 pypdf==6.14.2             # PDF text extraction
 pillow==12.2.0            # image downscaling before vision
 
+# LLM cost tracking (optional; agentcost.tech - active only when
+# AGENTCOST_API_KEY + AGENTCOST_PROJECT_ID are set in .env). Young third-party
+# SDK that monkey-patches the anthropic/openai clients: keep it PINNED and
+# re-test before any bump.
+agentcost==0.1.3
+
 # Phase 7 - semantic search (optional; needs Voyage + Pinecone keys)
 voyageai==0.4.1
 pinecone==9.1.0

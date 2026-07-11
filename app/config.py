@@ -44,6 +44,18 @@ class Settings:
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+    # AgentCost (agentcost.tech) — OPTIONAL LLM cost tracking. When both values
+    # are set, main.py initializes the SDK, which patches the anthropic/openai
+    # client libraries and reports per-call metadata (model, token counts, cost,
+    # latency — NOT prompt content) to the AgentCost dashboard. Leave empty to
+    # disable entirely. NOTE: it does NOT patch the native groq SDK, so the
+    # groq provider path is not tracked (only anthropic, and ollama-via-openai).
+    AGENTCOST_API_KEY: str = os.getenv("AGENTCOST_API_KEY", "")
+    AGENTCOST_PROJECT_ID: str = os.getenv("AGENTCOST_PROJECT_ID", "")
+    AGENTCOST_DEBUG: bool = os.getenv("AGENTCOST_DEBUG", "false").lower() in (
+        "1", "true", "yes",
+    )
+
     # Ollama (LOCAL, offline testing). Runs a model on this machine via Ollama's
     # OpenAI-compatible endpoint — no API key, no internet, no daily quota. Set
     # LLM_PROVIDER=ollama to use it (routed through the Groq backend, which speaks
