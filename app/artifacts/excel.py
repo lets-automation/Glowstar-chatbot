@@ -8,6 +8,8 @@ Input shape (same as the query runner returns):
   rows:    [ {"Shape": "ROUND", "Cnt": 123}, ... ]
 """
 
+import re
+
 from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.chart import BarChart, Reference
@@ -160,3 +162,94 @@ def to_excel(columns: list[str], rows: list[dict], filename: str = "report.xlsx"
     path = output_path(filename)
     wb.save(path)
     return path
+
+
+def _safe_sheet_name(name: str, used: set) -> str:
+    """Excel sheet names: <=31 chars, no []:*?/\\, and unique in the workbook."""
+    name = re.sub(r"[\[\]:\*\?/\\]", " ", str(name)).strip()[:28] or "Section"
+    base, n, final = name, 1, name
+    while final.lower() in used:
+        n += 1
+        final = f"{base[:26]} {n}"
+    used.add(final.lower())
+    return final
+
+
+def dashboard_to_excel(dashboard: dict, filename: str = "dashboard.xlsx") -> str:
+    """
+    Write a FULL analytics dashboard to Excel: a 'Summary' sheet with the KPI
+    figures, then one sheet per chart section holding its complete category/value
+    table (with a native bar chart when it's a comparison). This is all the detail
+    behind the on-screen dashboard, not a single summary table. `dashboard` is the
+    show_dashboard payload {title, subtitle, tiles[], sections[]}.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+
+    ws.append([_clean(str(dashboard.get("title") or "Analytics Report"))])
+    ws["A1"].font = Font(bold=True, size=14)
+    subtitle = str(dashboard.get("subtitle") or "")
+    if subtitle:
+        ws.append([_clean(subtitle)])
+    ws.append([])
+
+    ws.append(["Metric", "Value", "Unit", "Change"])
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True)
+    for t in (dashboard.get("tiles") or [])[:12]:
+        ws.append([
+            _clean(t.get("label")), _clean(t.get("value")),
+            _clean(t.get("unit") or ""), _clean(t.get("delta") or ""),
+        ])
+    for letter, width in (("A", 34), ("B", 18), ("C", 10), ("D", 24)):
+        ws.column_dimensions[letter].width = width
+
+    used = {"summary"}
+    for i, s in enumerate((dashboard.get("sections") or [])[:6]):
+        sws = wb.create_sheet(_safe_sheet_name(s.get("title") or f"Section {i + 1}", used))
+        series = str(s.get("series_label") or "Value")
+        sws.append(["Category", _clean(series)])
+        for cell in sws[1]:
+            cell.font = Font(bold=True)
+        labels = (s.get("labels") or [])[:500]
+        values = (s.get("values") or [])[:500]
+        for label, value in zip(labels, values):
+            sws.append([_clean(label), _clean(value)])
+        sws.column_dimensions["A"].width = 30
+        sws.column_dimensions["B"].width = 18
+        # A native bar chart of the section (same styling as the data export).
+        cols = ["Category", series]
+        rws = [{"Category": str(l), series: v} for l, v in zip(labels, values)]
+        _add_chart_sheet_inline(wb, sws, cols, rws, s.get("type"))
+
+    path = output_path(filename)
+    wb.save(path)
+    return path
+
+
+def _add_chart_sheet_inline(wb, data_ws, columns, rows, section_type=None) -> None:
+    """Draw a bar chart of a section's table directly onto its own sheet (only
+    for comparison/breakdown data that's small enough to be legible)."""
+    if str(section_type) == "pie":
+        return  # pie sections: the table is clearer than a tiny openpyxl pie
+    if not (1 < len(rows) <= CHART_MAX_ROWS):
+        return
+    last_row = len(rows) + 1
+    chart = BarChart()
+    chart.type = "col"
+    chart.title = f"{columns[1]} by {columns[0]}"
+    chart.legend = None
+    chart.height = 9
+    chart.width = 18
+    chart.varyColors = False
+    data_ref = Reference(data_ws, min_col=2, min_row=1, max_row=last_row)
+    cats_ref = Reference(data_ws, min_col=1, min_row=2, max_row=last_row)
+    chart.add_data(data_ref, titles_from_data=True)
+    chart.set_categories(cats_ref)
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+    chart.y_axis.numFmt = "#,##0"
+    chart.series[0].graphicalProperties.solidFill = _BAR_COLOR
+    # Place the chart to the right of the data so both are visible.
+    data_ws.add_chart(chart, "D2")

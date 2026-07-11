@@ -47,12 +47,16 @@ def test_blocks_writes_and_commands():
 
 
 def test_row_cap_injection():
+    # cap+1 is injected (NOT the exact cap): the runner detects truncation by
+    # fetching one row beyond the cap, so an exact-cap TOP made the "results
+    # were capped" warning impossible to ever fire — a silently capped report
+    # was presented as complete (2026-07-11 audit fix).
     capped = ensure_row_cap("SELECT EmpName FROM tblPacketHistory", cap=1000)
-    assert "TOP 1000" in capped.upper()
+    assert "TOP 1001" in capped.upper()
 
     # DISTINCT keeps its place.
     capped2 = ensure_row_cap("SELECT DISTINCT Shape FROM tblPacket", cap=500)
-    assert "DISTINCT TOP 500" in capped2.upper()
+    assert "DISTINCT TOP 501" in capped2.upper()
 
     # Existing TOP is left alone.
     already = "SELECT TOP 5 * FROM tblPacket"
@@ -61,7 +65,7 @@ def test_row_cap_injection():
 
 def test_validate_and_prepare():
     ok, sql = validate_and_prepare("SELECT EmpName FROM tblPacketHistory")
-    assert ok and "TOP 1000" in sql.upper()
+    assert ok and "TOP 1001" in sql.upper()  # cap+1 — see test_row_cap_injection
 
     ok2, reason = validate_and_prepare("DELETE FROM tblPacket")
     assert not ok2

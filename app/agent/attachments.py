@@ -104,8 +104,18 @@ def _tabular_text(path: str, filename: str, kind: str) -> str:
 
     parts = [f"FILE: {filename}"]
     for name, df in sheets.items():
+        # Reading stopped at READ_CAP: the true file is (or may be) larger, so
+        # never present the capped count as the sheet's size, and flag that any
+        # summary/statistics cover only the rows actually read.
+        capped = df.shape[0] >= READ_CAP
+        size_txt = (
+            f"first {READ_CAP} rows READ (the file has more - totals/summaries "
+            "below cover ONLY these rows; say so if asked for file totals)"
+            if capped
+            else f"{df.shape[0]} rows"
+        )
         parts.append(
-            f"\n--- Sheet '{name}': {df.shape[0]} rows x {df.shape[1]} columns ---"
+            f"\n--- Sheet '{name}': {size_txt} x {df.shape[1]} columns ---"
         )
         cols = [str(c) for c in df.columns]
         if len(cols) > MAX_COLS:
@@ -206,9 +216,13 @@ def process_attachments(attachments: list[dict] | None) -> dict:
                 images.append(_image_block(path, _IMAGE_EXT[ext]))
                 text_parts.append(f"FILE: {name} (image — see attached image below)")
             else:
-                # Best effort: treat unknown types as UTF-8 text.
+                # Best effort: treat unknown types as UTF-8 text. Read one char
+                # beyond the cap so truncation is DETECTED and marked - a
+                # silently cut file reads as if it were the whole document.
                 with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                    body = fh.read(MAX_PDF_CHARS)
+                    body = fh.read(MAX_PDF_CHARS + 1)
+                if len(body) > MAX_PDF_CHARS:
+                    body = body[:MAX_PDF_CHARS] + "\n...(file is longer - remaining text truncated)"
                 text_parts.append(f"FILE: {name}\n{body}")
                 has_doc = True
         except Exception as exc:

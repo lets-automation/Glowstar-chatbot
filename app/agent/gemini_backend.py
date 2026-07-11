@@ -130,6 +130,8 @@ def ask_gemini(
     data_columns: list[str] = []
     data_rows: list[dict] = []
     nudged_dashboard = False  # one corrective round if a requested dashboard was skipped
+    nudged_report_detail = False  # one corrective round if a "report" came back aggregated
+    execute_nudges = 0        # how many times we've forced a stalled model to run its SQL
     dashboard_built = False
 
     for _ in range(tools.MAX_TOOL_ROUNDS):
@@ -160,6 +162,67 @@ def ask_gemini(
         if not calls:
             # No more tool calls -> this is the final answer.
             answer = "".join(p.text for p in parts if getattr(p, "text", None)).strip()
+            # Grounding guard (mirrors groq_backend): the model returned a data
+            # table, a chart/dashboard, or written-out SQL but ran NO query, so
+            # nothing it shows is real. Force a real run_sql round rather than
+            # letting the fabrication fall through to the "ungrounded" refusal
+            # the user sees. Fires up to _MAX_EXECUTE_NUDGES times.
+            from app.agent.groq_backend import (
+                _EXECUTE_NUDGE,
+                _MAX_EXECUTE_NUDGES,
+                _has_data_visual,
+                _looks_like_unrun_sql,
+            )
+            from app.agent.postprocess import looks_like_data_table
+            ungrounded_fabrication = (
+                not sql_used
+                and not file_grounded
+                and (
+                    _looks_like_unrun_sql(answer)
+                    or looks_like_data_table(answer)
+                    or _has_data_visual(widgets)
+                )
+            )
+            if ungrounded_fabrication and execute_nudges < _MAX_EXECUTE_NUDGES:
+                execute_nudges += 1
+                widgets = [w for w in widgets if not _has_data_visual([w])]
+                if cand and cand.content:
+                    contents.append(cand.content)
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=_EXECUTE_NUDGE)],
+                    )
+                )
+                emit("Running the query…")
+                continue
+            # Report-detail guard (mirrors groq_backend; client-flagged bug):
+            # a "…report…" question answered with a GROUP BY aggregate instead
+            # of the mandated detail listing with joined names.
+            from app.agent.groq_backend import (
+                REPORT_ASKED_RE,
+                REPORT_DETAIL_NUDGE,
+                _all_sql_aggregated,
+                _SUMMARY_INTENT_RE,
+            )
+            if (
+                not nudged_report_detail
+                and not file_grounded
+                and _all_sql_aggregated(sql_used)
+                and REPORT_ASKED_RE.search(question or "")
+                and not _SUMMARY_INTENT_RE.search(question or "")
+            ):
+                nudged_report_detail = True
+                if cand and cand.content:
+                    contents.append(cand.content)
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=REPORT_DETAIL_NUDGE)],
+                    )
+                )
+                emit("Building the detailed report…")
+                continue
             # Dashboard guard (mirrors groq_backend): the question asked for
             # analytics/overview/dashboard/analysis but no dashboard was built.
             # Nudge one corrective round; requires queried data (sql_used).
@@ -229,7 +292,9 @@ def ask_gemini(
                 emit("Building your dashboard…")
                 try:
                     code = widget.build_dashboard_html(args)
-                    widgets.append({"title": args.get("title", "dashboard"), "code": code, "kind": "dashboard"})
+                    # Keep the structured args too, so the export can rebuild the
+                    # FULL dashboard (all KPIs + every section), not just one table.
+                    widgets.append({"title": args.get("title", "dashboard"), "code": code, "kind": "dashboard", "data": args})
                     outcome = "rendered"
                     dashboard_built = True
                 except Exception as exc:
@@ -244,7 +309,17 @@ def ask_gemini(
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
-                if name == "run_sql" and rows_full:
+                # Prefer a multi-row DETAIL result for export; don't let a 1-row
+                # summary/aggregate run afterwards clobber the full list (see
+                # groq_backend for the rationale — the kapan-report download bug).
+                # LARGEST result wins for the export capture; a smaller
+                # aggregate/breakdown run afterwards must not clobber the full
+                # detail list (see groq_backend — the kapan-report download bug).
+                if (
+                    name == "run_sql"
+                    and rows_full
+                    and len(rows_full) > len(data_rows)
+                ):
                     data_columns, data_rows = cols_full, rows_full
             responses.append(
                 types.Part.from_function_response(name=name, response={"result": result_text})
