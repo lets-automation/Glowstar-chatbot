@@ -332,6 +332,95 @@ department-wise production summary" and "…salary for May 2026" both auto-rende
 
 ---
 
+## APPENDIX — Grounding guard: no more "I couldn't pull that" on valid data Qs (2026-07-10, fixed + verified)
+
+**Symptom (client testing):** "show me packet report for kapan AA" → the bot replied *"I
+wasn't able to pull that from the database just now… could you rephrase (e.g. which kapan)…"*
+even though kapan AA is real (262 packets in tblPacket).
+
+**Root cause:** on the free Groq **llama-4-scout** model, the model *printed* a packet-report
+Markdown table but never called `run_sql` (container log: no `SQL:` line, `rows_returned: 0`,
+no error). The postprocess grounding guard ([postprocess.py](app/agent/postprocess.py)) correctly
+refuses to show ungrounded data and swaps in the canned `_UNGROUNDED_MSG`. The backend's
+execution-nudge that's supposed to force a real query only fired when the reply contained literal
+`SELECT … FROM` text ([groq_backend.py](app/agent/groq_backend.py) `_looks_like_unrun_sql`), so a
+clean fabricated table with no SQL text slipped straight through to the refusal.
+
+**Fix (permanent, model-agnostic):** broadened the execution guard in BOTH weak backends
+(`groq_backend.py` + `gemini_backend.py`) to force a real `run_sql` round whenever the model
+returns an ungrounded **data table OR chart/dashboard OR written-out SQL** (reuses
+`postprocess.looks_like_data_table`, the same detector postprocess rejects on — so the guard fires
+on exactly the cases that would otherwise dead-end). Now retries up to `_MAX_EXECUTE_NUDGES = 2`
+(weak models sometimes ignore the first push) and strips the fabricated widget before retrying.
+Clarifying questions / "not tracked" replies have no table, so they never false-trigger.
+
+**Verified:** rebuilt the backend image; the exact question now returns `ok=True`,
+`rows_returned=262`, grounded SQL `SELECT … FROM tblPacket WHERE KapanName='AA'`, real table +
+citation. Logic proof: old guard=False / new guard=True on a fabricated table; clarifier=False.
+Full suite **63 passed, 1 skipped**. (Files touched, uncommitted: `app/agent/groq_backend.py`,
+`app/agent/gemini_backend.py`.)
+
+---
+
+## APPENDIX — Export/download gave only the SUMMARY row, not the full report (2026-07-10, fixed)
+
+**Symptom:** the chat showed the full kapan-AA packet report (summary glance + first 50 of 262
+packets), but the downloaded PDF/Excel contained only ONE row — the aggregate summary
+(`TotalPackets, TotalRoughWt, … KapanStartDate`).
+
+**Root cause:** the export uses the backend-captured `data_rows` (via `exportRows` → `/export_rows`).
+In all three backends `data_columns/data_rows` were **overwritten on every `run_sql`**, so they held
+whatever query ran LAST. For a report the model runs the DETAIL query (262 rows) and then a 1-row
+SUMMARY aggregate — the summary ran last, so the export captured the 1-row summary.
+
+**Fix:** capture rows for export from the last **multi-row** result — a trailing 1-row
+summary/aggregate no longer clobbers the detail list. One-liner in each backend's run_sql capture:
+`if rows_full and (len(rows_full) > 1 or not data_rows): data_columns, data_rows = cols_full, rows_full`
+(`groq_backend.py`, `gemini_backend.py`, `anthropic_backend.py`). Single-summary answers still
+export their one row (no regression).
+
+**Verified:** deterministic replay of the capture over detail-then-summary AND summary-then-detail
+both export the 262 detail rows; summary-only still exports 1. Full suite **63 passed, 1 skipped**.
+Live re-test was blocked (both free providers quota-exhausted — see below). `exportData()` in
+`frontend/src/api.js` is dead code; the live path is `exportRows()`.
+
+*Provider note (2026-07-10):* `.env` was switched to `LLM_PROVIDER=gemini` (Groq daily cap hit);
+Gemini free tier = **20 req/day** and is now also exhausted (429). For client testing use Groq
+(swap to the 2nd `GROQ_API_KEY`, `.env` line 26) or Claude for the actual demo.
+
+---
+
+## APPENDIX — Exports leaked raw internal IDs; not client's format (2026-07-10, fixed + verified)
+
+**Symptom:** a downloaded packet report (Excel/PDF) showed raw id columns `ID, KapanID,
+PacketID, UserID` (from tblFinalPacket). Client rule: NEVER show internal ids — display
+KapanName / PacketNo. Client sent the expected format as `artifacts/packet.xlsx`
+(10 cols from **tblPacket**: `KapanName, Packet(=PacketNo), Shape, Color, PolishedWt, RoughWt,
+CurrentWt, PAmount, Rate, CreDate`, ordered by PacketNo, packet as a plain number).
+
+**Root causes (two):** (1) the system prompt's REPORT rule literally said "one row per record
+**with IDs**, names, weights…" — telling the model to include ids; (2) the model reported from
+tblFinalPacket (which has ID/KapanID/PacketID/UserID) instead of tblPacket.
+
+**Fix (chosen: rule-based + deterministic sanitizer):**
+- `tools.py` REPORT rule: dropped "IDs"; added a PACKET-REPORT hint → use **tblPacket** (not
+  tblFinalPacket), human columns only, packet as plain PacketNo, ORDER BY PacketNo.
+- `postprocess.py`: new `sanitize_export()` / `_is_id_col()` — strips raw-id columns (`ID`,
+  `*_ID`, CamelCase `*ID`/`*Id`) from the export snapshot in `enrich()`. Precise: does NOT catch
+  words like void/paid/grid (lowercase "id"). Never empties an all-id result.
+- Applied the SAME sanitizer at every file-building path that bypasses enrich:
+  `tools.tool_create_report` (the actual `report.xlsx`/`report.pdf` builder), and the
+  `/export` + `/export_rows` endpoints in `main.py`.
+
+**Verified:** E2E via `create_report` on a query selecting `ID,KapanID,PacketID,UserID` →
+generated `report.xlsx` header = `KapanName, PacketNo, Shape, Color, RoughWt, CurrentWt, Amount,
+CreateDate, Lab` (zero id columns, 197 rows). New `tests/test_export_sanitize.py` (4 tests). Full
+suite **67 passed, 1 skipped**. Note: live LLM re-test still blocked by free-tier quota (provider
+was on gemini/20-per-day). Files touched: `tools.py`, `postprocess.py`, `main.py`,
+`tests/test_export_sanitize.py`.
+
+---
+
 ## APPENDIX — Dashboard artifact feature (2026-07-09, built + verified)
 
 **What:** Claude-artifacts-style analytics dashboards rendered inline in the chat (KPI stat tiles
