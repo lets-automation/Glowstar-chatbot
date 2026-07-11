@@ -146,7 +146,11 @@ def build_schema_context(table_names: list[str] | None = None) -> str:
         if MAX_COLS_PER_TABLE and len(cols) > MAX_COLS_PER_TABLE:
             shown_cols = _cap_columns(cols, MAX_COLS_PER_TABLE)
             col_text = ", ".join(f"{c['name']} ({c['type']})" for c in shown_cols)
-            col_text += f", ... (+{len(cols) - MAX_COLS_PER_TABLE} more columns)"
+            col_text += (
+                f", ... (+{len(cols) - MAX_COLS_PER_TABLE} MORE columns not shown - "
+                "if a column you expect is missing, call get_table_columns "
+                f"('{table}') for the full list before concluding it doesn't exist)"
+            )
         else:
             col_text = ", ".join(f"{c['name']} ({c['type']})" for c in cols)
         parts.append(f"  columns: {col_text}")

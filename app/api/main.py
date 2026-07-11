@@ -116,6 +116,15 @@ class ExportRowsRequest(BaseModel):
     y_col: str | None = None
 
 
+class ExportDashboardRequest(BaseModel):
+    """Export a FULL analytics dashboard (KPI tiles + every chart section + its
+    data) that was already shown, as one multi-section file. The `dashboard`
+    payload is the show_dashboard data the chat rendered."""
+    dashboard: dict
+    format: str = Field("pdf", pattern="^(pdf|excel)$")
+    title: str = "Report"
+
+
 class ThreadUpsertRequest(BaseModel):
     """Whole-thread save from the frontend (it persists complete threads,
     mirroring the old localStorage model - see frontend/src/lib/chatStore.js)."""
@@ -342,6 +351,16 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
     from app.agent.agent import ask
     from app.api import sessions
 
+    # Same guard as /chat: fail fast with a clear 503 when the active provider's
+    # API key isn't configured, instead of a mid-stream generic error. This is
+    # the endpoint the UI actually uses, so it needs the guard most.
+    missing = _active_provider_key_missing()
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail=f"AI is not configured: {missing} is missing in .env.",
+        )
+
     events: "queue.Queue" = queue.Queue()
     convo_history = _load_history(request.session_id)
 
@@ -392,27 +411,55 @@ def export_rows(req: ExportRowsRequest, user: dict = Depends(enforce_rate_limit)
     """
     if not req.rows:
         raise HTTPException(status_code=400, detail="No data to export.")
-    columns = req.columns or list(req.rows[0].keys())
+    # Client display rule: strip raw internal ids before building the file, even
+    # though rows reaching here are normally pre-sanitized by postprocess.enrich.
+    from app.agent.postprocess import sanitize_export
+    columns, rows = sanitize_export(req.columns or list(req.rows[0].keys()), req.rows)
     uid = uuid.uuid4().hex
 
     # Wrap file generation so dirty/unusual data (control chars, non-Latin text,
     # very wide tables) returns a clean 422 instead of an unhandled 500.
     try:
         if req.format == "pdf":
-            path = to_pdf(columns, req.rows, f"export-{uid}.pdf", title=req.title)
+            path = to_pdf(columns, rows, f"export-{uid}.pdf", title=req.title)
             return _download(path, "application/pdf", "export.pdf")
 
         if req.format == "chart":
             x_col = req.x_col or columns[0]
             y_col = req.y_col or columns[-1]
-            path = to_chart(req.rows, x_col, y_col, f"export-{uid}.png", title=req.title)
+            path = to_chart(rows, x_col, y_col, f"export-{uid}.png", title=req.title)
             return _download(path, "image/png", "export.png")
 
-        path = to_excel(columns, req.rows, f"export-{uid}.xlsx")
+        path = to_excel(columns, rows, f"export-{uid}.xlsx")
         return _download(path, _EXCEL_MEDIA, "export.xlsx")
     except Exception:
         logger.exception("export_rows failed (format=%s)", req.format)
         raise HTTPException(status_code=422, detail=f"Could not build the {req.format} file from this data.")
+
+
+@app.post("/export_dashboard")
+def export_dashboard(req: ExportDashboardRequest, user: dict = Depends(enforce_rate_limit)):
+    """
+    Build a downloadable file that reproduces the WHOLE analytics dashboard the
+    chat already showed — headline KPIs plus every chart section and its data
+    table — instead of a single summary table. No DB re-run; the dashboard data
+    is the snapshot the chat rendered. Requires a valid login; rate-limited.
+    """
+    d = req.dashboard or {}
+    if not (d.get("tiles") or d.get("sections")):
+        raise HTTPException(status_code=400, detail="No dashboard data to export.")
+    uid = uuid.uuid4().hex
+    try:
+        if req.format == "excel":
+            from app.artifacts.excel import dashboard_to_excel
+            path = dashboard_to_excel(d, f"dashboard-{uid}.xlsx")
+            return _download(path, _EXCEL_MEDIA, "dashboard.xlsx")
+        from app.artifacts.pdf import dashboard_to_pdf
+        path = dashboard_to_pdf(d, f"dashboard-{uid}.pdf", title=req.title)
+        return _download(path, "application/pdf", "dashboard.pdf")
+    except Exception:
+        logger.exception("export_dashboard failed (format=%s)", req.format)
+        raise HTTPException(status_code=422, detail="Could not build the dashboard file.")
 
 
 @app.post("/upload")
@@ -618,8 +665,14 @@ def export(req: ExportRequest, user: dict = Depends(enforce_rate_limit)):
     No AI key needed - this runs the query directly through the safe runner.
     Returns the file itself for the browser to download. Requires a valid login
     and is rate-limited per user (it runs arbitrary read-only SQL).
+
+    This is the "re-run for the FULL data" path the UI uses when a reopened
+    thread's stored snapshot was trimmed - so it MUST use the same high export
+    cap as the chat-time capture, not the 1000-row model default (a mismatch
+    here silently shrank downloads on reopened threads).
     """
-    result = run_select(req.query)
+    from app.agent.tools import EXPORT_ROW_CAP
+    result = run_select(req.query, max_rows=EXPORT_ROW_CAP)
     if not result["ok"]:
         # Log the real reason server-side, but do NOT return raw DB/driver error
         # text to the caller (it leaks table/server/schema names on an open API).
@@ -632,6 +685,10 @@ def export(req: ExportRequest, user: dict = Depends(enforce_rate_limit)):
     columns, rows = result["columns"], result["rows"]
     if not rows:
         raise HTTPException(status_code=400, detail="Query returned no rows.")
+
+    # Client display rule: never leak raw internal ids into a downloaded file.
+    from app.agent.postprocess import sanitize_export
+    columns, rows = sanitize_export(columns, rows)
 
     uid = uuid.uuid4().hex
     try:

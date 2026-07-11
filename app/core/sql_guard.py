@@ -83,11 +83,20 @@ def is_read_only(sql: str) -> tuple[bool, str]:
 
 def ensure_row_cap(sql: str, cap: int = DEFAULT_ROW_CAP) -> str:
     """
-    Make sure a SELECT can't return more than `cap` rows by injecting
-    'TOP <cap>' right after SELECT (or SELECT DISTINCT).
+    Make sure a SELECT can't return unbounded rows by injecting
+    'TOP <cap+1>' right after SELECT (or SELECT DISTINCT).
+
+    Why cap+1, not cap: the runner detects truncation by fetching ONE row
+    more than the cap. If the injected TOP were exactly the cap, that extra
+    row could never arrive, result["truncated"] could never become True, and
+    a silently-capped report would be presented as complete (a real bug this
+    fixes). The +1 row is only the truncation signal - the runner still
+    returns at most `cap` rows.
 
     Notes:
-    - If the query already has a TOP, we leave it alone.
+    - If the query already has a TOP, we leave it alone (an explicit top-N
+      is the model/user's own intent - the rules forbid the model from
+      adding one to a plain listing).
     - For CTEs (WITH ...) or anything we can't safely rewrite, we return
       it unchanged - the query runner caps fetched rows as a backstop.
     """
@@ -106,7 +115,7 @@ def ensure_row_cap(sql: str, cap: int = DEFAULT_ROW_CAP) -> str:
     if upper.startswith("SELECT DISTINCT"):
         return re.sub(
             r"^SELECT\s+DISTINCT\s+",
-            f"SELECT DISTINCT TOP {cap} ",
+            f"SELECT DISTINCT TOP {cap + 1} ",
             text,
             count=1,
             flags=re.IGNORECASE,
@@ -114,7 +123,7 @@ def ensure_row_cap(sql: str, cap: int = DEFAULT_ROW_CAP) -> str:
     if upper.startswith("SELECT"):
         return re.sub(
             r"^SELECT\s+",
-            f"SELECT TOP {cap} ",
+            f"SELECT TOP {cap + 1} ",
             text,
             count=1,
             flags=re.IGNORECASE,

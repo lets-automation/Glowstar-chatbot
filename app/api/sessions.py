@@ -17,11 +17,14 @@ wipe follow-up context.
 """
 
 import json
+import os
 
 from app.core.redis_client import get_redis
 
-# How many past turns (Q + A pairs) to remember per session.
-MAX_TURNS = 6
+# How many past turns (Q + A pairs) to remember per session. Configurable so
+# the paid/demo provider (Claude, no schema cap) can carry a longer
+# conversation than the token-tight free tiers; 6 stays the safe default.
+MAX_TURNS = int(os.getenv("MEMORY_MAX_TURNS", "6"))
 
 # Idle sessions expire after this long (refreshed on every new turn).
 SESSION_TTL_SECONDS = 24 * 60 * 60  # 24h - comfortably past a workday

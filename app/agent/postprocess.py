@@ -33,6 +33,30 @@ def looks_like_data_table(answer: str) -> bool:
     return len(_MD_TABLE_ROW.findall(answer or "")) >= 2
 
 
+def _is_id_col(name: str) -> bool:
+    """True for a raw internal-id column the client rule forbids showing. Matches
+    the ERP's id conventions — a bare "ID", any *_ID, and CamelCase foreign keys
+    ending in "ID"/"Id" (KapanID, PacketID, UserID, Emp_ID) — WITHOUT catching
+    ordinary words that end in a lowercase "id" (void, paid, grid, valid)."""
+    n = (name or "").strip()
+    low = n.lower()
+    return low == "id" or low.endswith("_id") or n.endswith("ID") or n.endswith("Id")
+
+
+def sanitize_export(columns: list, rows: list) -> tuple[list, list]:
+    """Drop raw internal-id columns from the export snapshot so a downloaded
+    report shows names/numbers only (KapanName, PacketNo), never KapanID/PacketID/
+    UserID — the client's display rule, enforced deterministically regardless of
+    what SQL the model wrote. If EVERY column is an id (rare), keep the originals
+    rather than export an empty file."""
+    cols = list(columns) if columns else (list(rows[0].keys()) if rows else [])
+    keep = [c for c in cols if not _is_id_col(c)]
+    if not keep or keep == cols:
+        return cols, rows
+    trimmed = [{c: r.get(c) for c in keep} for r in rows]
+    return keep, trimmed
+
+
 def extract_suggestions(answer: str) -> tuple[str, list[str]]:
     """
     Split a trailing 'SUGGESTIONS: a | b | c' line out of the answer.
@@ -131,19 +155,22 @@ def fallback_chart(question: str, result: dict) -> dict | None:
         return None
     label_col, value_col = picked
     use = rows[:25]  # readable cap: top 25 rows in the query's own order
+    # Label the slice honestly: a chart of 25 of 60 categories presented as
+    # "the data" is a silent sample - say "first 25 of 60" in the title.
+    title = value_col if len(rows) <= 25 else f"{value_col} (first 25 of {len(rows)})"
     q = (question or "").lower()
     chart_type = "pie" if "pie" in q else ("line" if ("line" in q or "trend" in q) else "bar")
     try:
         code = build_chart_html({
             "chart_type": chart_type,
-            "title": value_col,
+            "title": title,
             "labels": [str(r.get(label_col)) for r in use],
             "values": [float(r.get(value_col) or 0) for r in use],
             "series_label": value_col,
         })
     except Exception:
         return None
-    return {"title": value_col, "code": code, "kind": "chart"}
+    return {"title": title, "code": code, "kind": "chart"}
 
 
 def enrich(result: dict, now: datetime | None = None, question: str = "") -> dict:
@@ -213,6 +240,11 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
         if auto:
             widgets.append(auto)
 
+    # Strip raw internal ids from the export snapshot (client display rule) — the
+    # download shows KapanName/PacketNo, never KapanID/PacketID/UserID. Only on a
+    # successful turn; a failed/ungrounded turn exports nothing.
+    export_columns, export_rows = sanitize_export(data_columns, data_rows) if ok else ([], [])
+
     return {
         "answer": clean,
         "suggestions": suggestions,
@@ -226,6 +258,6 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
         # Inline visuals the model drew via show_widget; rendered in a sandboxed iframe.
         "widgets": widgets,
         # Exact rows behind the answer — exported as a stable snapshot (no re-run).
-        "data_columns": data_columns if ok else [],
-        "data_rows": data_rows if ok else [],
+        "data_columns": export_columns,
+        "data_rows": export_rows,
     }

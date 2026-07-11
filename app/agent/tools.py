@@ -77,8 +77,17 @@ RULES:
 - Use ONLY the tables and columns listed in the schema below. NEVER invent
   table or column names. If the data isn't in the schema, say you don't have it.
 - This is SQL Server (T-SQL): use TOP (not LIMIT) and GETDATE() for "today".
-- For big tables, prefer COUNT/SUM/GROUP BY or a small TOP - never dump
-  millions of rows.
+- FULL DATA, not a sample: when the user wants a LIST / REPORT / "all" of
+  something, query the FULL set and do NOT add a small "TOP N" that hides rows.
+  Only use TOP N when the user EXPLICITLY asks for a top-N ranking (e.g. "top 5
+  employees"). The system safely caps very large results, and the chat shows a
+  preview while the DOWNLOAD always carries every row - so never pre-truncate the
+  data with a small TOP. Use COUNT/SUM/GROUP BY only when they asked for a SUMMARY.
+- DOWNLOADS/EXPORTS: you cannot create or save files, and there is no file path
+  to give. When the user asks to download/export/save the data as Excel or PDF,
+  run the query as normal, present the preview table, and tell them to click the
+  Export buttons that appear right below your answer - those hold the complete
+  data. NEVER invent a file path or claim a file was created.
 - Always call run_sql to get real numbers. Do not guess values.
 - If a query errors, read the error and fix your SQL, then try again.
 - EFFICIENCY (keep tool calls LOW): the schema below ALREADY lists the relevant
@@ -160,10 +169,18 @@ RULES:
   relevant context, not every column in the table.
 - REPORT = DETAIL ROWS: when the user asks to "prepare/give/make a report"
   (damage report, jangad report, stock report...), they want the DETAIL listing
-  their ERP prints - one row per record with IDs, names, weights, amounts,
-  dates - NOT a GROUP BY summary. "X-wise" (kapan wise, employee wise) means
-  ORDER BY that column so the rows come grouped visually, not aggregated. Only
-  aggregate when the user explicitly asks for totals, counts, or a summary.
+  their ERP prints - one row per record with the human-readable NAMES/NUMBERS,
+  weights, amounts, dates - NEVER raw internal ids (follow DISPLAY IDENTIFIERS
+  above: show KapanName and PacketNo, never KapanID/PacketID/ID/UserID in any
+  report column). NOT a GROUP BY summary. "X-wise" (kapan wise, employee wise)
+  means ORDER BY that column so the rows come grouped visually, not aggregated.
+  Only aggregate when the user explicitly asks for totals, counts, or a summary.
+- PACKET REPORT for a kapan ("packet report / full report for kapan AA"): list
+  its packets from tblPacket (NOT tblFinalPacket), ORDER BY PacketNo, with the
+  human columns only - KapanName, PacketNo (header it "Packet"), Shape, Color,
+  PolishedWt, RoughWt, CurrentWt, PAmount, Rate, CreDate. Because KapanName is
+  its own column here, the Packet column is the plain NUMBER (not "AA-1"). Never
+  include ID/KapanID/PacketID/UserID.
 - NEVER silently DROP a filter or qualifier from the question (e.g. "managers
   only", "in the cutting department", "round stones", "excluding backup"). Apply
   it with the correct column or JOIN (see the relationship hints in the data
@@ -212,9 +229,11 @@ a colleague, NEVER a raw database dump. Build a substantive answer in three beat
   actually know it - never invent a currency symbol. Dates as "27 Jun 2026".
 - Do NOT mention SQL, raw table names, or column names (say "packets on jangad",
   not "tblJangadPackets").
-- LARGE RESULTS: never dump every row. Give the headline (total/count) in a
-  sentence, show the top ~10 in a table if a list is needed, and offer to narrow
-  or filter.
+- LARGE RESULTS - PREVIEW in chat, FULL data in the download: give the headline
+  (total/count) in a sentence, show the first ~30 rows as a Markdown table, and
+  tell the user the COMPLETE data (all N rows) is in the Excel/PDF download. NEVER
+  present only a top-few as if it were the whole answer (unless they asked for
+  top-N), and never truncate the underlying data - the download must have EVERY row.
 - AMBIGUOUS MATCHES: if a name/term matches several records (e.g. several
   "Customer A" in different cities), ASK which one and list the options instead
   of guessing.
@@ -272,9 +291,23 @@ def dynamic_schema_for(question: str) -> str:
     Schema text for THIS question only: the glossary lists every table, but
     detailed columns are included only for the few tables the router picks as
     relevant. This is the key token-saving step.
+
+    Starts with TODAY'S DATE: without it the model labels grounded numbers with
+    its training-era year (a validated live bug: a 2026 production overview was
+    narrated as "2025" and compared against 2024 as "last year"). Placed here
+    (not in RULES) so the cached rules block stays byte-stable; this block is
+    per-question anyway and the date only changes at midnight.
     """
+    from datetime import date
+
+    today = date.today()
+    date_line = (
+        f"TODAY'S DATE: {today:%d %b %Y}. The current year is {today.year}. "
+        f"Use these for 'this year/month/last year' in BOTH your SQL and your "
+        f"written answer - never assume a different year.\n\n"
+    )
     relevant = select_tables(question)
-    return build_schema_context(relevant)
+    return date_line + build_schema_context(relevant)
 
 
 def system_prompt_for(question: str) -> str:
@@ -298,6 +331,12 @@ def routing_text(question: str, history: list[dict] | None = None) -> str:
 # sending hundreds of rows explodes token usage (and blows rate limits). The
 # FULL rows are still returned separately for export.
 MODEL_ROW_LIMIT = 50
+
+# A downloaded report/export must be the COMPLETE detail list, so it is fetched
+# with a much higher row cap than the model-facing preview. Guards against a
+# runaway full-table dump while covering every realistic report (a kapan's
+# packets, a month's production). Kept in step with pdf.MAX_PDF_ROWS.
+EXPORT_ROW_CAP = 5000
 
 
 # Deterministic enrichment/display nudge: prompt rules alone are ignored by
@@ -366,9 +405,14 @@ def _enrichment_hint(columns: list, rows: list | None = None) -> str:
 
 
 def tool_run_sql(tool_input: dict) -> tuple[str, str, int, list, list]:
-    """Execute run_sql. Returns (model_text, sql, row_count, columns, full_rows)."""
+    """Execute run_sql. Returns (model_text, sql, row_count, columns, full_rows).
+
+    Fetches up to EXPORT_ROW_CAP rows so the FULL result is captured for the
+    download (the model itself is only shown MODEL_ROW_LIMIT as a preview). This
+    is what makes an export the complete data, not a top-few sample.
+    """
     query = tool_input.get("query", "")
-    result = run_select(query)
+    result = run_select(query, max_rows=EXPORT_ROW_CAP)
 
     if not result["ok"]:
         return f"ERROR: {result['error']}", result["sql"], 0, [], []
@@ -382,18 +426,29 @@ def tool_run_sql(tool_input: dict) -> tuple[str, str, int, list, list]:
         "truncated": result["truncated"],
     }
     text = json.dumps(payload, default=str)
-    if len(rows) > MODEL_ROW_LIMIT:
+    # ORDER MATTERS: check truncation FIRST. A result can be both >preview-size
+    # AND truncated; the preview note calls the capture "the COMPLETE result",
+    # which would be a lie for a truncated one - the very bug this guards.
+    if result["truncated"]:
         text += (
-            f"\n(NOTE: showing the first {MODEL_ROW_LIMIT} of {result['row_count']} "
-            "rows - the full result is available to the user as an export. "
-            "If this is a REPORT/LISTING request, present ~20-30 of these rows as "
-            "a Markdown table (same columns) and say the rest are in the export - "
-            "do NOT invent a different aggregated structure. Only aggregate/"
-            "summarise instead of listing if the user explicitly asked for totals "
-            "or a summary.)"
+            f"\n(WARNING: the true result is LARGER than the {result['row_count']}-row "
+            f"safety cap - only the FIRST {result['row_count']} rows were captured, and "
+            "the user's download will hold only those. You MUST say plainly that the "
+            f"report shows the first {result['row_count']} rows and suggest narrowing "
+            "the filter (kapan/date/department) for a complete report. NEVER present "
+            "this as the complete data.)"
         )
-    elif result["truncated"]:
-        text += "\n(NOTE: results were capped - add filters or use aggregates.)"
+    elif len(rows) > MODEL_ROW_LIMIT:
+        text += (
+            f"\n(NOTE: you are shown the first {MODEL_ROW_LIMIT} of "
+            f"{result['row_count']} rows as a PREVIEW; the COMPLETE {result['row_count']}"
+            "-row result is captured for the user's download. Present the first "
+            "~30 of these rows as a Markdown table (same columns) and tell the user "
+            f"the full data (all {result['row_count']} rows) is in the Excel/PDF "
+            "download - do NOT invent a different aggregated structure. Only "
+            "aggregate/summarise instead of listing if the user explicitly asked "
+            "for totals or a summary.)"
+        )
 
     if rows:
         text += _enrichment_hint(columns, rows)
@@ -408,13 +463,21 @@ def tool_create_report(tool_input: dict) -> tuple[str, str, int]:
     fmt = tool_input.get("format", "excel")
     title = tool_input.get("title", "Report")
 
-    result = run_select(query)
+    # An export is the COMPLETE detail list: fetch with the high export cap, not
+    # the model-facing 1000 default, so a big report isn't silently truncated.
+    result = run_select(query, max_rows=EXPORT_ROW_CAP)
     if not result["ok"]:
         return f"ERROR: {result['error']}", result["sql"], 0
 
     columns, rows = result["columns"], result["rows"]
     if not rows:
         return "No rows to put in the report.", result["sql"], 0
+
+    # Client display rule: a downloaded report must NEVER contain raw internal
+    # ids (KapanID/PacketID/ID/UserID) — only names/numbers. This tool builds the
+    # file directly from the query, bypassing postprocess, so sanitize here too.
+    from app.agent.postprocess import sanitize_export
+    columns, rows = sanitize_export(columns, rows)
 
     try:
         if fmt == "pdf":
@@ -555,32 +618,13 @@ TOOL_SPECS = [
             "required": ["query"],
         },
     },
-    {
-        "name": "create_report",
-        "description": (
-            "Generate a DOWNLOADABLE FILE (Excel, PDF, or PNG chart image) from "
-            "a READ-ONLY SELECT query. Use ONLY when the user explicitly asks to "
-            "export or download a report, spreadsheet, or file. Do NOT use this "
-            "to show a chart on screen in the chat - for an on-screen, "
-            "interactive chart or visual, call show_widget instead. For a PNG "
-            "chart file, also give x_col and y_col (column names to plot)."
-        ),
-        "schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "A T-SQL SELECT statement."},
-                "format": {
-                    "type": "string",
-                    "enum": ["excel", "pdf", "chart"],
-                    "description": "The output file type.",
-                },
-                "title": {"type": "string", "description": "Title for the report/chart."},
-                "x_col": {"type": "string", "description": "Chart only: x-axis column."},
-                "y_col": {"type": "string", "description": "Chart only: y-axis column."},
-            },
-            "required": ["query", "format"],
-        },
-    },
+    # NOTE: the old "create_report" tool is intentionally NOT offered to the
+    # model anymore. It wrote files to the server's outputs/ folder and told the
+    # user a server-side path ("/app/outputs/report.pdf") that NO endpoint
+    # serves - a download the user could never actually download. Real exports
+    # happen through the UI's Export buttons (which call /export_rows and
+    # /export_dashboard with the exact captured data). The handler is kept in
+    # TOOL_HANDLERS for backward compatibility with old sessions only.
     {
         "name": "get_table_columns",
         "description": (

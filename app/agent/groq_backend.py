@@ -13,6 +13,7 @@ from groq import Groq
 from app.agent import attachments as attachments_mod
 from app.agent import tools, widget
 from app.agent._retry import call_with_retry
+from app.agent.postprocess import looks_like_data_table
 from app.config import settings
 from app.core.logging_util import log_interaction
 
@@ -96,6 +97,74 @@ DASHBOARD_NUDGE = (
     "summary."
 )
 
+# REPORT = DETAIL ROWS guard (client-flagged bug): the user asked for a
+# "report" but the model answered with a GROUP BY aggregate ("Top 10 kapans by
+# damage count") instead of the detail listing with joined names the rules
+# mandate. Prompt rules alone did not stop weak models, so this is enforced
+# deterministically: report-intent question + aggregated final query -> one
+# corrective round. Summary-intent words exempt (an explicitly-asked summary
+# may aggregate).
+REPORT_ASKED_RE = re.compile(r"\breports?\b", re.IGNORECASE)
+_SUMMARY_INTENT_RE = re.compile(
+    r"\b(summar(y|ies|ise|ize)|total|count|how many|average|avg|trend|"
+    r"overview|analytics?|dashboards?|charts?|graphs?)\b",
+    re.IGNORECASE,
+)
+
+REPORT_DETAIL_NUDGE = (
+    "The user asked for a REPORT. In this system a report ALWAYS means the "
+    "DETAIL listing - one row per record - NEVER a GROUP BY summary, and never "
+    "a 'Top N' ranking they didn't ask for. Your last query AGGREGATED. Re-run "
+    "ONE corrected query that lists the individual records with human-readable "
+    "columns: JOIN tblEmployee on the numeric emp id for EmployeeName + "
+    "DepartMentName where the table has one; show KapanName and PacketNo, "
+    "never raw IDs. 'X wise' means ORDER BY that column (kapan wise = ORDER BY "
+    "KapanName), NOT GROUP BY. Then present the first ~30 rows as a Markdown "
+    "table and tell the user the full data is in the Excel/PDF download. "
+    "Aggregate ONLY if the user explicitly asked for totals or a summary."
+)
+
+
+def _all_sql_aggregated(sql_used: list[str]) -> bool:
+    """True if EVERY executed query was a GROUP BY aggregate - i.e. the model
+    never pulled the detail rows at all. (Checking only the LAST query would
+    false-positive on the good pattern 'detail query, then a small total for
+    the headline'.)"""
+    return bool(sql_used) and all("group by" in s.lower() for s in sql_used)
+
+
+# How many times, in ONE turn, we force a stalled model to actually run its
+# query before giving up. Weak models (e.g. llama-4-scout) sometimes ignore the
+# first push, so we allow a second.
+_MAX_EXECUTE_NUDGES = 2
+
+# Output budget per model call. 1024 was too small for the mandated answer
+# format (intro + ~30-row preview table + conclusion + download pointer +
+# SUGGESTIONS) and cut listing answers off mid-table. 2048 fits it while
+# staying inside the free tier's tokens-per-minute budget.
+_MAX_TOKENS = 2048
+
+# Shown to the model when it presents data (a table, figures, or written-out
+# SQL) without having called run_sql. Generalises the old "you wrote SQL" nudge
+# so it ALSO catches a fabricated Markdown table that contains no literal SELECT
+# — the exact failure that let "packet report for kapan AA" fall through to the
+# canned refusal.
+_EXECUTE_NUDGE = (
+    "You presented data (a table, figures, or a query) but you did NOT call "
+    "run_sql, so nothing you showed is real. You MUST call the run_sql tool "
+    "NOW to fetch the actual rows from the database, then answer ONLY from the "
+    "rows it returns. If you already wrote a SQL query, run that EXACT query "
+    "(do not rewrite or simplify it). Never put a data table, chart, or numbers "
+    "in your reply without running run_sql first. If the query genuinely "
+    "returns no rows, say so plainly."
+)
+
+
+def _has_data_visual(widgets: list[dict]) -> bool:
+    """True if a chart/dashboard was emitted — it presents numbers like a table,
+    so an ungrounded one is as fabricated as an invented table."""
+    return any((w or {}).get("kind") in ("chart", "dashboard") for w in widgets)
+
 
 def ask_groq(
     question: str,
@@ -133,7 +202,8 @@ def ask_groq(
     data_columns: list[str] = []  # columns/rows from the LAST successful run_sql,
     data_rows: list[dict] = []    # captured so export uses the exact data shown
 
-    nudged_to_execute = False  # have we already forced a stalled model to run its SQL?
+    execute_nudges = 0         # how many times we've forced a stalled model to run its SQL
+    nudged_report_detail = False  # one corrective round if a "report" came back aggregated
     nudged_dashboard = False   # have we already asked it to build the requested dashboard?
     force_tool = False         # require a tool call on the NEXT request (set by the nudge)
     dashboard_built = False    # did show_dashboard actually render this turn?
@@ -151,7 +221,7 @@ def ask_groq(
                     tools=_GROQ_TOOLS,
                     tool_choice=choice,
                     temperature=0,  # deterministic: same question -> same SQL, no drift
-                    max_tokens=1024,
+                    max_tokens=_MAX_TOKENS,
                 )
             )
         except Exception as exc:
@@ -201,30 +271,61 @@ def ask_groq(
 
         if not msg.tool_calls:
             answer = msg.content or ""
-            # Model-quirk guard: if the reply EMBEDS a SELECT but no query has
-            # actually run (and this isn't a file-only answer), the model wrote
-            # SQL instead of calling run_sql. Force one execution round instead
-            # of returning a data-less "here's the query" reply to the user.
-            if (
+            # Honesty on output-length truncation: finish_reason "length" means
+            # the answer was cut mid-generation - never return a silently
+            # sliced table as if it were the whole answer.
+            if response.choices[0].finish_reason == "length" and answer:
+                answer = answer.rstrip() + (
+                    "\n\n_(The written answer was shortened for length - the "
+                    "complete data is in the Excel/PDF download below.)_"
+                    if data_rows
+                    else "\n\n_(The answer was shortened for length - ask a "
+                    "narrower question for the rest.)_"
+                )
+            # Grounding guard: the model returned a data TABLE, a chart/dashboard,
+            # or written-out SQL but ran NO query (and this isn't a file-only
+            # answer) — so nothing it shows is real. Force an actual run_sql round
+            # rather than letting the fabrication fall through to the "ungrounded"
+            # refusal the user sees ("I couldn't pull that…"). This catches the
+            # common weak-model quirk where it prints a clean Markdown table with
+            # no literal SELECT text, which the old SQL-text-only check missed.
+            # Fires up to _MAX_EXECUTE_NUDGES times (weak models may need a second
+            # push); force_tool makes the next request require a tool call.
+            ungrounded_fabrication = (
                 not sql_used
                 and not file_grounded
-                and not nudged_to_execute
-                and _looks_like_unrun_sql(answer)
+                and (
+                    _looks_like_unrun_sql(answer)
+                    or looks_like_data_table(answer)
+                    or _has_data_visual(widgets)
+                )
+            )
+            if ungrounded_fabrication and execute_nudges < _MAX_EXECUTE_NUDGES:
+                execute_nudges += 1
+                force_tool = True
+                # Drop any fabricated widget from this stalled round so it can't
+                # be shown; the forced round rebuilds it from real rows.
+                widgets = [w for w in widgets if not _has_data_visual([w])]
+                messages.append({"role": "assistant", "content": answer})
+                messages.append({"role": "user", "content": _EXECUTE_NUDGE})
+                emit("Running the query…")
+                continue
+            # Report-detail guard (client-flagged): "…report…" question answered
+            # with a GROUP BY aggregate instead of the mandated detail listing
+            # with joined names. One corrective round, unless the user actually
+            # asked for a summary.
+            if (
+                not nudged_report_detail
+                and not file_grounded
+                and _all_sql_aggregated(sql_used)
+                and REPORT_ASKED_RE.search(question or "")
+                and not _SUMMARY_INTENT_RE.search(question or "")
             ):
-                nudged_to_execute = True
+                nudged_report_detail = True
                 force_tool = True
                 messages.append({"role": "assistant", "content": answer})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You wrote a SQL query but did not run it, so I have no "
-                        "data to show. Call the run_sql tool NOW to execute the "
-                        "EXACT query you just wrote above (do not rewrite or "
-                        "simplify it), then answer from the actual rows it "
-                        "returns. Do not put SQL in your reply."
-                    ),
-                })
-                emit("Running the query…")
+                messages.append({"role": "user", "content": REPORT_DETAIL_NUDGE})
+                emit("Building the detailed report…")
                 continue
             # Dashboard guard: the question asked for analytics/overview/
             # dashboard/analysis but the model finished without building one
@@ -311,7 +412,9 @@ def ask_groq(
                 emit("Building your dashboard…")
                 try:
                     code = widget.build_dashboard_html(args)
-                    widgets.append({"title": args.get("title", "dashboard"), "code": code, "kind": "dashboard"})
+                    # Keep the structured args too, so the export can rebuild the
+                    # FULL dashboard (all KPIs + every section), not just one table.
+                    widgets.append({"title": args.get("title", "dashboard"), "code": code, "kind": "dashboard", "data": args})
                     outcome = "rendered"
                     dashboard_built = True
                 except Exception as exc:
@@ -327,8 +430,17 @@ def ask_groq(
                 sql_used.append(sql)
                 last_row_count = row_count
                 # Capture the FULL rows from a successful run_sql (the model only
-                # sees a sample) so export is the exact, complete data.
-                if tc.function.name == "run_sql" and rows_full:
+                # sees a sample) so export is the exact, complete data. The
+                # LARGEST result wins: don't let a smaller aggregate/breakdown the
+                # model runs AFTERWARDS clobber the detail listing — the download
+                # must be the full list (e.g. all 3,200 packets of a kapan
+                # report), not the 12-row monthly breakdown or 1-row "summary at
+                # a glance" queried after it for the prose/dashboard.
+                if (
+                    tc.function.name == "run_sql"
+                    and rows_full
+                    and len(rows_full) > len(data_rows)
+                ):
                     data_columns, data_rows = cols_full, rows_full
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result_text}
@@ -351,7 +463,7 @@ def ask_groq(
     synth_ok = True
     try:
         final = client.chat.completions.create(
-            model=model, messages=messages, temperature=0, max_tokens=1024
+            model=model, messages=messages, temperature=0, max_tokens=_MAX_TOKENS
         )
         answer = (final.choices[0].message.content or "").strip()
     except Exception as exc:

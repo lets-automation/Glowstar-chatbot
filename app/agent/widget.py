@@ -287,8 +287,11 @@ def build_dashboard_html(args: dict) -> str:
         raise ValueError("tiles must be a non-empty array of {label, value}")
     if not isinstance(sections, list):
         raise ValueError("sections must be an array")
-    tiles = tiles[:6]
-    sections = sections[:3]
+    # Tolerate more than the spec asks for rather than silently dropping data
+    # the model computed: cap at the same limits as the PDF/Excel export
+    # (12 tiles / 6 sections) so the screen and the download always match.
+    tiles = tiles[:12]
+    sections = sections[:6]
 
     # ---- KPI tiles -------------------------------------------------------
     tile_html = []
@@ -516,9 +519,9 @@ response; the widget contains ONLY the visual.
   more than ~3 comparable data points -> show a chart. Single numbers or yes/no answers -> no chart.
 - NEVER reply with a text placeholder like "[Chart image: ...]" or "(see chart below)". That is
   a failure - if a chart is wanted, the widget IS the chart. Build it.
-- show_widget is for an ON-SCREEN visual rendered live in the chat. It is NOT the same as
-  create_report: create_report makes a downloadable Excel/PDF/PNG file and is ONLY for when the
-  user explicitly asks to export or download. For anything shown in the conversation, use
+- show_widget is for an ON-SCREEN visual rendered live in the chat. You cannot create
+  downloadable files: when the user asks to export/download, answer with the data and point
+  them to the Export buttons below your answer. For anything shown in the conversation, use
   show_widget.
 - If the user gives the data inline (e.g. "Rings 120, Necklaces 90"), you already have the
   numbers - go straight to show_widget. Do not run a query for data you were handed.
