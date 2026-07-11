@@ -62,11 +62,16 @@ export function saveThreads(threads) {
   } catch {
     /* still too big */
   }
-  // Fallback 2: keep only the 10 most recent threads, titles intact.
+  // Fallback 2: keep only the 10 most recent threads, titles intact. The bulky
+  // export rows/widgets are dropped, but exportQuery (small text) survives and
+  // exportTruncated is set — so the UI can still offer a full-data re-run
+  // export instead of silently losing the download.
   try {
     const minimal = threads.slice(0, 10).map((t) => ({
       ...t,
-      messages: (t.messages || []).map(({ exportRows, exportColumns, widgets, ...m }) => m),
+      messages: (t.messages || []).map(({ exportRows, exportColumns, widgets, ...m }) =>
+        exportRows?.length ? { ...m, exportTruncated: true } : m,
+      ),
     }))
     localStorage.setItem(KEY, JSON.stringify(minimal))
   } catch {
