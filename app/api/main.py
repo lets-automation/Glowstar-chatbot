@@ -33,6 +33,35 @@ from app.core.logging_util import logger
 from app.core.rate_limit import enforce_history_rate_limit, enforce_rate_limit
 from app.database.runner import run_select
 
+# --- AgentCost (optional cost tracking; agentcost.tech) ---
+# Must run BEFORE any LLM client is used: the SDK monkey-patches the anthropic/
+# openai client libraries so every call reports model, token counts, cost and
+# latency (metadata only — no prompt or answer content) to the AgentCost
+# dashboard. Best-effort by design: this is a young third-party SDK, so a
+# failure here logs a warning and the chatbot runs WITHOUT tracking — it must
+# never take the API down. Covers anthropic + ollama (openai lib); the native
+# groq SDK is not patched, so groq turns are invisible to it.
+if settings.AGENTCOST_API_KEY and settings.AGENTCOST_PROJECT_ID:
+    try:
+        from agentcost import track_costs
+
+        track_costs.init(
+            api_key=settings.AGENTCOST_API_KEY,
+            project_id=settings.AGENTCOST_PROJECT_ID,
+            debug=settings.AGENTCOST_DEBUG,
+            # AgentCost's pricing table doesn't know our demo model (it logged
+            # "Unknown model 'claude-sonnet-4-6' - cost will be $0.00"), so
+            # supply the rate: dollars per 1K tokens = $3/M input, $15/M output.
+            custom_pricing={
+                "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
+            },
+        )
+        logger.info(
+            "AgentCost tracking enabled (project %s).", settings.AGENTCOST_PROJECT_ID
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade to untracked, never crash
+        logger.warning("AgentCost init failed - running WITHOUT cost tracking: %s", exc)
+
 app = FastAPI(
     title="Aastha ERP AI Chatbot API",
     description="Ask questions about the Aastha diamond-manufacturing ERP.",
