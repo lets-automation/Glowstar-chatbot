@@ -2,6 +2,12 @@ import { useRef } from 'react'
 import { Image as ImageIcon, Paperclip, ArrowUp, Square, X, FileText } from 'lucide-react'
 import { cn } from '../lib/cn'
 
+// Attachments are DISABLED in the UI until the silent upload-failure bug is
+// fixed (a failed upload sends the question WITHOUT the file while the chip
+// stays visible — the answer looks wrong with no hint why). Flip to true to
+// bring the image/file pickers back; the whole pipeline behind them is intact.
+const ATTACHMENTS_ENABLED = false
+
 /*
  * Composer — the input surface, shared by the hero empty-state and the docked
  * active-chat view. Taller text area; two working pickers (image + file) that
@@ -91,14 +97,18 @@ export default function Composer({
       </div>
 
       <div className={cn('flex items-center justify-between gap-2 px-4 pt-1', lg ? 'pb-5' : 'pb-4')}>
-        {/* Left: image + file pickers (the only two tools we keep) */}
+        {/* Left: image + file pickers (hidden while ATTACHMENTS_ENABLED=false) */}
         <div className="flex items-center gap-1.5">
-          <ToolButton lg={lg} label="Attach image" onClick={() => imageInput.current?.click()}>
-            <ImageIcon className={lg ? 'h-5 w-5' : 'h-[18px] w-[18px]'} />
-          </ToolButton>
-          <ToolButton lg={lg} label="Attach file" onClick={() => fileInput.current?.click()}>
-            <Paperclip className={lg ? 'h-5 w-5' : 'h-[18px] w-[18px]'} />
-          </ToolButton>
+          {ATTACHMENTS_ENABLED && (
+            <>
+              <ToolButton lg={lg} label="Attach image" onClick={() => imageInput.current?.click()}>
+                <ImageIcon className={lg ? 'h-5 w-5' : 'h-[18px] w-[18px]'} />
+              </ToolButton>
+              <ToolButton lg={lg} label="Attach file" onClick={() => fileInput.current?.click()}>
+                <Paperclip className={lg ? 'h-5 w-5' : 'h-[18px] w-[18px]'} />
+              </ToolButton>
+            </>
+          )}
         </div>
 
         {/* Right: send / stop */}
