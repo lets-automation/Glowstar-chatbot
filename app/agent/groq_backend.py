@@ -15,7 +15,7 @@ from app.agent import tools, widget
 from app.agent._retry import call_with_retry
 from app.agent.postprocess import looks_like_data_table
 from app.config import settings
-from app.core.logging_util import log_interaction
+from app.core.logging_util import log_interaction, log_provider_error
 
 
 def _user_content(question: str, file_context: dict | None):
@@ -248,20 +248,14 @@ def ask_groq(
                 emit("Retrying…")
                 continue
             log_interaction(question, sql_used, last_row_count, error=str(exc))
-            if "rate_limit" in err or "429" in err or "quota" in err:
-                answer = (
-                    "The assistant is busy right now (usage limit reached). "
-                    "Please try again in a minute."
-                )
-            else:
-                answer = (
-                    "Sorry, I had trouble forming that query. Please try "
-                    "rephrasing the question."
-                )
+            # Classify + log the real cause (dead model / auth / rate-limit /
+            # connection) and return the message that points at the RIGHT fix,
+            # instead of always blaming the user's phrasing.
+            pe = log_provider_error(settings.LLM_PROVIDER, model, exc)
             # ok=False: the turn failed (no real answer), so the UI must not
             # offer export even though some SQL may have run before the failure.
             return {
-                "answer": answer,
+                "answer": pe.user_message,
                 "sql_used": sql_used,
                 "rows_returned": last_row_count,
                 "ok": False,

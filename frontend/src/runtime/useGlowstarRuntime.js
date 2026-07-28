@@ -7,6 +7,7 @@ import {
   streamQuestion,
   uploadFile,
 } from '../api'
+import { describeAttachmentFailures } from '../lib/attachments'
 import {
   loadThreads,
   saveThreads,
@@ -374,7 +375,11 @@ export function useGlowstarRuntime() {
       const question = (text ?? '').trim()
       // loadingThread: this thread's history is still arriving from the server;
       // basing a turn on the empty placeholder would save over the real history.
-      if ((!question && files.length === 0) || isStreaming || loadingThread) return
+      // Refusing returns ok:false so the caller can put the text/files BACK in
+      // the composer rather than silently dropping what the user typed.
+      if ((!question && files.length === 0) || isStreaming || loadingThread) {
+        return { ok: false, reason: 'busy' }
+      }
 
       // Ensure there's an active thread (create one on the first turn).
       let id = activeIdRef.current
@@ -390,22 +395,49 @@ export function useGlowstarRuntime() {
       // (Minus transient UI banners, which must never enter the saved history.)
       const baseMsgs = messagesRef.current.filter((m) => !m.transient)
 
-      // Best-effort upload of attachments to the backend /upload endpoint.
+      // Upload the attachments to /upload. A failure here USED to be swallowed:
+      // the turn went out without the file while its chip still showed as
+      // attached, so the model answered from nothing and looked confidently
+      // wrong with no hint why. Now one failed upload refuses the WHOLE turn —
+      // a partial answer the user believes is file-based is the worse outcome.
       const attachments = await Promise.all(
         files.map(async (att) => {
           try {
             const res = await uploadFile(att.file)
             return { name: att.name, kind: att.kind, fileId: res.file_id, uploaded: true }
-          } catch {
-            return { name: att.name, kind: att.kind, uploaded: false }
+          } catch (e) {
+            return {
+              name: att.name,
+              kind: att.kind,
+              uploaded: false,
+              error: e?.message || 'the upload failed.',
+            }
           }
         }),
       )
 
-      // References for the backend to read+analyse (only successfully uploaded).
-      const uploadedRefs = attachments
-        .filter((a) => a.uploaded && a.fileId)
-        .map((a) => ({ file_id: a.fileId, filename: a.name }))
+      const failedUploads = attachments.filter((a) => !a.uploaded)
+      if (failedUploads.length) {
+        // Nothing has been committed for this turn yet, so a thread created just
+        // for it must be rolled back — otherwise the user is stranded in an empty
+        // chat that never reaches the sidebar. Only when they're still on it (a
+        // mid-upload navigation means that id is no longer theirs to clear).
+        if (isNew && activeIdRef.current === id) {
+          activeIdRef.current = null
+          setActiveId(null)
+        }
+        return {
+          ok: false,
+          reason: 'upload',
+          message:
+            `${describeAttachmentFailures(failedUploads)} ` +
+            'Your question was not sent — remove or replace it and send again.',
+        }
+      }
+
+      // References for the backend to read+analyse. Every one uploaded, or we
+      // bailed above.
+      const uploadedRefs = attachments.map((a) => ({ file_id: a.fileId, filename: a.name }))
 
       // If the user attached a file but typed nothing, give the backend a
       // sensible default prompt (its question field can't be empty).
@@ -487,6 +519,7 @@ export function useGlowstarRuntime() {
                 content: answer,
                 ok: data.ok !== false,
                 widgets: data.widgets || [],
+                clarifyOptions: data.clarify_options || [],
                 exportColumns: cols,
                 exportRows: rows,
                 exportQuery: data.export_query || null,
@@ -543,6 +576,7 @@ export function useGlowstarRuntime() {
         // deleted thread stays deleted and another thread is never touched).
         updateThreadMessages(id, localMsgs)
       }
+      return { ok: true }
     },
     [isStreaming, loadingThread, threads, commitThread, updateThreadMessages],
   )

@@ -26,7 +26,12 @@ Run: python -m pytest tests/test_regression_datamodel.py -q
 
 import pytest
 
-from app.agent.postprocess import _UNGROUNDED_MSG, enrich, looks_like_data_table
+from app.agent.postprocess import (
+    _UNGROUNDED_MSG,
+    enrich,
+    export_query,
+    looks_like_data_table,
+)
 from app.agent.tools import _is_trap_table
 from app.schema import router
 from app.schema.context import KEY_TABLES
@@ -125,9 +130,75 @@ def test_incentive_uses_points_not_dead_amount():
     assert _note_has("CreditPoints", "POINTS", "points")
 
 
+def test_damage_count_records_and_type_split():
+    # Bug (2026-07): "how many damage" returned COUNT(DISTINCT KapanName) (~20/mo)
+    # AND merged the two InceDamageTypeName categories into one number. Fix: count
+    # RECORDS (rows), and always split DAMAGE vs REPORT so the client's official
+    # figure is visible and the answer can't be silently wrong.
+    assert _note_has("InceDamageTypeName", "DAMAGE", "REPORT")
+    # The guidance must explicitly warn OFF counting distinct kapans.
+    assert any(
+        "InceDamageTypeName" in n and "DISTINCT" in n and "Kapan" in n
+        for n in _ALL_NOTES
+    ), "damage-count guidance must say COUNT rows, NOT COUNT(DISTINCT Kapan...)"
+
+
+def test_clarify_ambiguous_employee_role_guidance():
+    # Bug (2026-07, client meeting): "GIA results ... employee wise" was silently
+    # grouped by the UPLOAD clerk (tblFinalPacket.UserID) instead of the Fency
+    # worker the client meant. Fix: teach the 3 employee roles + tell the model to
+    # ASK or DECLARE which role, and never default to the upload clerk.
+    assert _note_has("tblFinalPacket.UserID", "upload", "UPLOAD", "clerk")
+    assert any(
+        "Fency" in n and "employee-wise" in n.lower()
+        for n in _ALL_NOTES
+    ), "GIA employee-wise ambiguity (3 roles + Fency) must be documented"
+
+
 def test_count_distinct_guidance_present():
     # Bug: COUNT(*) on transactional tables inflated counts (~34 rows/packet).
     assert any("COUNT(DISTINCT" in n for n in _ALL_NOTES)
+
+
+def test_export_query_prefers_detail_over_trailing_aggregate():
+    # Bug (2026-07): a "Fency production" answer LISTED 305 packets, then ran a
+    # COUNT/SUM for its summary line. export_query took the LAST select (the
+    # aggregate), so a reopened-thread export re-ran the 1-row summary instead of
+    # the 305-packet list — breaking the "full list available to download" promise.
+    detail = ("SELECT KapanName, PacketNo AS Packet, Shape FROM tblFinalPacket "
+              "WHERE PacketID IN (SELECT Packet_ID FROM tblPointRateLabour "
+              "WHERE DepartmentName='Fency') AND CreateDate >= '2026-06-01'")
+    summary = ("SELECT COUNT(PacketID) AS n, SUM(CurrentWt) AS ct FROM tblFinalPacket "
+               "WHERE CreateDate >= '2026-06-01'")
+    # The detail listing must win, regardless of order.
+    assert export_query([detail, summary]) == detail
+    assert export_query([summary, detail]) == detail
+    # A genuine summary-only answer still exports its aggregate (nothing else to use).
+    assert export_query([summary]) == summary
+    # No SELECT at all -> nothing to export.
+    assert export_query(["UPDATE x SET y=1"]) is None
+
+
+def test_detail_by_default_guidance():
+    # Bug (2026-07, client): "Fency department production output" answered with a
+    # lone COUNT/SUM ("305 packets, 76.16 ct") and threw away the 305 packet rows
+    # the client actually wanted ("which packet"). Fix lives in TWO layers:
+    #   (a) an always-on RULES bullet biasing to a DETAIL listing + summary line,
+    #   (b) a concrete PRODUCTION note with the packet-list query + dept filter.
+    from app.agent.tools import RULES
+
+    assert "DETAIL BY DEFAULT" in RULES, "the always-on detail-listing rule is missing"
+    # It must warn OFF answering with a bare aggregate and cover output/results.
+    assert "lone COUNT/SUM" in RULES or "bare total" in RULES
+    assert all(w in RULES for w in ("OUTPUT", "RESULTS", "PRODUCTION"))
+
+    # The PRODUCTION note must tell it to LIST finished packets and how to scope a
+    # department (via tblPointRateLabour), not just how to GROUP BY.
+    assert _note_has("PRODUCTION", "LIST", "packet list", "PACKET LIST")
+    assert any(
+        "tblFinalPacket" in n and "PacketID IN" in n and "tblPointRateLabour" in n
+        for n in _ALL_NOTES
+    ), "production detail must scope a department by its packets (PacketID IN ...)"
 
 
 def test_glossary_not_gutted():

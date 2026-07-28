@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Sparkles, Paperclip, Download, FileSpreadsheet, FileText, Loader2 } from 'lucide-react'
+import { Sparkles, Paperclip, Download, FileSpreadsheet, FileText, Loader2, Pencil } from 'lucide-react'
 import Composer from './Composer'
 import { Widget } from '../SandboxedWidget'
 import { exportRows, exportDashboard, exportData } from '../api'
@@ -23,7 +23,7 @@ const MD_COMPONENTS = {
  * Markdown. An Export control appears only when the backend returned an
  * export query for that answer (i.e. there's tabular data worth exporting).
  */
-export default function Thread({ messages, isStreaming, status, composerProps, onWidgetPrompt }) {
+export default function Thread({ messages, isStreaming, status, composerProps, onWidgetPrompt, onClarifyOther }) {
   const endRef = useRef(null)
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -68,6 +68,34 @@ export default function Thread({ messages, isStreaming, status, composerProps, o
                           {m.content}
                         </ReactMarkdown>
                       </div>
+                      {/* Clarify buttons: when the bot asks which interpretation the
+                          user meant, it returns the choices here — tapping one sends
+                          that phrase back as the next question (no typing needed). */}
+                      {m.clarifyOptions?.length > 0 && (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {m.clarifyOptions.map((opt, oi) => (
+                            <button
+                              key={oi}
+                              type="button"
+                              onClick={() => onWidgetPrompt?.(opt)}
+                              disabled={isStreaming}
+                              className="inline-flex items-center rounded-full border border-accent bg-accent/10 px-3.5 py-1.5 text-[0.82rem] font-medium text-accent transition hover:bg-accent hover:text-white disabled:opacity-50"
+                            >
+                              {opt}
+                            </button>
+                          ))}
+                          {/* Escape hatch: none of the choices fit -> focus the
+                              text box so the user can type their own answer. */}
+                          <button
+                            type="button"
+                            onClick={() => onClarifyOther?.()}
+                            disabled={isStreaming}
+                            className="inline-flex items-center gap-1.5 rounded-full border border-dashed border-line bg-white px-3.5 py-1.5 text-[0.82rem] font-medium text-text-muted transition hover:border-accent hover:text-accent disabled:opacity-50"
+                          >
+                            <Pencil className="h-3.5 w-3.5" /> Something else…
+                          </button>
+                        </div>
+                      )}
                       {/* Inline charts/graphs the model drew (sandboxed iframe) */}
                       {m.widgets?.map((w, wi) => (
                         <Widget key={wi} code={w.code} title={w.title} onPrompt={onWidgetPrompt} />

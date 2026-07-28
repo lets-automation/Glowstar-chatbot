@@ -72,6 +72,25 @@ def extract_suggestions(answer: str) -> tuple[str, list[str]]:
     return "\n".join(kept).strip(), suggestions
 
 
+def extract_clarify(answer: str) -> tuple[str, list[str]]:
+    """
+    Split a trailing 'CLARIFY: option A | option B | option C' line out of the
+    answer. When the model asks a follow-up question about which interpretation
+    the user meant, it lists the choices here; the UI renders them as clickable
+    BUTTONS so a non-technical user just taps one instead of typing "1, 2 or 3".
+    Each option is a short, self-contained phrase — tapping it sends that phrase
+    back as the next question. Returns (clean_answer, [options]).
+    """
+    kept, options = [], []
+    for line in answer.splitlines():
+        if line.strip().upper().startswith("CLARIFY:"):
+            payload = line.split(":", 1)[1]
+            options = [s.strip() for s in payload.split("|") if s.strip()][:4]
+        else:
+            kept.append(line)
+    return "\n".join(kept).strip(), options
+
+
 def build_citation(sql_used: list[str], now: datetime | None = None) -> str:
     """Build 'Source: tblX, tblY • Retrieved: 27 Jun 2026, 10:45 AM'."""
     if not sql_used:
@@ -91,13 +110,29 @@ def build_citation(sql_used: list[str], now: datetime | None = None) -> str:
     return f"Source: {src} • Retrieved: {now.strftime('%d %b %Y, %I:%M %p')}"
 
 
+def _is_aggregate_select(sql: str) -> bool:
+    """A SELECT whose OUTPUT is a rollup (GROUP BY, or a top-level COUNT/SUM/…)."""
+    u = sql.upper()
+    return "GROUP BY" in u or bool(re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", u))
+
+
 def export_query(sql_used: list[str]) -> str | None:
-    """The last successful SELECT/WITH - what the UI exports to Excel/PDF."""
-    for sql in reversed(sql_used):
-        head = sql.strip().upper()
-        if head.startswith("SELECT") or head.startswith("WITH"):
-            return sql
-    return None
+    """
+    The SELECT the UI re-runs for a FULL export (used on a reopened thread, whose
+    captured rows are no longer in memory).
+
+    Prefer the DETAIL listing over a trailing COUNT/SUM/GROUP BY summary: when an
+    answer LISTS rows and then runs an aggregate for its one-line summary, that
+    aggregate must NOT become the export - otherwise the download silently shrinks
+    to a single summary row, breaking the "full list available to download"
+    promise. Fall back to the last SELECT only when EVERY query is an aggregate (a
+    genuine summary/GROUP-BY answer, where the aggregate IS the data to export).
+    """
+    selects = [s for s in sql_used if s.strip().upper().startswith(("SELECT", "WITH"))]
+    if not selects:
+        return None
+    non_aggregate = [s for s in selects if not _is_aggregate_select(s)]
+    return (non_aggregate or selects)[-1]
 
 
 # "The user asked for a chart" - keyword check on the question.
@@ -179,6 +214,9 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
     full professional response.
     """
     clean, suggestions = extract_suggestions(result.get("answer", ""))
+    # Clarify-buttons: a trailing 'CLARIFY: a | b | c' line becomes clickable
+    # option buttons in the UI (so a non-dev user taps a choice instead of typing).
+    clean, clarify_options = extract_clarify(clean)
     sql_used = result.get("sql_used", [])
     rows_returned = result.get("rows_returned", 0)
     ok = result.get("ok", True)
@@ -212,6 +250,7 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
         return {
             "answer": _UNGROUNDED_MSG,
             "suggestions": [],
+            "clarify_options": [],
             "citation": "",
             "export_query": None,
             "sql_used": sql_used,
@@ -248,6 +287,7 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
     return {
         "answer": clean,
         "suggestions": suggestions,
+        "clarify_options": clarify_options,
         "citation": build_citation(sql_used, now),
         # Only offer export on a turn that actually succeeded — otherwise the
         # exported file would contain results the chat couldn't present.

@@ -28,7 +28,7 @@ from app.agent.groq_backend import (
 )
 from app.agent.postprocess import looks_like_data_table
 from app.config import settings
-from app.core.logging_util import log_interaction
+from app.core.logging_util import log_interaction, log_provider_error
 
 # Output budget per model call. 1024 was too small: the mandated answer format
 # (intro + ~30-row Markdown preview table + conclusion + download pointer +
@@ -157,16 +157,13 @@ def ask_anthropic(
                 )
             )
         except Exception as exc:
-            err = str(exc).lower()
             log_interaction(question, sql_used, last_row_count, error=str(exc))
-            busy = "rate" in err or "429" in err or "quota" in err
+            # Classify + log the real cause and return the message that points
+            # at the right fix (config error vs. transient busy vs. rephrase).
+            pe = log_provider_error(settings.LLM_PROVIDER, model, exc)
             # ok=False: the turn failed, so the UI must not offer export.
             return {
-                "answer": (
-                    "The assistant is busy right now. Please try again shortly."
-                    if busy
-                    else "Sorry, I had trouble answering that. Please rephrase."
-                ),
+                "answer": pe.user_message,
                 "sql_used": sql_used,
                 "rows_returned": last_row_count,
                 "ok": False,

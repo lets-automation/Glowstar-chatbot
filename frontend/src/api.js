@@ -130,14 +130,50 @@ export async function exportData(query, format) {
   URL.revokeObjectURL(url)
 }
 
+// Turn a failed /upload into a reason a business user can act on. The text
+// COMPLETES the sentence: Couldn't attach "<name>" — <reason>
+function uploadFailureReason(status) {
+  if (status === 413) return 'it is larger than the 15 MB limit.'
+  if (status === 415) return 'only Excel, CSV, PDF, text and image files can be read.'
+  if (status === 429) return 'too many uploads just now — wait a moment and try again.'
+  if (status === 401) return 'the session has expired — reload the page and sign in again.'
+  return `the server rejected it (error ${status}).`
+}
+
+// Entity autocomplete: real department/kapan/employee names matching `q`.
+// Deterministic (a DB LIKE + SOUNDEX, no AI), used by the composer to let a user
+// pick a real name instead of typing it. Returns [] on any failure (never throws
+// — a failed suggest must not disrupt typing).
+export async function fetchSuggestions(q, signal) {
+  try {
+    const res = await fetch(`${API_URL}/suggest?q=${encodeURIComponent(q)}`, {
+      headers: authHeaders(),
+      signal,
+    })
+    if (!res.ok) return []
+    const data = await res.json()
+    return data.suggestions || []
+  } catch {
+    return []
+  }
+}
+
 // Upload an image or file to the backend. Returns { file_id, filename, ... }.
 // Used by the composer's image/file pickers; see /upload in app/api/main.py.
+// Throws with a reason the composer SHOWS the user — never let this fail
+// quietly: a swallowed upload sends the question without its file and the
+// answer then looks wrong for no visible reason.
 export async function uploadFile(file) {
   const form = new FormData()
   form.append('file', file)
-  const res = await fetch(`${API_URL}/upload`, { method: 'POST', headers: authHeaders(), body: form })
+  let res
+  try {
+    res = await fetch(`${API_URL}/upload`, { method: 'POST', headers: authHeaders(), body: form })
+  } catch {
+    throw new Error('the server could not be reached.')
+  }
   handle401(res.status)
-  if (!res.ok) throw new Error(`Upload failed (${res.status}).`)
+  if (!res.ok) throw new Error(uploadFailureReason(res.status))
   return res.json()
 }
 

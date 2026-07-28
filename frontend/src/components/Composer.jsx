@@ -1,12 +1,12 @@
 import { useRef } from 'react'
-import { Image as ImageIcon, Paperclip, ArrowUp, Square, X, FileText } from 'lucide-react'
+import { AlertCircle, Image as ImageIcon, Paperclip, ArrowUp, Square, X, FileText } from 'lucide-react'
 import { cn } from '../lib/cn'
+import { ACCEPT_ANY, ACCEPT_IMAGE } from '../lib/attachments'
 
-// Attachments are DISABLED in the UI until the silent upload-failure bug is
-// fixed (a failed upload sends the question WITHOUT the file while the chip
-// stays visible — the answer looks wrong with no hint why). Flip to true to
-// bring the image/file pickers back; the whole pipeline behind them is intact.
-const ATTACHMENTS_ENABLED = false
+// Kill switch for the attachment pickers. This was false while a failed upload
+// silently sent the question WITHOUT its file; that now refuses the turn and
+// shows why (see useGlowstarRuntime.send + lib/attachments), so it's back on.
+const ATTACHMENTS_ENABLED = true
 
 /*
  * Composer — the input surface, shared by the hero empty-state and the docked
@@ -25,6 +25,11 @@ export default function Composer({
   attachments = [],
   onAttach,
   onRemoveAttachment,
+  error = '',
+  onDismissError,
+  textareaRef,
+  suggestions = [],
+  onPickSuggestion,
   size = 'md',
 }) {
   const imageInput = useRef(null)
@@ -48,9 +53,31 @@ export default function Composer({
 
   return (
     <div className="w-full rounded-3xl border border-line bg-white shadow-composer transition-colors focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/20">
-      {/* Hidden native pickers */}
-      <input ref={imageInput} type="file" accept="image/*" multiple hidden onChange={pick} />
-      <input ref={fileInput} type="file" multiple hidden onChange={pick} />
+      {/* Hidden native pickers. `accept` is limited to what the backend can
+          actually read, so the OS dialog greys out files that would only fail
+          on upload (the picker used to accept anything at all). */}
+      <input ref={imageInput} type="file" accept={ACCEPT_IMAGE} multiple hidden onChange={pick} />
+      <input ref={fileInput} type="file" accept={ACCEPT_ANY} multiple hidden onChange={pick} />
+
+      {/* Why an attachment was refused — the message that used to be missing
+          entirely while the question went out silently without its file. */}
+      {error && (
+        <div
+          role="alert"
+          className="mx-5 mt-4 flex items-start gap-2 rounded-lg border border-[#F0C9C9] bg-[#FDF4F4] px-3 py-2 text-[0.8rem] leading-snug text-[#8E2F2F]"
+        >
+          <AlertCircle className="mt-[2px] h-4 w-4 shrink-0" />
+          <span className="flex-1">{error}</span>
+          <button
+            type="button"
+            onClick={onDismissError}
+            aria-label="Dismiss message"
+            className="grid h-5 w-5 shrink-0 place-items-center rounded text-[#8E2F2F]/70 hover:bg-[#F6E4E4] hover:text-[#8E2F2F]"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* Attachment chips */}
       {attachments.length > 0 && (
@@ -81,9 +108,30 @@ export default function Composer({
         </div>
       )}
 
+      {/* Entity autocomplete: real names from the DB matching the word being
+          typed. Tap one to drop the correct spelling in (kills "fancy" → "Fency"
+          misses). onMouseDown+preventDefault so the tap doesn't blur the box. */}
+      {suggestions.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 px-5 pt-3">
+          <span className="text-[0.72rem] text-text-muted">Did you mean:</span>
+          {suggestions.map((s, i) => (
+            <button
+              key={i}
+              type="button"
+              onMouseDown={(e) => { e.preventDefault(); onPickSuggestion?.(s.name) }}
+              className="inline-flex items-center gap-1.5 rounded-full border border-line bg-[#FBFAFE] px-2.5 py-1 text-[0.77rem] text-text transition hover:border-accent hover:text-accent"
+            >
+              {s.name}
+              <span className="text-[0.64rem] uppercase tracking-wide text-text-muted">{s.kind}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Input */}
       <div className={cn('px-5', lg ? 'pt-5' : 'pt-4')}>
         <textarea
+          ref={textareaRef}
           rows={lg ? 4 : 3}
           value={value}
           onChange={(e) => onChange(e.target.value)}

@@ -1,9 +1,16 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Sidebar from './components/Sidebar'
 import TopBar from './components/TopBar'
 import Hero from './components/Hero'
 import Thread from './components/Thread'
 import { useGlowstarRuntime } from './runtime/useGlowstarRuntime'
+import { attachmentProblem, describeAttachmentFailures } from './lib/attachments'
+import { fetchSuggestions } from './api'
+
+// Replace the last whitespace-delimited word of `text` with `name`.
+function replaceLastWord(text, name) {
+  return /(\S+)$/.test(text) ? text.replace(/(\S+)$/, name) : (text + name)
+}
 
 // Name shown in the top-right corner. No login screen — the chatbot runs
 // standalone. (API access control lives in the backend behind AUTH_ENABLED,
@@ -19,6 +26,15 @@ export default function App() {
   const rt = useGlowstarRuntime()
   const [input, setInput] = useState('')
   const [attachments, setAttachments] = useState([])
+  // Why the last attachment / send was refused. Shown in the composer so an
+  // upload can never fail invisibly.
+  const [attachError, setAttachError] = useState('')
+  // The message textarea, so a clarify "Something else…" button can focus it and
+  // let the user type their own answer instead of picking an offered option.
+  const composerInputRef = useRef(null)
+  // Entity autocomplete: real names matching the word being typed, so the user
+  // picks (e.g. "Fency") instead of mis-spelling it. Deterministic, from the DB.
+  const [entitySuggestions, setEntitySuggestions] = useState([])
   const [collapsed, setCollapsed] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
 
@@ -35,20 +51,58 @@ export default function App() {
     return () => mq.removeEventListener('change', apply)
   }, [])
 
+  // Debounced entity autocomplete on the last word being typed. Names come from
+  // the DB (/suggest), so they can't be misspelled — the user taps a real one.
+  useEffect(() => {
+    const lastWord = (input.match(/(\S+)$/) || [])[1] || ''
+    if (rt.isStreaming || lastWord.length < 2) {
+      setEntitySuggestions([])
+      return
+    }
+    const ctrl = new AbortController()
+    const t = setTimeout(async () => {
+      const s = await fetchSuggestions(lastWord, ctrl.signal)
+      // Don't suggest the exact word they've already fully typed.
+      setEntitySuggestions(s.filter((x) => x.name.toLowerCase() !== lastWord.toLowerCase()))
+    }, 250)
+    return () => { clearTimeout(t); ctrl.abort() }
+  }, [input, rt.isStreaming])
+
+  function pickSuggestion(name) {
+    setInput((cur) => replaceLastWord(cur, name) + ' ')
+    setEntitySuggestions([])
+    requestAnimationFrame(() => composerInputRef.current?.focus())
+  }
+
   const hasChat = rt.messages.length > 0
 
+  // Reject unreadable/oversized files the moment they're picked, using the same
+  // rules the server enforces — far better than accepting them here and failing
+  // at send time (which is how the silent-upload bug went unnoticed).
   function addAttachments(files) {
-    const next = files.map((file) => ({
-      id: `att-${attachSeq++}`,
-      file,
-      name: file.name,
-      kind: file.type.startsWith('image/') ? 'image' : 'file',
-      preview: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
-    }))
-    setAttachments((a) => [...a, ...next])
+    const accepted = []
+    const refused = []
+    files.forEach((file) => {
+      const problem = attachmentProblem(file)
+      if (problem) refused.push({ name: file.name, error: problem })
+      else accepted.push(file)
+    })
+
+    if (accepted.length) {
+      const next = accepted.map((file) => ({
+        id: `att-${attachSeq++}`,
+        file,
+        name: file.name,
+        kind: file.type.startsWith('image/') ? 'image' : 'file',
+        preview: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
+      }))
+      setAttachments((a) => [...a, ...next])
+    }
+    setAttachError(refused.length ? describeAttachmentFailures(refused) : '')
   }
 
   function removeAttachment(id) {
+    setAttachError('')
     setAttachments((a) => {
       const gone = a.find((x) => x.id === id)
       if (gone?.preview) URL.revokeObjectURL(gone.preview)
@@ -56,18 +110,33 @@ export default function App() {
     })
   }
 
-  function submit() {
+  async function submit() {
     if (!input.trim() && attachments.length === 0) return
     const text = input
     const files = attachments
     setInput('')
     setAttachments([])
-    rt.send(text, files)
+    setAttachError('')
+
+    const result = await rt.send(text, files)
+
+    // Refused (an upload failed, or a turn was already streaming): put the
+    // message and its files BACK so nothing the user typed is lost. The File
+    // objects and preview URLs are still alive — clearing state above doesn't
+    // revoke them. Don't clobber anything typed while the upload was running.
+    if (result?.ok === false) {
+      setInput((cur) => cur || text)
+      setAttachments((cur) => (cur.length ? cur : files))
+      if (result.message) setAttachError(result.message)
+    } else {
+      files.forEach((a) => a.preview && URL.revokeObjectURL(a.preview))
+    }
   }
 
   function clearAttachments() {
     attachments.forEach((a) => a.preview && URL.revokeObjectURL(a.preview))
     setAttachments([])
+    setAttachError('')
   }
 
   function newChat() {
@@ -87,13 +156,29 @@ export default function App() {
   // Shared composer wiring for both the hero and the docked thread view.
   const composerProps = {
     value: input,
-    onChange: setInput,
+    onChange: (v) => {
+      setInput(v)
+      if (attachError) setAttachError('') // stale once they start fixing it
+    },
     onSubmit: submit,
     isStreaming: rt.isStreaming,
     onStop: rt.stop,
     attachments,
     onAttach: addAttachments,
     onRemoveAttachment: removeAttachment,
+    error: attachError,
+    onDismissError: () => setAttachError(''),
+    textareaRef: composerInputRef,
+    suggestions: entitySuggestions,
+    onPickSuggestion: pickSuggestion,
+  }
+
+  // Clarify "Something else…" — let the user type their own answer: focus the
+  // message box (and clear any leftover text so they start fresh).
+  function clarifyOther() {
+    setInput('')
+    // focus after the current render so the ref is attached and enabled
+    requestAnimationFrame(() => composerInputRef.current?.focus())
   }
 
   return (
@@ -140,6 +225,7 @@ export default function App() {
               status={rt.status}
               composerProps={composerProps}
               onWidgetPrompt={(text) => rt.send(text)}
+              onClarifyOther={clarifyOther}
             />
           ) : (
             <Hero userName={USER.name} composerProps={composerProps} onPickPrompt={setInput} />

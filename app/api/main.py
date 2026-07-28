@@ -17,6 +17,7 @@ Then open the auto-docs at http://127.0.0.1:8000/docs
 
 import os
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, HTTPException, Path, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +30,7 @@ from app.artifacts.excel import to_excel
 from app.artifacts.pdf import to_pdf
 from app.config import settings
 from app.core import auth, history
-from app.core.logging_util import logger
+from app.core.logging_util import log_startup, logger
 from app.core.rate_limit import enforce_history_rate_limit, enforce_rate_limit
 from app.database.runner import run_select
 
@@ -41,6 +42,7 @@ from app.database.runner import run_select
 # failure here logs a warning and the chatbot runs WITHOUT tracking — it must
 # never take the API down. Covers anthropic + ollama (openai lib); the native
 # groq SDK is not patched, so groq turns are invisible to it.
+_agentcost_track_costs = None
 if settings.AGENTCOST_API_KEY and settings.AGENTCOST_PROJECT_ID:
     try:
         from agentcost import track_costs
@@ -59,18 +61,47 @@ if settings.AGENTCOST_API_KEY and settings.AGENTCOST_PROJECT_ID:
         logger.info(
             "AgentCost tracking enabled (project %s).", settings.AGENTCOST_PROJECT_ID
         )
+        _agentcost_track_costs = track_costs
     except Exception as exc:  # noqa: BLE001 - degrade to untracked, never crash
         logger.warning("AgentCost init failed - running WITHOUT cost tracking: %s", exc)
+
+def _log_startup_banner() -> None:
+    """Log the active provider + model the moment the backend boots, so a
+    misconfiguration (wrong provider, retired model, missing key) is visible
+    immediately in the logs instead of only when the first question fails."""
+    from app.agent.agent import _resolve_model
+
+    provider = settings.LLM_PROVIDER.lower()
+    model = _resolve_model(provider, None)
+    key = {
+        "groq": settings.GROQ_API_KEY,
+        "gemini": settings.GEMINI_API_KEY,
+        "anthropic": settings.ANTHROPIC_API_KEY,
+        "claude": settings.ANTHROPIC_API_KEY,
+        "ollama": "local",  # local model needs no key
+    }.get(provider, "")
+    log_startup(provider, model, key_present=bool(key))
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Runs once at serve time (not on mere import), so the banner reflects the
+    # real running config and the backend import is deferred to boot.
+    _log_startup_banner()
+    yield
+
 
 app = FastAPI(
     title="Aastha ERP AI Chatbot API",
     description="Ask questions about the Aastha diamond-manufacturing ERP.",
     version="0.1.0",
+    lifespan=_lifespan,
     # Hide the interactive API surface unless explicitly enabled (see config).
     docs_url="/docs" if settings.API_DOCS_ENABLED else None,
     redoc_url="/redoc" if settings.API_DOCS_ENABLED else None,
     openapi_url="/openapi.json" if settings.API_DOCS_ENABLED else None,
 )
+
 
 # --- CORS ---
 # CORS only matters for cross-origin callers (local dev: Vite :5173 -> API
@@ -252,6 +283,45 @@ def _safe_remove(path: str) -> None:
         pass
 
 
+def _ask_with_cost_tracking(
+    question: str,
+    *,
+    history: list[dict],
+    attachments: list[dict],
+    session_id: str | None,
+    user: dict,
+    on_event=None,
+) -> dict:
+    """Run one chat turn, tagging every Claude call with its API requester.
+
+    One chat turn can make multiple Claude calls while using tools.  AgentCost's
+    Anthropic interceptor records each of them; its context manager gives all
+    those events the same safe request identifiers.  The context is entered in
+    the worker itself, which is important for /chat/stream because ContextVars
+    do not automatically cross a manually-created thread.
+    """
+    from app.agent.agent import ask
+
+    kwargs = {
+        "history": history,
+        "attachments": attachments,
+        "on_event": on_event,
+    }
+    if _agentcost_track_costs is None:
+        return ask(question, **kwargs)
+
+    # Do not attach the question, response, token, or credentials as metadata.
+    # These fields let the dashboard group costs by frontend/API caller.
+    with _agentcost_track_costs.agent("aastha-erp-chatbot"), _agentcost_track_costs.metadata(
+        source="frontend_api",
+        endpoint="chat_stream" if on_event else "chat",
+        session_id=session_id or "anonymous",
+        user_id=str(user.get("username") or user.get("sub") or "anonymous"),
+    ):
+        return ask(question, **kwargs)
+
+0
+
 def _sweep_old(dir_path: str, max_age_seconds: float) -> None:
     """Best-effort deletion of files older than max_age in a directory, so
     transient dirs (uploads) don't grow without bound. Never raises."""
@@ -331,13 +401,17 @@ def chat(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
             detail=f"AI is not configured: {missing} is missing in .env.",
         )
 
-    # Import here so the app still starts/imports fine when the key is absent.
-    from app.agent.agent import ask
     from app.api import sessions
 
     convo_history = _load_history(request.session_id)
     try:
-        result = ask(request.question, history=convo_history, attachments=request.attachments)
+        result = _ask_with_cost_tracking(
+            request.question,
+            history=convo_history,
+            attachments=request.attachments,
+            session_id=request.session_id,
+            user=user,
+        )
     except Exception as exc:
         # Log the real error server-side, but never return raw DB/driver text to
         # the client (it can leak table/server names). Give a friendly message.
@@ -377,7 +451,6 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
     import queue
     import threading
 
-    from app.agent.agent import ask
     from app.api import sessions
 
     # Same guard as /chat: fail fast with a clear 503 when the active provider's
@@ -398,11 +471,13 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
 
     def run():
         try:
-            result = ask(
+            result = _ask_with_cost_tracking(
                 request.question,
                 history=convo_history,
-                on_event=on_event,
                 attachments=request.attachments,
+                session_id=request.session_id,
+                user=user,
+                on_event=on_event,
             )
             sessions.add_turn(request.session_id, request.question, result["answer"])
             events.put({"type": "result", "data": result})
@@ -685,6 +760,81 @@ def restore_thread(
     if not restored:
         raise HTTPException(status_code=404, detail="No recoverable thread with that id.")
     return {"restored": True}
+
+
+def _suggest_run(kind: str, sql: str, cap: int) -> list[dict]:
+    res = run_select(sql, max_rows=cap)
+    if not res.get("ok"):
+        return []
+    return [{"name": r["name"].strip(), "kind": kind} for r in res["rows"] if r.get("name")]
+
+
+@app.get("/suggest")
+def suggest(q: str = "", user: dict = Depends(enforce_history_rate_limit)):
+    """
+    Entity autocomplete: return REAL department / kapan / employee names matching
+    `q`. Deterministic — a LIKE/SOUNDEX against actual values, NO AI — so a user
+    PICKS a real name instead of misspelling it, killing the 'fancy vs Fency'
+    class of miss on any provider.
+
+    Precision matters more than recall here (the user is mid-sentence, so a partial
+    word must not flood the box):
+      - departments & kapans are FEW and curated -> substring + SOUNDEX (a misspelt
+        'fanc' still surfaces the real 'Fency'); these rank FIRST.
+      - employees are THOUSANDS -> PREFIX match only, min 3 chars, capped at 3, so a
+        mid-word coincidence ('ra-FA-liya') never floods out the real answer.
+
+    Uses the lighter history rate-limit bucket (it fires as the user types).
+    """
+    import re as _re
+
+    # Sanitize to a safe charset so the value is a harmless LIKE literal (no injection).
+    safe = _re.sub(r"[^A-Za-z0-9 ._-]", "", q or "").strip()[:40]
+    if len(safe) < 2:
+        return {"suggestions": []}
+
+    single = " " not in safe and len(safe) >= 3  # SOUNDEX only makes sense per-token
+
+    # Departments are WORDS (Fency, Ghisi, Galaxy) — substring, plus a phonetic
+    # fallback so a misspelling ("fanc") still resolves ("Fency"). The SOUNDEX arm
+    # is length-guarded to real word-length names close to what was typed: without
+    # it, a 3-letter query collides with tiny codes and unrelated long names
+    # (e.g. SOUNDEX('giv') == SOUNDEX of the 2-letter kapan codes GB/GF/GP/GV).
+    dept = f"Name LIKE '%{safe}%'"
+    if single:
+        dept = (
+            f"({dept} OR (SOUNDEX(Name) = SOUNDEX('{safe}') "
+            f"AND LEN(Name) BETWEEN 4 AND {len(safe) + 3}))"
+        )
+    out = _suggest_run(
+        "department",
+        f"SELECT DISTINCT TOP 6 Name AS name FROM tblDepartMent "
+        f"WHERE ({dept}) AND Name IS NOT NULL AND Name <> '' ORDER BY name",
+        6,
+    )
+
+    # Kapans are short CODES (GB, GI, 101), not words anyone misspells phonetically,
+    # so SOUNDEX here is pure noise — it made "giv" surface GB/GF/GP/GV. Substring only.
+    kap = f"KapanName LIKE '%{safe}%'"
+    out += _suggest_run(
+        "kapan",
+        f"SELECT DISTINCT TOP 6 KapanName AS name FROM tblKapan "
+        f"WHERE ({kap}) AND KapanName IS NOT NULL AND KapanName <> '' ORDER BY name",
+        6,
+    )
+
+    # Employees (thousands) — PREFIX only (first OR last name starts with the word),
+    # min 3 chars, capped, so they never flood the curated matches above.
+    if len(safe) >= 3:
+        out += _suggest_run(
+            "employee",
+            f"SELECT DISTINCT TOP 3 FirstName + ' ' + LastName AS name FROM tblEmployee "
+            f"WHERE (FirstName LIKE '{safe}%' OR LastName LIKE '{safe}%') "
+            f"AND FirstName IS NOT NULL ORDER BY name",
+            3,
+        )
+
+    return {"suggestions": out[:8]}
 
 
 @app.post("/export")

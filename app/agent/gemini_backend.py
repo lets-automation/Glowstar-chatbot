@@ -19,7 +19,7 @@ from google.genai import types
 from app.agent import attachments as attachments_mod
 from app.agent import tools, widget
 from app.config import settings
-from app.core.logging_util import log_interaction
+from app.core.logging_util import log_interaction, log_provider_error
 
 
 def _client() -> genai.Client:
@@ -140,16 +140,12 @@ def ask_gemini(
                 model=model, contents=contents, config=config
             )
         except Exception as exc:
-            err = str(exc).lower()
             log_interaction(question, sql_used, last_row_count, error=str(exc))
-            busy = any(h in err for h in ("rate", "429", "quota", "resource_exhausted", "exhausted"))
+            # Classify + log the real cause and return the message that points
+            # at the right fix (config error vs. transient busy vs. rephrase).
+            pe = log_provider_error(settings.LLM_PROVIDER, model, exc)
             return {
-                "answer": (
-                    "The assistant is busy right now (usage limit reached). "
-                    "Please try again in a minute."
-                    if busy
-                    else "Sorry, I had trouble answering that. Please rephrase."
-                ),
+                "answer": pe.user_message,
                 "sql_used": sql_used,
                 "rows_returned": last_row_count,
                 "ok": False,

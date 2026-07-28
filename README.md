@@ -76,3 +76,8 @@ npm run dev
 The React app calls the API; the API runs the Groq-powered agent against
 the AasthaErp database. LLM provider is set in `.env`
 (`GROQ_API_KEY`, `GROQ_MODEL`).
+
+
+docker compose up -d --force-recreate backend
+docker compose exec backend python -c "from app.config import settings; print(settings.LLM_PROVIDER)"
+

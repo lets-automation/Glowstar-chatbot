@@ -11,6 +11,8 @@ Switching providers is a one-line change in .env (LLM_PROVIDER + the key).
 The shared rules, schema prompt, and tool handlers live in tools.py.
 """
 
+import time
+
 from app.agent import (
     anthropic_backend,
     attachments as attachments_mod,
@@ -19,6 +21,19 @@ from app.agent import (
     postprocess,
 )
 from app.config import settings
+from app.core.logging_util import log_request
+
+
+def _resolve_model(provider: str, override: str | None) -> str:
+    """The model id this provider will actually use — for logging + dispatch."""
+    if override:
+        return override
+    return {
+        "anthropic": settings.ANTHROPIC_MODEL,
+        "claude": settings.ANTHROPIC_MODEL,
+        "gemini": settings.GEMINI_MODEL,
+        "ollama": settings.OLLAMA_MODEL,
+    }.get(provider, settings.GROQ_MODEL)
 
 
 def ask(
@@ -39,6 +54,7 @@ def ask(
       { answer, suggestions[], citation, export_query, sql_used[], rows_returned }
     """
     provider = settings.LLM_PROVIDER.lower()
+    active_model = _resolve_model(provider, model)
 
     # Read the uploaded files ONCE (into text + image blocks) so every backend
     # receives the same ready-to-use content instead of re-parsing.
@@ -48,24 +64,45 @@ def ask(
             on_event("Reading your file(s)…")
         file_context = attachments_mod.process_attachments(attachments)
 
-    if provider in ("anthropic", "claude"):
-        raw = anthropic_backend.ask_anthropic(
-            question, model or settings.ANTHROPIC_MODEL, history, on_event, file_context
+    # Time the whole turn and log ONE ops line (provider / model / latency /
+    # rows / outcome) regardless of how it ends. Backends catch their own
+    # provider errors and return ok=False; an unexpected raise is logged here
+    # as a failure and re-raised so the API's own handler still runs.
+    t0 = time.monotonic()
+    try:
+        if provider in ("anthropic", "claude"):
+            raw = anthropic_backend.ask_anthropic(
+                question, active_model, history, on_event, file_context
+            )
+        elif provider == "gemini":
+            raw = gemini_backend.ask_gemini(
+                question, active_model, history, on_event, file_context
+            )
+        elif provider == "ollama":
+            # Local model via Ollama's OpenAI-compatible API — reuses the Groq
+            # backend (same tool-calling dialect); _client() points at Ollama.
+            raw = groq_backend.ask_groq(
+                question, active_model, history, on_event, file_context
+            )
+        else:
+            raw = groq_backend.ask_groq(
+                question, active_model, history, on_event, file_context
+            )
+    except Exception as exc:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        log_request(
+            question, provider, active_model,
+            ok=False, rows_returned=0, latency_ms=latency_ms, error=str(exc),
         )
-    elif provider == "gemini":
-        raw = gemini_backend.ask_gemini(
-            question, model or settings.GEMINI_MODEL, history, on_event, file_context
-        )
-    elif provider == "ollama":
-        # Local model via Ollama's OpenAI-compatible API — reuses the Groq
-        # backend (same tool-calling dialect); _client() points at Ollama.
-        raw = groq_backend.ask_groq(
-            question, model or settings.OLLAMA_MODEL, history, on_event, file_context
-        )
-    else:
-        raw = groq_backend.ask_groq(
-            question, model or settings.GROQ_MODEL, history, on_event, file_context
-        )
+        raise
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    log_request(
+        question, provider, active_model,
+        ok=raw.get("ok", True),
+        rows_returned=raw.get("rows_returned", 0),
+        latency_ms=latency_ms,
+    )
 
     # Add suggestions, citation, export query, and the chart backstop
     # (deterministic, no LLM cost).
