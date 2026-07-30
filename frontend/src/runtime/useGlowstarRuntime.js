@@ -520,6 +520,11 @@ export function useGlowstarRuntime() {
                 ok: data.ok !== false,
                 widgets: data.widgets || [],
                 clarifyOptions: data.clarify_options || [],
+                // The bot wants a period for this report -> render the date picker.
+                // forQuestion carries the original text so tapping a period re-sends
+                // the SAME question with the dates appended.
+                askDate: data.ask_date === true,
+                forQuestion: data.ask_date === true ? question : '',
                 exportColumns: cols,
                 exportRows: rows,
                 exportQuery: data.export_query || null,

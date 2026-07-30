@@ -27,8 +27,12 @@ def _clean_value(value):
     """Convert DB-specific types into plain JSON-friendly Python values."""
     if isinstance(value, decimal.Decimal):
         return float(value)
-    if isinstance(value, (datetime.datetime, datetime.date)):
+    # datetime takes sep=; plain date/time do NOT (isoformat() raises TypeError
+    # there) - which crashed every "GROUP BY CAST(col AS DATE)" / day-wise query.
+    if isinstance(value, datetime.datetime):
         return value.isoformat(sep=" ")
+    if isinstance(value, (datetime.date, datetime.time)):
+        return value.isoformat()
     if isinstance(value, bytes):
         return value.hex()
     return value

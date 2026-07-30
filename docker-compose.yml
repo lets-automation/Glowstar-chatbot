@@ -132,7 +132,8 @@ services:
       # the database's real hostname/IP. To use the bundled db container instead,
       # set DB_SERVER: db, DB_USER: sa, DB_PASSWORD: ${DB_SA_PASSWORD}.
       DB_SERVER: host.docker.internal
-      DB_NAME: AasthaErp
+      # 2026-07-27 client backup (restored 2026-07-29); old 25-Jun snapshot kept as AasthaErp.
+      DB_NAME: AasthaErp_new
       DB_USER: glowstar_ro
       DB_PASSWORD: ${DB_RO_PASSWORD}
       REDIS_URL: redis://redis:6379/0

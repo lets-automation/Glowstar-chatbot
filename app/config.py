@@ -42,7 +42,25 @@ class Settings:
 
     # Google Gemini (free-tier FALLBACK for Groq — big per-minute budget).
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    # EXTRA keys for automatic failover. The free tier is ~20 requests/DAY per
+    # key, which killed mid-demo turns with "the assistant is busy". Set
+    # GEMINI_API_KEYS to a comma-separated list (or add GEMINI_API_KEY_2/_3) and
+    # a quota-exhausted key is skipped for the rest of the day automatically.
+    GEMINI_API_KEYS: str = os.getenv("GEMINI_API_KEYS", "")
+    GEMINI_API_KEY_2: str = os.getenv("GEMINI_API_KEY_2", "")
+    GEMINI_API_KEY_3: str = os.getenv("GEMINI_API_KEY_3", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    def gemini_keys(self) -> list[str]:
+        """All configured Gemini keys, in priority order, de-duplicated."""
+        raw = [self.GEMINI_API_KEY, *self.GEMINI_API_KEYS.split(","),
+               self.GEMINI_API_KEY_2, self.GEMINI_API_KEY_3]
+        seen, out = set(), []
+        for k in (s.strip() for s in raw):
+            if k and k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
 
     # AgentCost (agentcost.tech) — OPTIONAL LLM cost tracking. When both values
     # are set, main.py initializes the SDK, which patches the anthropic/openai

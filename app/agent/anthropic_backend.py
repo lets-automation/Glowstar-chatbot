@@ -344,7 +344,13 @@ def ask_anthropic(
 
     log_interaction(question, sql_used, last_row_count)
     return {
-        "answer": answer or "I don't have that information in the database.",
+        # Never claim "no data" while holding rows: when the write-up call fails
+        # (e.g. provider quota) AFTER the query succeeded, say so honestly - the
+        # UI then renders the captured rows as a table instead of a false denial.
+        "answer": answer or (
+            "I fetched the data but couldn't write the summary just now - here it is."
+            if data_rows else "I don't have that information in the database."
+        ),
         "sql_used": sql_used,
         "rows_returned": last_row_count,
         "widgets": widgets,

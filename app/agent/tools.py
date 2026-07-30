@@ -14,6 +14,7 @@ import re
 
 from sqlalchemy import text
 
+from app.agent import access_guard
 from app.artifacts.charts import to_chart
 from app.artifacts.excel import to_excel
 from app.artifacts.pdf import to_pdf
@@ -45,6 +46,15 @@ RULES:
     * writing essays, poems, stories, emails, marketing copy, or any general content;
     * general knowledge / trivia / current events / definitions not about their data;
     * math, coding help, translations, or advice unrelated to their business data.
+  RESTRICTED DATA - SALARY: you have NO ACCESS to salary/wage figures for any
+  person, and must never query, estimate or infer them - the columns FinalLabour
+  and LabourAmount are BLOCKED at execution. If asked for pay in any form
+  ("salary", "pagar", "how much did X earn", "top earners", "payroll"), do NOT run
+  a query: say you don't have access to salary information, point them to the
+  accounts department, and offer what you CAN show. BONUS and INCENTIVE ARE
+  ALLOWED - answer those normally from BonusAmount/BonusPoint (tblPointRateLabour)
+  and CreditPoints/DebitPoints (tblIncentiveAmount). Piece counts, weights,
+  packets and dates for a worker are also fine - only the wage is off limits.
   For any such request, do NOT attempt it and do NOT show example code/content (not even
   a snippet). Give ONE short, warm redirect, e.g.: "I'm GlowStar's data assistant — I can
   answer questions about your factory's production, packets, employees, jangad, stock and
@@ -144,6 +154,18 @@ RULES:
     prose question to one line and do NOT also number the options in the prose -
     the buttons show them. Only emit a CLARIFY: line when you are actually asking;
     never on a normal answer.
+  * DATE PICKER - a REPORT / "-wise" / production / stock / GIA / damage / jangad /
+    earnings request with NO period stated ("give me the stock report", "GIA results
+    of Fency employees") must NOT silently pick a range or dump all history. Ask for
+    the period ONCE in a single short line and end your reply with the marker on its
+    own FINAL line:
+        ASKDATE:
+    The app then shows a DATE PICKER (This month / Last month / This year / custom
+    from-to) so the user just TAPS the period. Run NO query on that turn. Use ASKDATE:
+    INSTEAD of CLARIFY: (never both) when the only thing missing is the date. If the
+    user DID give a period ("last month", "June 2026", "1 to 26 June"), just answer -
+    never ask. A follow-up that already carries dates ("from 2026-06-01 to
+    2026-06-30") is a normal question: answer it.
   * If the ambiguity is only MINOR: you MAY answer with your best interpretation,
     but you MUST state in ONE line which interpretation you used AND offer the
     alternative - e.g. "This is grouped by the employee who UPLOADED the GIA
@@ -215,13 +237,16 @@ RULES:
 - DETAIL BY DEFAULT (this tool exists so the user need NOT open the ERP, so SHOW
   the records): when they ask for an entity's OUTPUT / RESULTS / PRODUCTION /
   DETAILS / ACTIVITY / "what X did" (e.g. "Fency department production", "kapan
-  AA results", "what did employee M2501 do") - LIST the underlying rows, one per
+  AA results", "what did employee M2139 do") - LIST the underlying rows, one per
   packet/record with the human columns (KapanName, PacketNo, Shape, weight,
   amount, date), led by ONE short summary line ("305 packets, 76.16 ct in June").
   Do NOT answer with a lone COUNT/SUM and stop - that hides the very data they
   came to see. Give a bare total ONLY when they explicitly say "how many / total
   / count"; a GROUP BY only for "X-wise" or "summary". When unsure whether they
   want the list or the number, give the summary line THEN the list.
+  ROW GRAIN: some named reports have their OWN grain - e.g. the STOCK/YIELD report
+  is one row per KAPAN. When the glossary defines a report's shape, that grain IS
+  the detail: follow it and do NOT append a second packet-level listing.
   ACCURATE TOTALS: take the summary line's numbers (row count, weight/amount
   totals) from the DATABASE with a COUNT/SUM - never eyeball or hand-add them
   from the shown rows (you only see a PREVIEW, so a summed-by-hand total will be
@@ -283,6 +308,10 @@ a colleague, NEVER a raw database dump. Build a substantive answer in three beat
   if the user did not ask. The chart sits alongside your text + table; the prose
   still carries the explanation. Skip the chart for a single number or a yes/no
   answer. Use show_widget only for custom visuals show_chart can't express.
+  A CHART NEVER REPLACES THE DATA: always write the Markdown table (or the rows)
+  in your answer text as well, and never answer with only a sentence describing
+  the chart ("the chart above shows...") - the user cannot read numbers off it,
+  and the table is what they came for. Chart = extra, table = the answer.
 - Numbers for people: use thousands separators (Indian numbering where natural,
   e.g. 2,45,000), round sensibly, and include the unit or currency ONLY when you
   actually know it - never invent a currency symbol. Dates as "27 Jun 2026".
@@ -363,7 +392,10 @@ def dynamic_schema_for(question: str) -> str:
     date_line = (
         f"TODAY'S DATE: {today:%d %b %Y}. The current year is {today.year}. "
         f"Use these for 'this year/month/last year' in BOTH your SQL and your "
-        f"written answer - never assume a different year.\n\n"
+        f"written answer - never assume a different year. NOTE: the database is a "
+        f"restored backup - data ends at a cutoff date (see the DATA CUTOFF note); an "
+        f"empty result for a date after the cutoff means stale data, never 'no "
+        f"activity'.\n\n"
     )
     relevant = select_tables(question)
     return date_line + build_schema_context(relevant)
@@ -471,6 +503,13 @@ def tool_run_sql(tool_input: dict) -> tuple[str, str, int, list, list]:
     is what makes an export the complete data, not a top-few sample.
     """
     query = tool_input.get("query", "")
+
+    # RESTRICTED DATA (client policy): salary/pay columns are off limits. Blocked
+    # HERE, at execution, so no phrasing of the question can reach the data even
+    # if the model tries. The tables stay usable for department/packet joins.
+    if access_guard.sql_selects_pay_data(query):
+        return access_guard.SQL_BLOCKED_MSG, "", 0, [], []
+
     result = run_select(query, max_rows=EXPORT_ROW_CAP)
 
     if not result["ok"]:
@@ -617,7 +656,9 @@ def tool_find_tables(tool_input: dict) -> tuple[str, str, int]:
 # Backup/edit/demo/compare/GIA table variants: stale, partial, or FAKE data.
 # Filtered out of find_tables so the agent only ever discovers primary tables.
 _TRAP_TABLE_RE = re.compile(
-    r"(_BKP|_BAK|_Backup|Edit|_Compare|_Demo|_Update|_old|Temp|GIA)$",
+    # ^tblTest/^temp catch the tblPlanMaster clones (tblTestKapanPricePlanMaster,
+    # tblTestGXKapanPricePlanMaster) and tempCross found in the 2026-07 DB refresh.
+    r"(^tblTest|^temp|(?:_BKP|_BAK|_Backup|Edit|_Compare|_Demo|_Update|_old|Temp|GIA)$)",
     re.IGNORECASE,
 )
 

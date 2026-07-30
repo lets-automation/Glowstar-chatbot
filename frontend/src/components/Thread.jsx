@@ -5,6 +5,7 @@ import { Sparkles, Paperclip, Download, FileSpreadsheet, FileText, Loader2, Penc
 import Composer from './Composer'
 import { Widget } from '../SandboxedWidget'
 import { exportRows, exportDashboard, exportData } from '../api'
+import DateRangePicker from './DateRangePicker'
 
 // Markdown overrides: open links safely; let wide result tables scroll.
 const MD_COMPONENTS = {
@@ -95,6 +96,14 @@ export default function Thread({ messages, isStreaming, status, composerProps, o
                             <Pencil className="h-3.5 w-3.5" /> Something else…
                           </button>
                         </div>
+                      )}
+                      {/* Date picker: the bot needs a period for this report, so the
+                          user TAPS one instead of typing dates (backend ASKDATE:). */}
+                      {m.askDate && (
+                        <DateRangePicker
+                          disabled={isStreaming}
+                          onPick={(phrase) => onWidgetPrompt?.(`${m.forQuestion || ''} ${phrase}`.trim())}
+                        />
                       )}
                       {/* Inline charts/graphs the model drew (sandboxed iframe) */}
                       {m.widgets?.map((w, wi) => (

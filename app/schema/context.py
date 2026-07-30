@@ -6,7 +6,8 @@ Turns the raw schema (from extractor.py) + the business glossary
 the AI agent reads before writing SQL.
 
 WHY ONLY KEY TABLES:
-There are 239 business tables - far too many to feed the LLM at once.
+There are ~260 business tables (the count moves with client refreshes) - far too
+many to feed the LLM at once.
 We start with the ~20 most important (largest / most-asked) tables.
 Adding more later is as easy as editing KEY_TABLES below.
 """

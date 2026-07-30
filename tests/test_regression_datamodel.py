@@ -39,6 +39,7 @@ from app.schema.glossary import (
     DATA_NOTES,
     JOIN_HINTS,
     TABLE_NOTES,
+    VALUE_CODES,
     render_data_notes,
     render_glossary_text,
 )
@@ -57,6 +58,10 @@ TRAP_TABLES = [
     "tblPacket_Update",
     "tblFinalPacket_Temp",
     "tblLabourResultGIA",
+    # Clone/scratch tables found in the 2026-07-27 client refresh.
+    "tblTestKapanPricePlanMaster",
+    "tblTestGXKapanPricePlanMaster",
+    "tempCross",
 ]
 REAL_TABLES = [
     "tblPacket",
@@ -85,7 +90,14 @@ def test_real_tables_are_not_blocked(name):
 # Every free-text guidance string the agent sees (data notes + tricky joins +
 # per-table meanings). We assert a fix's identifier and its meaning co-occur in
 # ONE note, so the check is robust to reordering but still catches a deletion.
-_ALL_NOTES = list(DATA_NOTES) + list(JOIN_HINTS) + [v["note"] for v in TABLE_NOTES.values()]
+# VALUE_CODES is included too: the RunningProcess/stage decode lives there and is
+# just as load-bearing as a data note (it drives every "where are the stones" answer).
+_ALL_NOTES = (
+    list(DATA_NOTES)
+    + list(JOIN_HINTS)
+    + [v["note"] for v in TABLE_NOTES.values()]
+    + list(VALUE_CODES.values())
+)
 
 
 def _note_has(token: str, *keywords: str) -> bool:
@@ -201,6 +213,129 @@ def test_detail_by_default_guidance():
     ), "production detail must scope a department by its packets (PacketID IN ...)"
 
 
+# --- 2026-07-27 DB-refresh sweep: 9 domains, 139 verified facts ---------------
+# Each test below locks ONE fact the live DB proved, so a refresh/edit can't
+# silently reintroduce the wrong-answer bug it prevents.
+
+
+def test_planmaster_is_the_stage_pipeline():
+    # Bug: tblPlanMaster was described as just "the cutting plan", so the bot
+    # answered GIA questions from tblFinalPacket (wrong table, far too thin).
+    assert _note_has("RapVer", "one row per packet per STAGE")
+    assert _note_has("tblPlanMaster", "CreatDate")
+
+
+def test_gia_report_is_pls_vs_gia_dual_grade():
+    # The client's own report shape: in-house PLS grade next to the lab GIA grade.
+    assert _note_has("RapVer='PLS'", "RapVer='GIA'")
+    assert _note_has("HasChange", "regrades", "change flag")
+
+
+def test_gia_stage_is_not_gia_certified():
+    # ~34% of RapVer='GIA' rows are LAB='NONE' (graded in-house, never certified).
+    assert _note_has("LAB='GIA'", "NONE", "CERTIFIED", "certified")
+
+
+def test_gia_employee_wise_uses_latest_mfg_maker():
+    # G001 entered 150,078/150,080 GIA rows -> grouping there returns ONE name.
+    assert _note_has("G001", "150,078")
+    assert _note_has("MAX(ID)", "MFG")
+
+
+def test_fency_workers_are_vendor_firms():
+    assert _note_has("Fency", "VENDOR FIRMS", "job-work parties")
+
+
+def test_approvedate_is_a_date_trap():
+    # ApproveDate is NULL on ~96% of GIA rows -> always filter on CreatDate.
+    assert _note_has("ApproveDate", "NULL", "CreatDate")
+
+
+def test_finallabour_is_all_in():
+    # FinalLabour ALREADY contains BonusAmount — adding both double-counts pay.
+    assert _note_has("FinalLabour", "ALL-IN")
+
+
+def test_labour_posted_in_arrears():
+    assert _note_has("tblPointRateLabour", "ARREARS", "arrears")
+
+
+def test_data_cutoff_note_present():
+    # The DB is a restored backup: "today" can return 0 rows from staleness.
+    assert _note_has("RESTORED BACKUP", "cutoff")
+
+
+def test_attendance_feed_is_dead():
+    assert _note_has("tblTimeAttendance", "2025-04-05")
+
+
+def test_junk_dates_use_createdate_not_issuedate():
+    assert any("tblJunk->CreateDate" in n for n in _ALL_NOTES)
+    assert not any("tblJunk->IssueDate" in n for n in _ALL_NOTES)
+
+
+def test_runningprocess_values_corrected():
+    # 'MFG - 1' really has spaces; there is no plain 'Marker' value.
+    assert _note_has("MFG - 1", "SPACES", "spaces")
+    assert _note_has("Marker-2", "NO plain 'Marker'")
+
+
+def test_kapan_avgsize_is_average_stone_size():
+    assert _note_has("AvgSize", "AVERAGE STONE")
+
+
+def test_jangad_partial_receives():
+    # Header Pcs/Carats ~2x overstate what is really out; sum the packet lines.
+    assert _note_has("IsReceived", "PARTIAL")
+
+
+def test_jangad_party_depends_on_direction():
+    # GROUP BY ToParty over all rows wrongly makes GLOW STAR the top party.
+    assert _note_has("ToParty", "GLOW STAR")
+
+
+def test_dummy_employees_excluded():
+    assert _note_has("EXTRA TRY", "dummy", "DUMMY")
+
+
+def test_pctchecker_is_partial():
+    # A missing tblPctChecker row is normal — not "nobody made it".
+    assert _note_has("tblPctChecker", "PARTIAL") or _note_has("PARTIAL", "35-50%")
+
+
+def test_finalpacket_grades_are_in_house_not_lab():
+    assert _note_has("IN-HOUSE", "frozen at entry", "regrades")
+
+
+def test_stock_report_is_kapan_weight_reconciliation():
+    # Client's stock report = kapan-wise weight reconciliation (stock wt, current wt,
+    # rwt, tops, rej wt, w loss) — the bot used to dump 30 random packet rows.
+    assert _note_has("STOCK", "RECONCILIATION", "reconciliation")
+    assert _note_has("IsRejected", "RejectionWt", "rejection")
+
+
+def test_finalpacket_weight_columns_are_dead():
+    # RoughWt/WeightLoss/Tops are 100% NULL on tblFinalPacket -> selecting them
+    # renders a report with blank columns. Yield must come from tblPacket.
+    assert _note_has("tblFinalPacket", "100% NULL") or _note_has("Tops", "100% NULL")
+    assert _note_has("SUM(p.RoughWt)", "k.Weight")
+
+
+def test_wip_in_process_report_guidance():
+    # Client ERP screen: "how many diamonds are manufactured / in process and in
+    # WHICH DEPARTMENT". Live snapshot from tblPacket: 'IN Stock' = finished, any
+    # other RunningProcess = work in process; department via DepartMentId.
+    assert _note_has("WIP", "IN-PROCESS", "in process")
+    assert _note_has("DepartMentId", "tblDepartMent")
+    assert _note_has("RunningProcess", "TERMINAL", "FINISHED")
+
+
+def test_stale_snapshot_examples_removed():
+    # Old-backup artifacts must not survive a refresh edit.
+    assert not any("2026-05-30" in n for n in _ALL_NOTES)
+    assert not any("132 damage records" in n for n in _ALL_NOTES)
+
+
 def test_glossary_not_gutted():
     # A blunt backstop: the guidance block is ~45k chars. If an edit accidentally
     # truncates it, per-note tests might pass while most guidance vanished.
@@ -273,3 +408,35 @@ def test_guard_allows_file_grounded_answer():
         "file_grounded": True,
     })
     assert out["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# 5. Date picker (ASKDATE): a report question with no period must ASK via the
+#    UI picker instead of silently guessing a range or dumping all history.
+# ---------------------------------------------------------------------------
+def test_askdate_marker_is_extracted_and_stripped():
+    from app.agent.postprocess import extract_askdate
+
+    clean, asked = extract_askdate("Which period should I use?\nASKDATE:")
+    assert asked is True
+    assert "ASKDATE" not in clean  # the marker must never reach the user
+    assert clean == "Which period should I use?"
+
+    clean2, asked2 = extract_askdate("Here are the 305 packets.")
+    assert asked2 is False and clean2 == "Here are the 305 packets."
+
+
+def test_enrich_exposes_ask_date_flag():
+    out = enrich({"answer": "Which period?\nASKDATE:", "sql_used": [], "rows_returned": 0, "ok": True})
+    assert out["ask_date"] is True
+    assert "ASKDATE" not in out["answer"]
+    # A normal data answer must NOT trigger the picker.
+    normal = enrich({"answer": "Total is 305.", "sql_used": ["SELECT 1"], "rows_returned": 1, "ok": True})
+    assert normal["ask_date"] is False
+
+
+def test_date_picker_rule_present_in_rules():
+    from app.agent.tools import RULES
+
+    assert "ASKDATE:" in RULES, "the date-picker rule is missing from the always-on RULES"
+    assert "DATE PICKER" in RULES

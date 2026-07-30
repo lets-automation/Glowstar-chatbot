@@ -22,10 +22,36 @@ from app.config import settings
 from app.core.logging_util import log_interaction, log_provider_error
 
 
-def _client() -> genai.Client:
-    if not settings.GEMINI_API_KEY:
+# Keys the free tier has already rejected today (quota/permission). Skipped on
+# later turns so one dead key can't keep costing every request a failed attempt.
+# Cleared on restart — the daily quota resets anyway.
+_EXHAUSTED_KEYS: set[str] = set()
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """A 429/quota/permission failure — i.e. try the NEXT key, not a real bug."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        s in text
+        for s in ("429", "resource_exhausted", "quota", "rate limit",
+                  "permission_denied", "403", "api key not valid", "invalid api key")
+    )
+
+
+def _client(api_key: str | None = None) -> genai.Client:
+    key = api_key or settings.GEMINI_API_KEY
+    if not key:
         raise RuntimeError("GEMINI_API_KEY is not set in .env.")
-    return genai.Client(api_key=settings.GEMINI_API_KEY)
+    return genai.Client(api_key=key)
+
+
+def _usable_keys() -> list[str]:
+    """Configured keys minus the ones already exhausted today (all, if all are)."""
+    keys = settings.gemini_keys()
+    if not keys:
+        raise RuntimeError("GEMINI_API_KEY is not set in .env.")
+    fresh = [k for k in keys if k not in _EXHAUSTED_KEYS]
+    return fresh or keys  # all exhausted -> retry them (the quota may have reset)
 
 
 def _to_schema(js: dict) -> types.Schema:
@@ -99,8 +125,50 @@ def ask_gemini(
     on_event=None,
     file_context: dict | None = None,
 ) -> dict:
-    """Answer a question via Gemini. Same return shape as the other backends."""
-    client = _client()
+    """
+    Answer a question via Gemini, FAILING OVER between configured API keys.
+
+    The free tier allows only ~20 requests/DAY per key, which showed the client
+    "the assistant is busy right now" mid-demo. With several keys configured we
+    transparently move to the next one on a quota/permission error and remember
+    the dead key for the rest of the process, so a demo keeps working.
+    """
+    keys = _usable_keys()
+    last_exc: Exception | None = None
+    for idx, key in enumerate(keys):
+        try:
+            return _ask_gemini_once(question, model, history, on_event, file_context, key)
+        except Exception as exc:  # noqa: BLE001 - decide by error kind below
+            if not _is_quota_error(exc):
+                raise  # a real bug: don't burn the other keys on it
+            _EXHAUSTED_KEYS.add(key)
+            last_exc = exc
+            log_provider_error("gemini", model, exc)
+            if idx + 1 < len(keys) and on_event:
+                on_event("Switching to a backup connection…")
+
+    # EVERY key is exhausted. Return the friendly provider message (HTTP 200,
+    # ok=False) rather than raising - an escaped exception becomes a 500 and the
+    # user sees a server error instead of "try again in a moment".
+    pe = log_provider_error("gemini", model, last_exc) if last_exc else None
+    return {
+        "answer": pe.user_message if pe else "The assistant is unavailable right now.",
+        "sql_used": [],
+        "rows_returned": 0,
+        "ok": False,
+    }
+
+
+def _ask_gemini_once(
+    question: str,
+    model: str,
+    history: list[dict] | None = None,
+    on_event=None,
+    file_context: dict | None = None,
+    api_key: str | None = None,
+) -> dict:
+    """One attempt with ONE api key (see ask_gemini for the failover wrapper)."""
+    client = _client(api_key)
     file_grounded = attachments_mod.grounds_data(file_context)
 
     def emit(msg):
@@ -140,6 +208,12 @@ def ask_gemini(
                 model=model, contents=contents, config=config
             )
         except Exception as exc:
+            # A quota/permission failure must RAISE so ask_gemini can fail over to
+            # the next API key (returning "busy" here would strand the user on a
+            # dead key). Only do that while nothing useful has been produced yet;
+            # mid-answer we keep the partial result rather than redo the work.
+            if _is_quota_error(exc) and not sql_used:
+                raise
             log_interaction(question, sql_used, last_row_count, error=str(exc))
             # Classify + log the real cause and return the message that points
             # at the right fix (config error vs. transient busy vs. rephrase).
@@ -353,7 +427,13 @@ def ask_gemini(
 
     log_interaction(question, sql_used, last_row_count)
     return {
-        "answer": answer or "I don't have that information in the database.",
+        # Never claim "no data" while holding rows: when the write-up call fails
+        # (e.g. provider quota) AFTER the query succeeded, say so honestly - the
+        # UI then renders the captured rows as a table instead of a false denial.
+        "answer": answer or (
+            "I fetched the data but couldn't write the summary just now - here it is."
+            if data_rows else "I don't have that information in the database."
+        ),
         "sql_used": sql_used,
         "rows_returned": last_row_count,
         "widgets": widgets,

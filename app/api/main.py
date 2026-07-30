@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
+from app.agent import access_guard, date_gate
 from app.artifacts.charts import to_chart
 from app.artifacts.excel import to_excel
 from app.artifacts.pdf import to_pdf
@@ -75,7 +76,9 @@ def _log_startup_banner() -> None:
     model = _resolve_model(provider, None)
     key = {
         "groq": settings.GROQ_API_KEY,
-        "gemini": settings.GEMINI_API_KEY,
+        # any configured key counts - GEMINI_API_KEY may be blank while the
+        # failover list (GEMINI_API_KEYS) supplies the working keys
+        "gemini": (settings.gemini_keys() or [""])[0],
         "anthropic": settings.ANTHROPIC_API_KEY,
         "claude": settings.ANTHROPIC_API_KEY,
         "ollama": "local",  # local model needs no key
@@ -153,6 +156,11 @@ class ChatResponse(BaseModel):
     answer: str
     ok: bool = True
     suggestions: list[str] = []
+    # Follow-up choices rendered as buttons, and the date-picker request — both
+    # already flow through /chat/stream (which emits the enriched dict as-is);
+    # declared here so the non-streaming /chat returns them too.
+    clarify_options: list[str] = []
+    ask_date: bool = False
     citation: str = ""
     export_query: str | None = None
     sql_used: list[str]
@@ -241,7 +249,8 @@ def _active_provider_key_missing() -> str | None:
     if provider in ("anthropic", "claude"):
         return "ANTHROPIC_API_KEY" if not settings.ANTHROPIC_API_KEY else None
     if provider == "gemini":
-        return "GEMINI_API_KEY" if not settings.GEMINI_API_KEY else None
+        # Configured = ANY key (primary or a failover key in GEMINI_API_KEYS).
+        return "GEMINI_API_KEY" if not settings.gemini_keys() else None
     return "GROQ_API_KEY" if not settings.GROQ_API_KEY else None
 
 
@@ -403,6 +412,21 @@ def chat(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
 
     from app.api import sessions
 
+    # RESTRICTED: salary/pay is off limits (client policy) - refuse before the LLM.
+    if access_guard.is_pay_question(request.question):
+        return ChatResponse(**{
+            k: v for k, v in access_guard.refusal_response(request.question).items()
+            if k in ChatResponse.model_fields
+        })
+
+    # Report question with no period -> ask for the date range (UI date picker)
+    # instead of answering over all history. Decided in code, before any LLM call.
+    if date_gate.needs_date(request.question):
+        return ChatResponse(**{
+            k: v for k, v in date_gate.ask_date_response(request.question).items()
+            if k in ChatResponse.model_fields
+        })
+
     convo_history = _load_history(request.session_id)
     try:
         result = _ask_with_cost_tracking(
@@ -428,6 +452,8 @@ def chat(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
         answer=result["answer"],
         ok=result.get("ok", True),
         suggestions=result.get("suggestions", []),
+        clarify_options=result.get("clarify_options", []),
+        ask_date=result.get("ask_date", False),
         citation=result.get("citation", ""),
         export_query=result.get("export_query"),
         sql_used=result["sql_used"],
@@ -462,6 +488,25 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
             status_code=503,
             detail=f"AI is not configured: {missing} is missing in .env.",
         )
+
+    # RESTRICTED: salary/pay is off limits (client policy) - refuse before the LLM.
+    if access_guard.is_pay_question(request.question):
+        _refusal = access_guard.refusal_response(request.question)
+
+        def _refusal_stream():
+            yield f"data: {json.dumps({'type': 'result', 'data': _refusal})}\n\n"
+
+        return StreamingResponse(_refusal_stream(), media_type="text/event-stream")
+
+    # Report question with no period -> stream back the date-picker turn straight
+    # away (no LLM call, no DB hit): the UI renders the period chooser.
+    if date_gate.needs_date(request.question):
+        payload = date_gate.ask_date_response(request.question)
+
+        def _ask_date_stream():
+            yield f"data: {json.dumps({'type': 'result', 'data': payload})}\n\n"
+
+        return StreamingResponse(_ask_date_stream(), media_type="text/event-stream")
 
     events: "queue.Queue" = queue.Queue()
     convo_history = _load_history(request.session_id)

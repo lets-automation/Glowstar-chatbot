@@ -91,6 +91,23 @@ def extract_clarify(answer: str) -> tuple[str, list[str]]:
     return "\n".join(kept).strip(), options
 
 
+def extract_askdate(answer: str) -> tuple[str, bool]:
+    """
+    Split a trailing 'ASKDATE:' marker out of the answer. The model emits it when a
+    REPORT/date-scoped question arrives with no period ("give me the stock report"),
+    instead of silently guessing a range or dumping all history. The UI then shows a
+    DATE PICKER (This month / Last month / … + a custom from-to), so a non-technical
+    user taps the period rather than typing it. Returns (clean_answer, asked).
+    """
+    kept, asked = [], False
+    for line in answer.splitlines():
+        if line.strip().upper().startswith("ASKDATE:"):
+            asked = True
+        else:
+            kept.append(line)
+    return "\n".join(kept).strip(), asked
+
+
 def build_citation(sql_used: list[str], now: datetime | None = None) -> str:
     """Build 'Source: tblX, tblY • Retrieved: 27 Jun 2026, 10:45 AM'."""
     if not sql_used:
@@ -217,6 +234,8 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
     # Clarify-buttons: a trailing 'CLARIFY: a | b | c' line becomes clickable
     # option buttons in the UI (so a non-dev user taps a choice instead of typing).
     clean, clarify_options = extract_clarify(clean)
+    # Date picker: an 'ASKDATE:' marker asks the UI to show the period chooser.
+    clean, ask_date = extract_askdate(clean)
     sql_used = result.get("sql_used", [])
     rows_returned = result.get("rows_returned", 0)
     ok = result.get("ok", True)
@@ -251,6 +270,7 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
             "answer": _UNGROUNDED_MSG,
             "suggestions": [],
             "clarify_options": [],
+            "ask_date": False,
             "citation": "",
             "export_query": None,
             "sql_used": sql_used,
@@ -288,6 +308,7 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
         "answer": clean,
         "suggestions": suggestions,
         "clarify_options": clarify_options,
+        "ask_date": ask_date,
         "citation": build_citation(sql_used, now),
         # Only offer export on a turn that actually succeeded — otherwise the
         # exported file would contain results the chat couldn't present.
