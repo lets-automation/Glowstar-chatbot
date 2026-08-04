@@ -217,10 +217,14 @@ def _ask_gemini_once(
 
     emit("Analyzing your question…")
     routing = tools.routing_text(question, history)
+    # ORDER IS BILLING, NOT STYLE. Caching matches a prefix, so every static
+    # block goes in front of the per-question schema. The widget prompt used to
+    # trail system_prompt_for(), which put 2k of never-changing text behind a
+    # per-question boundary where it could never be cached.
     system = (
-        tools.system_prompt_for(routing)
+        widget.WIDGET_SYSTEM_PROMPT
         + "\n\n"
-        + widget.WIDGET_SYSTEM_PROMPT
+        + tools.system_prompt_for(routing)
     )
     config = types.GenerateContentConfig(
         system_instruction=system,

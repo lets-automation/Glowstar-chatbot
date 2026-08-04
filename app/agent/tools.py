@@ -22,6 +22,7 @@ from app.database.connection import get_engine
 from app.database.runner import run_select
 from app.schema import extractor
 from app.schema.context import build_schema_context
+from app.schema.glossary import render_data_notes
 from app.schema.router import select_tables
 
 # Max tool-use rounds before we force a final answer. Higher now because the
@@ -486,9 +487,34 @@ def dynamic_schema_for(question: str) -> str:
     return date_line + build_schema_context(relevant, question=question)
 
 
+# ---------------------------------------------------------------------------
+# THE CACHEABLE PREFIX
+#
+# Prompt caching matches a PREFIX: the provider bills the repeated head of the
+# prompt at a fraction of the normal rate, but only up to the first byte that
+# differs. So everything identical on every question must come FIRST, and
+# anything per-question must come LAST.
+#
+# One question costs several model calls (a tool round each, plus the write-up),
+# and the whole system prompt is resent every time. Measured before this split:
+# 28,015 tokens x ~6 calls for a single report question. RULES and the data
+# notes are ~19k of that and never vary - they were being re-billed at full
+# price on every round because the data notes sat AFTER the per-question schema.
+#
+# Built once at import so it is the same object, byte for byte, every call.
+# Anything appended here must be genuinely question-independent; a single
+# per-question value (a date, a table name) silently un-caches all ~19k.
+# ---------------------------------------------------------------------------
+STATIC_PROMPT = RULES + "\n\n" + render_data_notes()
+
+
 def system_prompt_for(question: str) -> str:
-    """Rules + the question-specific schema, combined (for Groq)."""
-    return RULES + "\n\nDATABASE SCHEMA AND GLOSSARY:\n\n" + dynamic_schema_for(question)
+    """The cacheable prefix + this question's schema (for Groq/Gemini)."""
+    return (
+        STATIC_PROMPT
+        + "\n\nDATABASE SCHEMA AND GLOSSARY:\n\n"
+        + dynamic_schema_for(question)
+    )
 
 
 def routing_text(question: str, history: list[dict] | None = None) -> str:

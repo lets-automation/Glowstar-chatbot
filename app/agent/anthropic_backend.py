@@ -85,8 +85,12 @@ def _system_blocks(question: str) -> list[dict]:
     """
     return [
         {
+            # RULES + the data notes: the whole question-independent block, so
+            # one cache breakpoint covers all ~23k of it. This was tools.RULES
+            # alone (~7.7k) while the data notes rode along at the END of the
+            # schema block, un-cached and re-billed every round.
             "type": "text",
-            "text": tools.RULES,
+            "text": tools.STATIC_PROMPT,
             "cache_control": {"type": "ephemeral"},
         },
         {
