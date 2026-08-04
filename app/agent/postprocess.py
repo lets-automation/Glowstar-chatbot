@@ -285,6 +285,30 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
     data_columns = result.get("data_columns", [])
     data_rows = result.get("data_rows", [])
 
+    # BLANK REPLY GUARD. A model can stop with no text at all - a provider blip,
+    # a round that returned nothing. The backend's in-loop return passes that
+    # straight through, so the user gets an EMPTY chat bubble with ok=True, and
+    # the UI offers an export button next to it.
+    #
+    # Observed live: the same "full report of MFG - 1" question answered fully
+    # (2 queries, 317 rows) on one run and returned nothing at all on the next.
+    #
+    # The wording matters as much as the guard. This must NEVER be reported as
+    # "I don't have that information in the database" - that is a FALSE DENIAL,
+    # telling the client their data is missing when the truth is that our model
+    # call produced nothing. Say what actually happened.
+    if not clean.strip():
+        if data_rows:
+            # The queries DID succeed; only the write-up is missing. Keep ok=True
+            # so the rows still render and stay exportable.
+            clean = "I fetched the data but couldn't write the summary just now - here it is."
+        else:
+            clean = (
+                "I couldn't complete that just now - please ask again. "
+                "If it keeps happening, try rephrasing the question."
+            )
+            ok = False  # nothing real to show: the UI must not offer an export
+
     # ANTI-FABRICATION GUARD (deterministic backstop): if the answer presents a
     # data table but no run_sql actually returned rows, the data is invented.
     # Replace it with an honest message and strip export/widgets/data.

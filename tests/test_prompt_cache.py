@@ -28,13 +28,13 @@ QUESTIONS = [
 
 
 def test_the_prefix_is_byte_identical_across_questions():
-    prefixes = {tools.system_prompt_for(q)[: len(tools.STATIC_PROMPT)] for q in QUESTIONS}
+    prefixes = {tools.system_prompt_for(q)[: len(tools.static_prompt())] for q in QUESTIONS}
     assert len(prefixes) == 1, "the cacheable prefix differs per question - nothing will cache"
 
 
 def test_every_prompt_actually_starts_with_the_static_block():
     for q in QUESTIONS:
-        assert tools.system_prompt_for(q).startswith(tools.STATIC_PROMPT), q
+        assert tools.system_prompt_for(q).startswith(tools.static_prompt()), q
 
 
 def test_the_static_block_carries_no_moving_date():
@@ -50,9 +50,9 @@ def test_the_static_block_carries_no_moving_date():
     from datetime import date
 
     today = date.today()
-    assert "TODAY'S DATE" not in tools.STATIC_PROMPT
+    assert "TODAY'S DATE" not in tools.static_prompt()
     for stamp in (f"{today:%d %b %Y}", f"{today:%Y-%m-%d}"):
-        assert stamp not in tools.STATIC_PROMPT, f"{stamp!r} un-caches the prefix daily"
+        assert stamp not in tools.static_prompt(), f"{stamp!r} un-caches the prefix daily"
 
 
 def test_todays_date_is_still_given_to_the_model():
@@ -67,19 +67,19 @@ def test_todays_date_is_still_given_to_the_model():
 
 def test_the_static_block_is_worth_caching():
     # If this ever collapses, the split has silently stopped paying for itself.
-    assert len(tools.STATIC_PROMPT) // 4 > 15_000, "static block unexpectedly small"
+    assert len(tools.static_prompt()) // 4 > 15_000, "static block unexpectedly small"
 
 
 def test_the_static_block_is_most_of_the_prompt():
     q = QUESTIONS[0]
     total = len(tools.system_prompt_for(q))
-    assert len(tools.STATIC_PROMPT) / total > 0.7, \
+    assert len(tools.static_prompt()) / total > 0.7, \
         "the per-question tail has grown - most of the prompt is no longer cacheable"
 
 
 # --- the guidance must not have been LOST in the move -----------------------
 # The data notes were relocated out of build_schema_context and into
-# STATIC_PROMPT. If that wiring breaks, answers get quietly worse (wrong colour
+# static_prompt(). If that wiring breaks, answers get quietly worse (wrong colour
 # codes, the 'Florecent' misspelling) with every test still green.
 def test_the_data_notes_still_reach_the_model():
     prompt = tools.system_prompt_for("how many stones have strong fluorescence")
@@ -87,8 +87,38 @@ def test_the_data_notes_still_reach_the_model():
 
 
 def test_data_notes_are_in_the_cached_part_not_the_tail():
-    assert "Florecent" in tools.STATIC_PROMPT
+    assert "Florecent" in tools.static_prompt()
 
 
 def test_rules_are_in_the_cached_part():
-    assert tools.RULES in tools.STATIC_PROMPT
+    assert tools.RULES in tools.static_prompt()
+
+
+# --- the preview must cover what the model is told to display ---------------
+def test_the_model_sees_at_least_as_many_rows_as_it_must_show():
+    """
+    MODEL_ROW_LIMIT was 50 while the RULES ask for a ~30-row table: 20 rows per
+    query were sent, billed and never used. Tool results are the part of the
+    prompt that can NEVER be cached (new text, resent every later round), so
+    they are the expensive rows.
+
+    The floor matters as much as the ceiling: shown fewer rows than it is told
+    to display, the model either shows less than asked or invents the rest.
+    """
+    assert tools.MODEL_ROW_LIMIT >= tools.ROWS_TO_DISPLAY
+
+
+# --- exact stored values, so the model need not query to discover them ------
+def test_exact_dimension_values_are_supplied():
+    dims = tools.dimension_values()
+    if not dims:
+        return  # no database in this environment; the agent still works by querying
+    # The spellings are inconsistent in the source data ('MFG - 1' has spaces,
+    # 'MFG-2' does not) - which is exactly why guessing them cost a round.
+    assert "MFG - 1" in dims
+    assert "DEPARTMENTS" in dims
+
+
+def test_dimension_values_are_memoised_so_the_prefix_stays_cacheable():
+    assert tools.dimension_values() is tools.dimension_values()
+    assert tools.static_prompt() is tools.static_prompt()

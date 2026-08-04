@@ -90,7 +90,7 @@ def _system_blocks(question: str) -> list[dict]:
             # alone (~7.7k) while the data notes rode along at the END of the
             # schema block, un-cached and re-billed every round.
             "type": "text",
-            "text": tools.STATIC_PROMPT,
+            "text": tools.static_prompt(),
             "cache_control": {"type": "ephemeral"},
         },
         {

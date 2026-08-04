@@ -11,6 +11,7 @@ formatted) live in groq_backend.py and anthropic_backend.py.
 
 import json
 import re
+from functools import lru_cache
 
 from sqlalchemy import text
 
@@ -505,13 +506,72 @@ def dynamic_schema_for(question: str) -> str:
 # Anything appended here must be genuinely question-independent; a single
 # per-question value (a date, a table name) silently un-caches all ~19k.
 # ---------------------------------------------------------------------------
-STATIC_PROMPT = RULES + "\n\n" + render_data_notes()
+# Small dimensions whose EXACT spellings the model would otherwise have to
+# discover with a query. Each is a short, stable list (measured: 92 departments =
+# 256 tokens, 19 stages = 23, 36 shapes = 42).
+#
+# Worth far more than those ~320 cached tokens. "give me full report of MFG - 1"
+# spent a whole round on
+#     SELECT DISTINCT DepartmentName FROM ... WHERE DepartmentName LIKE '%MFG%'
+# before it could write the real query - a round costs the entire prompt plus a
+# result that can never be cached. It also guesses badly, because the spellings
+# are not consistent: 'MFG - 1' has spaces, 'MFG-2' does not, and there is a
+# 'VL MFG -1 Checker'. That inconsistency is why the model fell back to
+# REPLACE(DepartMentName,' ',''). Handing it the real values removes the round
+# AND the guesswork.
+_DIMENSION_SOURCES = (
+    ("DEPARTMENTS", "SELECT DISTINCT Name FROM tblDepartMent "
+                    "WHERE Name IS NOT NULL AND Name <> '' ORDER BY Name"),
+    ("PROCESS STAGES (tblPlanMaster.RapVer)",
+     "SELECT DISTINCT RapVer FROM tblPlanMaster WHERE RapVer IS NOT NULL ORDER BY RapVer"),
+    ("SHAPES", "SELECT DISTINCT Shape FROM tblFinalPacket "
+               "WHERE Shape IS NOT NULL AND Shape <> '' ORDER BY Shape"),
+)
+
+
+@lru_cache(maxsize=1)
+def dimension_values() -> str:
+    """
+    The exact stored values for the small dimensions, read once per process.
+
+    Read LAZILY rather than at import: the backend imports this module while the
+    database may still be starting, and an import-time failure would silently
+    drop these lists for the whole process life. Memoised so the text stays
+    byte-identical between calls - it sits in the cached prefix, so a value that
+    varied would un-cache ~24k tokens on every question.
+    """
+    blocks = []
+    for label, sql in _DIMENSION_SOURCES:
+        try:
+            res = run_select(sql, max_rows=500)
+            if not res.get("ok") or not res["rows"]:
+                continue
+            values = [str(list(r.values())[0]).strip() for r in res["rows"]]
+            blocks.append(f"{label}: " + ", ".join(v for v in values if v))
+        except Exception:  # noqa: BLE001
+            continue  # never let this break a question; the model can still query
+    if not blocks:
+        return ""
+    return (
+        "=== EXACT STORED VALUES (use these spellings verbatim; do NOT "
+        "run a query to discover them) ===\n" + "\n".join(blocks)
+    )
+
+
+@lru_cache(maxsize=1)
+def static_prompt() -> str:
+    """The question-independent prompt head. Memoised so it is byte-stable."""
+    parts = [RULES, render_data_notes()]
+    dims = dimension_values()
+    if dims:
+        parts.append(dims)
+    return "\n\n".join(parts)
 
 
 def system_prompt_for(question: str) -> str:
     """The cacheable prefix + this question's schema (for Groq/Gemini)."""
     return (
-        STATIC_PROMPT
+        static_prompt()
         + "\n\nDATABASE SCHEMA AND GLOSSARY:\n\n"
         + dynamic_schema_for(question)
     )
@@ -532,7 +592,19 @@ def routing_text(question: str, history: list[dict] | None = None) -> str:
 # Rows actually shown to the LLM. The model only needs a sample to summarise;
 # sending hundreds of rows explodes token usage (and blows rate limits). The
 # FULL rows are still returned separately for export.
-MODEL_ROW_LIMIT = 50
+#
+# Kept in step with ROWS_TO_DISPLAY below. This was 50 while the rules asked the
+# model to show ~30, so 20 rows per query were sent, billed, and never used.
+# Tool results are the part of the prompt that CANNOT be cached - they are new
+# text appended to the conversation and resent on every later round of the same
+# question - so they are the expensive rows. A wide result (22 columns) measured
+# 5,027 tokens at 50 rows.
+MODEL_ROW_LIMIT = 30
+
+# How many rows the RULES instruct the model to render as a Markdown table. The
+# preview above must cover this: if the model is shown fewer rows than it is
+# told to display, it either shows less than asked or invents the difference.
+ROWS_TO_DISPLAY = 30
 
 # A downloaded report/export must be the COMPLETE detail list, so it is fetched
 # with a much higher row cap than the model-facing preview. Guards against a
