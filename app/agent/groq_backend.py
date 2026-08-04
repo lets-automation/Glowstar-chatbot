@@ -316,10 +316,52 @@ def ask_groq(
                 "ok": False,
             }
 
+        # An OpenAI-compatible provider can return an EMPTY choices list. It is
+        # a valid HTTP 200, so no exception is raised until choices[0] raises
+        # IndexError and kills the whole turn - the user sees a server error
+        # after waiting through every query. Seen live on nvidia/gpt-oss-20b.
+        # Treat it as a round that produced nothing and let the loop continue:
+        # the data gathered so far is preserved, and the end-of-loop write-up
+        # still runs.
+        if not response.choices:
+            log_provider_error(
+                settings.LLM_PROVIDER, model,
+                RuntimeError("provider returned no choices"),
+            )
+            continue
+
         msg = response.choices[0].message
 
         if not msg.tool_calls:
             answer = msg.content or ""
+
+            # The model stopped calling tools but wrote NOTHING. Returning here
+            # hands back a blank answer, and the forced write-up further down
+            # (which asks it plainly for the final text) never runs because that
+            # only happens when the loop exhausts its rounds.
+            #
+            # This is the employee-360 failure: "report of employee M4117 for
+            # June 2026" gathered 32 rows across 2 queries and then produced no
+            # prose at all, so the user got a bare table under "I fetched the
+            # data but couldn't write the summary".
+            #
+            # WITH data, breaking out is right: the write-up call has material.
+            # With NO data it is not - breaking on the very first empty round
+            # ended the turn having run zero queries, and the turn then reported
+            # "I don't have that information in the database" about an employee
+            # who plainly exists. Nudge it to actually run the query instead,
+            # bounded by the same counter the fabrication guard uses.
+            if not answer.strip():
+                if data_rows:
+                    break
+                if execute_nudges < _MAX_EXECUTE_NUDGES:
+                    execute_nudges += 1
+                    force_tool = True
+                    messages.append({"role": "user", "content": _EXECUTE_NUDGE})
+                    emit("Running the query…")
+                    continue
+                break
+
             # Honesty on output-length truncation: finish_reason "length" means
             # the answer was cut mid-generation - never return a silently
             # sliced table as if it were the whole answer.
@@ -511,7 +553,12 @@ def ask_groq(
         final = client.chat.completions.create(
             model=model, messages=messages, temperature=0, max_tokens=_MAX_TOKENS
         )
-        answer = (final.choices[0].message.content or "").strip()
+        # Same empty-choices guard as the tool loop: a 200 with no choices must
+        # not become an IndexError after every query has already run.
+        answer = (
+            (final.choices[0].message.content or "").strip()
+            if final.choices else ""
+        )
     except Exception as exc:
         log_interaction(question, sql_used, last_row_count, error=str(exc))
         answer = ""
@@ -522,9 +569,17 @@ def ask_groq(
         # Never claim "no data" while holding rows: when the write-up call fails
         # (e.g. provider quota) AFTER the query succeeded, say so honestly - the
         # UI then renders the captured rows as a table instead of a false denial.
+        # Three different situations, three different truths. Saying "I don't
+        # have that information in the database" when NO query ever ran is a
+        # false denial - it tells the user their data is missing when in fact we
+        # never looked. Observed on "report of employee M4117", an employee who
+        # plainly exists.
         "answer": answer or (
             "I fetched the data but couldn't write the summary just now - here it is."
-            if data_rows else "I don't have that information in the database."
+            if data_rows
+            else "I don't have that information in the database."
+            if sql_used  # we DID query and it genuinely came back empty
+            else "I couldn't complete that just now - please ask again."
         ),
         "sql_used": sql_used,
         "rows_returned": last_row_count,
