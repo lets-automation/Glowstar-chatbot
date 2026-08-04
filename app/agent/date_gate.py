@@ -67,6 +67,10 @@ _CURRENT_STATE_RE = re.compile(
     r"\b(currently|right now|at present|as of now|pending|on hold|"
     # WIP is a LIVE snapshot ("what is in each department now"), never a period.
     r"in[\s-]?process|in[\s-]?processing|work[\s-]?in[\s-]?process|wip|"
+    # "how many X in stock" is a LIVE snapshot - asking for a date range is
+    # nonsense. Found by the cold test: "how many oval diamonds do we have in
+    # stock?" was answered with a date picker.
+    r"in\s+stock|on\s+hold|stock\s+ma|hold\s+par|atyare|abhi|right\s+now|"
     r"(where|which|what)\b.{0,40}\b(is|are)\b.{0,20}\b(in stock|out|now))\b",
     re.IGNORECASE,
 )
