@@ -37,12 +37,43 @@ from app.database.runner import run_select
 
 # --- AgentCost (optional cost tracking; agentcost.tech) ---
 # Must run BEFORE any LLM client is used: the SDK monkey-patches the anthropic/
-# openai client libraries so every call reports model, token counts, cost and
-# latency (metadata only — no prompt or answer content) to the AgentCost
+# openai/google-genai client libraries so every call reports model, token counts,
+# cost and latency (metadata only — no prompt or answer content) to the AgentCost
 # dashboard. Best-effort by design: this is a young third-party SDK, so a
 # failure here logs a warning and the chatbot runs WITHOUT tracking — it must
-# never take the API down. Covers anthropic + ollama (openai lib); the native
-# groq SDK is not patched, so groq turns are invisible to it.
+# never take the API down. Covers anthropic, gemini, and the OpenAI-compatible
+# providers (ollama/lmstudio/cerebras/nvidia); the native groq SDK is NOT
+# patched, so LLM_PROVIDER=groq turns are still invisible to it.
+
+# Rates in dollars per 1K tokens for every model this app can select. These go
+# in via custom_pricing, which the SDK consults FIRST — ahead of its own model
+# table. That ordering is the whole point: the SDK's bundled table knows neither
+# claude-sonnet-4-6 nor gemini-3-flash-preview, and its 2000-model table is
+# fetched from the backend in a BACKGROUND thread, so calls made before that
+# fetch lands are silently costed at $0.00. With a free-tier Gemini key capped
+# near 20 requests/day, those early calls are most of the traffic — which is why
+# every Gemini turn was showing up on the dashboard priced at zero. Listing the
+# rates here removes the race entirely.
+# Source: AgentCost's own /v1/pricing table, read 2026-08-04. Re-check when
+# switching models — a model missing here is recorded at $0.00, not refused.
+_AGENTCOST_PRICING = {
+    # Gemini (GEMINI_MODEL) — free tier bills $0, priced here at list rate
+    # so the dashboard shows what the traffic WOULD cost on a paid key.
+    "gemini-3-flash-preview": {"input": 0.0005, "output": 0.003},
+    "gemini-2.5-flash": {"input": 0.0003, "output": 0.0025},
+    # Anthropic (ANTHROPIC_MODEL)
+    "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
+    # Groq (GROQ_MODEL) — listed for when the native SDK does get patched.
+    "llama-3.3-70b-versatile": {"input": 0.00059, "output": 0.00079},
+    "meta-llama/llama-4-scout-17b-16e-instruct": {"input": 0.00018, "output": 0.00059},
+    # Cerebras / NVIDIA (OpenAI-compatible, tracked via the openai lib)
+    "gpt-oss-120b": {"input": 0.00022, "output": 0.00059},
+    "openai/gpt-oss-20b": {"input": 0.00005, "output": 0.0002},
+    "kimi-k2.6": {"input": 0.00095, "output": 0.004},
+    # LM Studio / Ollama run locally: no per-token cost.
+    "google/gemma-4-12b-qat": {"input": 0.0, "output": 0.0},
+}
+
 _agentcost_track_costs = None
 if settings.AGENTCOST_API_KEY and settings.AGENTCOST_PROJECT_ID:
     try:
@@ -52,12 +83,7 @@ if settings.AGENTCOST_API_KEY and settings.AGENTCOST_PROJECT_ID:
             api_key=settings.AGENTCOST_API_KEY,
             project_id=settings.AGENTCOST_PROJECT_ID,
             debug=settings.AGENTCOST_DEBUG,
-            # AgentCost's pricing table doesn't know our demo model (it logged
-            # "Unknown model 'claude-sonnet-4-6' - cost will be $0.00"), so
-            # supply the rate: dollars per 1K tokens = $3/M input, $15/M output.
-            custom_pricing={
-                "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
-            },
+            custom_pricing=_AGENTCOST_PRICING,
         )
         logger.info(
             "AgentCost tracking enabled (project %s).", settings.AGENTCOST_PROJECT_ID

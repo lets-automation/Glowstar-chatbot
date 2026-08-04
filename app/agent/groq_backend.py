@@ -11,7 +11,7 @@ import re
 from groq import Groq
 
 from app.agent import attachments as attachments_mod
-from app.agent import tools, widget
+from app.agent import result_capture, tools, widget
 from app.agent._retry import call_with_retry
 from app.agent.postprocess import looks_like_data_table
 from app.config import settings
@@ -479,16 +479,13 @@ def ask_groq(
                 sql_used.append(sql)
                 last_row_count = row_count
                 # Capture the FULL rows from a successful run_sql (the model only
-                # sees a sample) so export is the exact, complete data. The
-                # LARGEST result wins: don't let a smaller aggregate/breakdown the
-                # model runs AFTERWARDS clobber the detail listing — the download
-                # must be the full list (e.g. all 3,200 packets of a kapan
-                # report), not the 12-row monthly breakdown or 1-row "summary at
-                # a glance" queried after it for the prose/dashboard.
-                if (
-                    tc.function.name == "run_sql"
-                    and rows_full
-                    and len(rows_full) > len(data_rows)
+                # sees a sample) so export is the exact, complete data. Which
+                # result counts as "the answer" is decided by result_capture -
+                # one rule, shared by every backend, tested against both the bugs
+                # it fixes (a lookup shown as the report; a summary clobbering a
+                # detail listing).
+                if tc.function.name == "run_sql" and result_capture.better(
+                    cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
             messages.append(

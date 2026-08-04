@@ -63,11 +63,13 @@ class Settings:
         return out
 
     # AgentCost (agentcost.tech) — OPTIONAL LLM cost tracking. When both values
-    # are set, main.py initializes the SDK, which patches the anthropic/openai
-    # client libraries and reports per-call metadata (model, token counts, cost,
-    # latency — NOT prompt content) to the AgentCost dashboard. Leave empty to
-    # disable entirely. NOTE: it does NOT patch the native groq SDK, so the
-    # groq provider path is not tracked (only anthropic, and ollama-via-openai).
+    # are set, main.py initializes the SDK, which patches the anthropic/openai/
+    # google-genai client libraries and reports per-call metadata (model, token
+    # counts, cost, latency — NOT prompt content) to the AgentCost dashboard.
+    # Leave empty to disable entirely. NOTE: it does NOT patch the native groq
+    # SDK, so LLM_PROVIDER=groq is untracked; anthropic, gemini, and the
+    # OpenAI-compatible providers (ollama/lmstudio/cerebras/nvidia) all are.
+    # A model absent from main.py's _AGENTCOST_PRICING records at $0.00.
     AGENTCOST_API_KEY: str = os.getenv("AGENTCOST_API_KEY", "")
     AGENTCOST_PROJECT_ID: str = os.getenv("AGENTCOST_PROJECT_ID", "")
     AGENTCOST_DEBUG: bool = os.getenv("AGENTCOST_DEBUG", "false").lower() in (

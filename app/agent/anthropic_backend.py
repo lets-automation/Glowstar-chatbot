@@ -9,7 +9,7 @@ available for best accuracy. The big schema block is prompt-cached.
 import anthropic
 
 from app.agent import attachments as attachments_mod
-from app.agent import tools, widget
+from app.agent import result_capture, tools, widget
 from app.agent._retry import call_with_retry
 # Shared grounding/nudge machinery (defined once in the groq backend, used by
 # gemini too) so ALL providers refuse to present unqueried data — the demo
@@ -301,13 +301,10 @@ def ask_anthropic(
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
-                # LARGEST result wins for the export capture; a smaller
-                # aggregate/breakdown run afterwards must not clobber the full
-                # detail list (see groq_backend — the kapan-report download bug).
-                if (
-                    block.name == "run_sql"
-                    and rows_full
-                    and len(rows_full) > len(data_rows)
+                # Which result is "the answer"? See result_capture - one rule,
+                # shared by every backend, tested against both the bugs it fixes.
+                if block.name == "run_sql" and result_capture.better(
+                    cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
             tool_results.append(

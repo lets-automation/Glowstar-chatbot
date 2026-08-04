@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 
 from app.agent import attachments as attachments_mod
-from app.agent import tools, widget
+from app.agent import result_capture, tools, widget
 from app.config import settings
 from app.core.logging_util import log_interaction, log_provider_error
 
@@ -157,6 +157,46 @@ def ask_gemini(
         "rows_returned": 0,
         "ok": False,
     }
+
+
+def _write_up(contents, system, model, api_key: str | None, on_event=None) -> tuple[str, bool]:
+    """
+    The final plain-text answer, retried across API keys. Returns (answer, ok).
+
+    Why this is separate from the whole-turn failover in ask_gemini: by the time
+    we get here every query has ALREADY run and been paid for. The free tier caps
+    requests per MINUTE (limit 5), and one question spends up to MAX_TOOL_ROUNDS
+    of them, so the write-up is the call most likely to be the one refused - and
+    losing it means the user waited 30 seconds and got a table with no answer,
+    which is exactly the failure the client reported on "full report of MFG - 1".
+
+    Re-running the whole turn on a fresh key would re-run every query and spend
+    another round-trip budget for a write-up we could get in one call. So rotate
+    the key for THIS call only.
+
+    We rotate rather than honour the API's retryDelay (~16s): with several keys a
+    rotation is instant, and making a user wait 16 seconds mid-answer is its own
+    kind of failure.
+    """
+    tried = [api_key] if api_key else []
+    tried += [k for k in _usable_keys() if k != api_key]
+
+    for idx, key in enumerate(tried):
+        try:
+            final = _client(key).models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(system_instruction=system, temperature=0),
+            )
+            return (final.text or "").strip(), True
+        except Exception as exc:  # noqa: BLE001 - decide by error kind
+            log_provider_error("gemini", model, exc)
+            if not _is_quota_error(exc):
+                return "", False        # a real bug: another key won't help
+            _EXHAUSTED_KEYS.add(key)
+            if idx + 1 < len(tried) and on_event:
+                on_event("Switching to a backup connection…")
+    return "", False
 
 
 def _ask_gemini_once(
@@ -379,16 +419,10 @@ def _ask_gemini_once(
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
-                # Prefer a multi-row DETAIL result for export; don't let a 1-row
-                # summary/aggregate run afterwards clobber the full list (see
-                # groq_backend for the rationale — the kapan-report download bug).
-                # LARGEST result wins for the export capture; a smaller
-                # aggregate/breakdown run afterwards must not clobber the full
-                # detail list (see groq_backend — the kapan-report download bug).
-                if (
-                    name == "run_sql"
-                    and rows_full
-                    and len(rows_full) > len(data_rows)
+                # Which result is "the answer"? See result_capture - one rule,
+                # shared by every backend, tested against both the bugs it fixes.
+                if name == "run_sql" and result_capture.better(
+                    cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
             responses.append(
@@ -412,18 +446,10 @@ def _ask_gemini_once(
             ],
         )
     )
-    synth_ok = True
-    try:
-        final = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(system_instruction=system, temperature=0),
-        )
-        answer = (final.text or "").strip()
-    except Exception as exc:
-        log_interaction(question, sql_used, last_row_count, error=str(exc))
-        answer = ""
-        synth_ok = False
+    answer, synth_ok = _write_up(contents, system, model, api_key, on_event)
+    if not synth_ok:
+        log_interaction(question, sql_used, last_row_count,
+                        error="write-up call failed on every key")
 
     log_interaction(question, sql_used, last_row_count)
     return {

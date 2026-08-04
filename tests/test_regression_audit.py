@@ -110,17 +110,26 @@ def test_widget_prompt_no_longer_mentions_create_report():
 
 
 # ---------------------------------------------------------------------------
-# 4. Export-capture guard parity: in ALL three backends the LARGEST result
-#    wins, so a later small aggregate can't clobber the full detail listing.
+# 4. Export-capture parity: every backend must decide "which result is the
+#    answer" with the SHARED rule in result_capture.
+#
+#    This used to assert the literal expression `len(rows_full) > len(data_rows)`
+#    in all three files - i.e. it policed three copies of one rule staying
+#    identical. That copy-paste is exactly what let the "largest wins" bug (a
+#    10-row department lookup shown as the MFG-1 report) need finding and fixing
+#    three times. The rule now lives in ONE tested module; what needs policing
+#    here is only that no backend goes back to rolling its own.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "backend",
     ["app/agent/groq_backend.py", "app/agent/gemini_backend.py", "app/agent/anthropic_backend.py"],
 )
-def test_capture_guard_largest_wins(backend):
+def test_capture_uses_the_shared_rule(backend):
     src = _src(backend)
-    assert "len(rows_full) > len(data_rows)" in src, f"{backend} lost the largest-wins capture guard"
-    assert "len(rows_full) > 1 or not data_rows" not in src, f"{backend} regressed to the clobber-prone guard"
+    assert "result_capture.better(" in src, f"{backend} does not use the shared capture rule"
+    assert "len(rows_full) > len(data_rows)" not in src, (
+        f"{backend} re-inlined its own capture rule - it must delegate to result_capture"
+    )
 
 
 # ---------------------------------------------------------------------------
