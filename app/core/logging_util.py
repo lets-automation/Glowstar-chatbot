@@ -185,3 +185,41 @@ def log_request(
             "REQUEST | provider=%s model=%s | %s %dms rows=%s | q=%r",
             provider, model, status, latency_ms, rows_returned, short_q,
         )
+
+
+# Phrases an answer uses when the ERP genuinely has no data for the question.
+_NO_DATA_MARKERS = (
+    "don't have that information",
+    "do not have that information",
+    "not tracked",
+    "isn't tracked",
+    "is not tracked",
+    "doesn't record",
+    "does not record",
+    "not recorded",
+    "no access",
+)
+
+
+def log_unanswered(question: str, answer: str, rows_returned: int) -> bool:
+    """
+    Record a question the assistant could NOT answer from the data.
+
+    The client keeps asking things the ERP was never built for ("which city is
+    this packet in?"). Each one that reaches them unanswered is a bad meeting; each
+    one CAPTURED here is a to-do we can encode. Grep the log for UNANSWERED to get
+    the backlog:  docker logs glowstar_chatbot-backend-1 | grep UNANSWERED
+
+    Returns True when the turn was logged as unanswered.
+    """
+    if rows_returned:
+        return False
+    low = (answer or "").lower()
+    if not any(m in low for m in _NO_DATA_MARKERS):
+        return False
+    logger.warning(
+        "UNANSWERED | q=%r | reply=%r",
+        (question or "").replace("\n", " ").strip()[:160],
+        (answer or "").replace("\n", " ").strip()[:160],
+    )
+    return True

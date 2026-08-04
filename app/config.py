@@ -74,12 +74,52 @@ class Settings:
         "1", "true", "yes",
     )
 
+    # Cerebras (free tier, ~1M tokens/day — no daily REQUEST cap, unlike Gemini's
+    # ~20/day). OpenAI-compatible, so it routes through the Groq backend just
+    # like Ollama does. Set LLM_PROVIDER=cerebras to use it. This account serves
+    # gpt-oss-120b, zai-glm-4.7 and gemma-4-31b only (NO llama-3.3-70b).
+    CEREBRAS_API_KEY: str = os.getenv("CEREBRAS_API_KEY", "")
+    CEREBRAS_BASE_URL: str = os.getenv("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
+    CEREBRAS_MODEL: str = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+
+    # NVIDIA NIM (build.nvidia.com) — FREE with an NVIDIA Developer account, no
+    # card, ~40 req/min. The ONLY free remote tier verified to accept this app's
+    # full ~20k-token prompt (Groq caps at 12k TPM, GitHub Models at 8k in).
+    # OpenAI-compatible -> reuses this Groq backend. NOTE: many NIM models hang
+    # or refuse tool calls; openai/gpt-oss-20b is the verified-good one.
+    NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
+    NVIDIA_BASE_URL: str = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    NVIDIA_MODEL: str = os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
+
     # Ollama (LOCAL, offline testing). Runs a model on this machine via Ollama's
     # OpenAI-compatible endpoint — no API key, no internet, no daily quota. Set
     # LLM_PROVIDER=ollama to use it (routed through the Groq backend, which speaks
     # the same tool-calling dialect). Run `ollama pull <model>` first.
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+
+    # LM Studio (LOCAL, offline testing). Same idea as Ollama — an
+    # OpenAI-compatible server, so it also routes through the Groq backend. Set
+    # LLM_PROVIDER=lmstudio to use it. In LM Studio: load the model, open the
+    # Developer/Server tab, Start Server, and copy the model id it shows into
+    # LMSTUDIO_MODEL. Two things the model MUST have, or this app cannot work:
+    #   * TOOL / function calling  — every answer here comes from run_sql;
+    #     a model without tool support returns chat text and zero data.
+    #   * a big context length     — the schema prompt is ~20k tokens with
+    #     SCHEMA_MAX_COLS=0, and LM Studio defaults new models to ~4k. Raise
+    #     the context slider to 32k+ or the prompt is silently truncated.
+    # If LM Studio runs on a DIFFERENT machine, point the URL at that machine's
+    # IP and enable "Serve on Local Network" in LM Studio's server settings.
+    LMSTUDIO_BASE_URL: str = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
+    LMSTUDIO_MODEL: str = os.getenv("LMSTUDIO_MODEL", "qwen2.5-7b-instruct")
+
+    # Output-token budget per model call (groq_backend). The 2048 default was
+    # tuned for the free tiers, where it fits both the mandated answer format and
+    # a tight tokens-per-minute budget. REASONING models (Gemma 4, gpt-oss) spend
+    # part of this budget thinking before they write, so the visible answer gets
+    # less than the number suggests — raise it for those. A local model has no
+    # per-minute quota, so there is no cost to a bigger budget there.
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2048"))
 
     # Max columns shown per table in the schema context.
     # TEMPORARY token-saving cap for the free tier. Set SCHEMA_MAX_COLS=0

@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
-from app.agent import access_guard, date_gate
+from app.agent import access_guard, date_gate, smalltalk_gate
 from app.artifacts.charts import to_chart
 from app.artifacts.excel import to_excel
 from app.artifacts.pdf import to_pdf
@@ -82,6 +82,9 @@ def _log_startup_banner() -> None:
         "anthropic": settings.ANTHROPIC_API_KEY,
         "claude": settings.ANTHROPIC_API_KEY,
         "ollama": "local",  # local model needs no key
+        "lmstudio": "local",  # local model needs no key
+        "cerebras": settings.CEREBRAS_API_KEY,
+        "nvidia": settings.NVIDIA_API_KEY,
     }.get(provider, "")
     log_startup(provider, model, key_present=bool(key))
 
@@ -251,6 +254,12 @@ def _active_provider_key_missing() -> str | None:
     if provider == "gemini":
         # Configured = ANY key (primary or a failover key in GEMINI_API_KEYS).
         return "GEMINI_API_KEY" if not settings.gemini_keys() else None
+    if provider == "cerebras":
+        return "CEREBRAS_API_KEY" if not settings.CEREBRAS_API_KEY else None
+    if provider == "nvidia":
+        return "NVIDIA_API_KEY" if not settings.NVIDIA_API_KEY else None
+    if provider in ("ollama", "lmstudio"):
+        return None  # local model — no key required
     return "GROQ_API_KEY" if not settings.GROQ_API_KEY else None
 
 
@@ -412,6 +421,15 @@ def chat(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
 
     from app.api import sessions
 
+    # Pure greeting / thanks / "ok" -> canned reply, no LLM call. Checked first
+    # because it is the most specific gate (whole-string match) and the cheapest:
+    # "hi" was costing a full ~29k-token round trip and 5-10s of latency.
+    if smalltalk_gate.is_smalltalk(request.question):
+        return ChatResponse(**{
+            k: v for k, v in smalltalk_gate.smalltalk_response(request.question).items()
+            if k in ChatResponse.model_fields
+        })
+
     # RESTRICTED: salary/pay is off limits (client policy) - refuse before the LLM.
     if access_guard.is_pay_question(request.question):
         return ChatResponse(**{
@@ -488,6 +506,16 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
             status_code=503,
             detail=f"AI is not configured: {missing} is missing in .env.",
         )
+
+    # Pure greeting / thanks / "ok" -> stream the canned reply immediately (no
+    # LLM call, no DB hit). See the same gate on /chat above.
+    if smalltalk_gate.is_smalltalk(request.question):
+        _small = smalltalk_gate.smalltalk_response(request.question)
+
+        def _smalltalk_stream():
+            yield f"data: {json.dumps({'type': 'result', 'data': _small})}\n\n"
+
+        return StreamingResponse(_smalltalk_stream(), media_type="text/event-stream")
 
     # RESTRICTED: salary/pay is off limits (client policy) - refuse before the LLM.
     if access_guard.is_pay_question(request.question):

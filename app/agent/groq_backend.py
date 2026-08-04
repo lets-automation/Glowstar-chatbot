@@ -55,15 +55,68 @@ _GROQ_TOOLS = [
 ]
 
 
+# LM Studio compiles the tool schemas into a sampling grammar and cannot handle
+# a UNION type ("type": ["number", "string"]). It answers HTTP 500
+#   NotImplemented: map: filter-mapping not implemented
+# which surfaces as a 400 and kills the whole turn before a single tool runs —
+# show_dashboard has three such unions, so EVERY question failed, not just
+# dashboard ones. Remote providers accept unions, so the rewrite below is scoped
+# to the engines that need it rather than changing the shared tool specs.
+_UNION_INTOLERANT = {"lmstudio"}
+
+
+def _collapse_union_types(node):
+    """Recursively rewrite {"type": [a, b]} to a single type.
+
+    Collapses to "string": any value can be expressed as one, and nothing is
+    lost downstream because widget.py coerces on the way in (chart values via
+    float(x), labels and tile values via str(x)).
+    """
+    if isinstance(node, dict):
+        return {
+            k: ("string" if "string" in v else (v[0] if v else "string"))
+            if k == "type" and isinstance(v, list)
+            else _collapse_union_types(v)
+            for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [_collapse_union_types(x) for x in node]
+    return node
+
+
+def _tools_for_provider():
+    """The tool specs, adjusted for engines that reject parts of JSON Schema."""
+    if settings.LLM_PROVIDER.lower() in _UNION_INTOLERANT:
+        return _collapse_union_types(_GROQ_TOOLS)
+    return _GROQ_TOOLS
+
+
+# Providers that speak the OpenAI dialect and therefore reuse this whole
+# backend — only the base_url and key differ. They are reached with the real
+# OpenAI SDK, NOT the Groq client: the Groq SDK hardcodes Groq's "/openai/v1/…"
+# request path and would 404 against them. The OpenAI client honours base_url
+# and exposes the identical chat.completions.create surface used below.
+#   provider -> (base_url attr, api-key attr, key-name for the error message)
+# A blank key-name means no key is needed (local Ollama / LM Studio).
+_OPENAI_COMPATIBLE = {
+    "ollama":   ("OLLAMA_BASE_URL",   None,                ""),
+    "lmstudio": ("LMSTUDIO_BASE_URL", None,                ""),
+    "cerebras": ("CEREBRAS_BASE_URL", "CEREBRAS_API_KEY",  "CEREBRAS_API_KEY"),
+    "nvidia":   ("NVIDIA_BASE_URL",   "NVIDIA_API_KEY",    "NVIDIA_API_KEY"),
+}
+
+
 def _client():
-    # Local Ollama: OpenAI-compatible endpoint on this machine — no key, no
-    # internet, no quota. Use the real OpenAI SDK here, NOT the Groq client:
-    # the Groq SDK hardcodes Groq's "/openai/v1/…" request path and would 404
-    # against Ollama. The OpenAI client honours base_url correctly, and exposes
-    # the identical chat.completions.create surface this backend relies on.
-    if settings.LLM_PROVIDER.lower() == "ollama":
+    provider = settings.LLM_PROVIDER.lower()
+    spec = _OPENAI_COMPATIBLE.get(provider)
+    if spec:
         from openai import OpenAI
-        return OpenAI(api_key="ollama", base_url=settings.OLLAMA_BASE_URL)
+
+        base_attr, key_attr, key_name = spec
+        key = getattr(settings, key_attr) if key_attr else provider
+        if key_name and not key:
+            raise RuntimeError(f"{key_name} is not set in .env.")
+        return OpenAI(api_key=key, base_url=getattr(settings, base_attr))
     if not settings.GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in .env.")
     return Groq(api_key=settings.GROQ_API_KEY)
@@ -141,8 +194,10 @@ _MAX_EXECUTE_NUDGES = 2
 # Output budget per model call. 1024 was too small for the mandated answer
 # format (intro + ~30-row preview table + conclusion + download pointer +
 # SUGGESTIONS) and cut listing answers off mid-table. 2048 fits it while
-# staying inside the free tier's tokens-per-minute budget.
-_MAX_TOKENS = 2048
+# staying inside the free tier's tokens-per-minute budget. Overridable via
+# LLM_MAX_TOKENS because reasoning models (Gemma 4 in LM Studio) spend part of
+# this budget on hidden thinking, leaving too little for the answer itself.
+_MAX_TOKENS = settings.LLM_MAX_TOKENS
 
 # Shown to the model when it presents data (a table, figures, or written-out
 # SQL) without having called run_sql. Generalises the old "you wrote SQL" nudge
@@ -218,7 +273,7 @@ def ask_groq(
                 lambda: client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    tools=_GROQ_TOOLS,
+                    tools=_tools_for_provider(),
                     tool_choice=choice,
                     temperature=0,  # deterministic: same question -> same SQL, no drift
                     max_tokens=_MAX_TOKENS,

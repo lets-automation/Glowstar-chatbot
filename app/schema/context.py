@@ -107,7 +107,7 @@ def _relationships_for(table: str, foreign_keys: list[dict]) -> list[str]:
     return lines
 
 
-def build_schema_context(table_names: list[str] | None = None) -> str:
+def build_schema_context(table_names: list[str] | None = None, question: str = "") -> str:
     """
     Build the full schema context text for the agent:
       - per key table: row count, business meaning, columns, relationships
@@ -161,7 +161,9 @@ def build_schema_context(table_names: list[str] | None = None) -> str:
             parts.append("  links: " + "; ".join(rels))
 
     # Append the business glossary (industry terms + table meanings).
-    parts.append("\n" + render_glossary_text())
+    # Only the tables selected for THIS question — describing all ~100 on every
+    # turn buried the relevant guidance in irrelevant text.
+    parts.append("\n" + render_glossary_text(tables, question))
 
     # Append the data notes (coded values + misspelled columns) - critical
     # for accuracy on things like fluorescence ('Florecent') and colour codes.

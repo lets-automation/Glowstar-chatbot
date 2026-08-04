@@ -225,6 +225,49 @@ def fallback_chart(question: str, result: dict) -> dict | None:
     return {"title": title, "code": code, "kind": "chart"}
 
 
+_TABLE_PREVIEW_ROWS = 50
+
+
+def _rows_to_markdown(columns: list, rows: list, limit: int = _TABLE_PREVIEW_ROWS) -> str:
+    """Render captured rows as a Markdown table (the exact rows the query returned)."""
+    if not columns or not rows:
+        return ""
+    head = f"| {' | '.join(str(c) for c in columns)} |"
+    sep = f"|{'|'.join('---' for _ in columns)}|"
+    body = [
+        "| " + " | ".join("" if r.get(c) is None else str(r.get(c)) for c in columns) + " |"
+        for r in rows[:limit]
+    ]
+    out = "\n".join([head, sep, *body])
+    if len(rows) > limit:
+        out += f"\n\n_Showing {limit} of {len(rows)} rows — the export has every row._"
+    return out
+
+
+def ensure_data_shown(answer: str, columns: list, rows: list, has_visual: bool) -> str:
+    """
+    DETERMINISTIC anti-thin-answer backstop.
+
+    The model is not consistent: the same report question renders a full table on
+    one run and, on the next, only a sentence ABOUT the data ("the makers listed
+    above...") or nothing at all — which is what reaches the client as a failure.
+    Whenever a query returned rows and the prose contains no table (and no chart
+    is carrying the data), append the real rows. The data is already in hand, so
+    this never invents anything - it just guarantees the user SEES it.
+    """
+    # NOTE: a plain CHART does not count as showing the data — the user cannot read
+    # numbers off it (chart = extra, table = the answer). Only a DASHBOARD, which
+    # carries its own tables, suppresses this.
+    if not rows or has_visual or looks_like_data_table(answer):
+        return answer
+    table = _rows_to_markdown(columns, rows)
+    if not table:
+        return answer
+    prose = (answer or "").strip()
+    lead = prose if prose else "Here are the results:"
+    return f"{lead}\n\n{table}"
+
+
 def enrich(result: dict, now: datetime | None = None, question: str = "") -> dict:
     """
     Take the backend's raw {answer, sql_used, rows_returned} and return the
@@ -304,6 +347,112 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
     # successful turn; a failed/ungrounded turn exports nothing.
     export_columns, export_rows = sanitize_export(data_columns, data_rows) if ok else ([], [])
 
+    # Guarantee the user SEES the data. The model intermittently writes prose about
+    # a table it never printed (or nothing at all) — on those runs we render the
+    # captured rows ourselves so a correct query can never reach the client as a
+    # thin answer.
+    #
+    # Deliberately NOT gated on `ok`: a turn that failed at the write-up step (a
+    # provider hiccup AFTER the query succeeded) is exactly when the user is most
+    # likely to see prose with no numbers. The rows are real — they came from a
+    # successful run_sql in this turn, and the anti-fabrication guard above has
+    # already rejected ungrounded answers — so showing them is honest either way.
+    shown_columns, shown_rows = sanitize_export(data_columns, data_rows)
+
+    # A "most/highest/top" claim must name the FIRST row of the ordered result.
+    # On unseen questions the model has reported the ranking backwards while the
+    # table beside it was right — and the client reads the sentence. We can't
+    # rewrite prose safely, so we LOG it (grep: SUPERLATIVE-MISMATCH) and let the
+    # rendered table carry the truth.
+    _mismatch = superlative_mismatch(clean, shown_columns, shown_rows)
+    if _mismatch:
+        from app.core.logging_util import logger
+        logger.warning(
+            "SUPERLATIVE-MISMATCH | answer says %r but the top row is %r | q=%r",
+            _mismatch[0], _mismatch[1], (question or "")[:100],
+        )
+
+    # COUNT CONSISTENCY (LOG ONLY, tier 1): does a prose row-count claim match the
+    # data returned? Same family as superlative_mismatch. No user-visible action
+    # yet - we measure the real hit rate from the log first, exactly how the
+    # superlative guard earned its place. Reads the model's prose only, so it runs
+    # before the banner/table are added below. Grep: COUNT-MISMATCH
+    if ok:
+        from app.agent import count_guard
+
+        _cm = count_guard.count_mismatch(
+            clean, shown_rows, rows_returned, question, sql_used,
+            file_grounded=bool(result.get("file_grounded")),
+        )
+        if _cm:
+            from app.core.logging_util import logger
+
+            logger.warning(
+                "COUNT-MISMATCH | answer claims %s %s but the data gives %s rows | q=%r",
+                _cm[0], _cm[1], len(shown_rows), (question or "")[:100],
+            )
+
+    # SCOPE CHECK (runs BEFORE the dimension guard and takes precedence over it:
+    # a wrong-scope number beats a missing column). The user named a period but no
+    # query constrained a date, so every figure shown is all-time. We cannot fix
+    # the SQL from here, so we WARN ABOVE the table - a banner under 50 rows is
+    # never read - and offer a one-tap re-ask. Rows are left untouched: they are
+    # real, and destroying a correct answer on a false positive is the worse bug.
+    _period_flagged = False
+    if ok:
+        from app.agent import period_guard
+
+        if period_guard.unfiltered_period(question, sql_used, shown_rows):
+            _period = period_guard.period_phrase(question)
+            from app.core.logging_util import logger
+
+            logger.warning("PERIOD-UNFILTERED | period=%r | q=%r", _period,
+                           (question or "")[:100])
+            clean = period_guard.scope_banner(_period) + "\n\n" + clean
+            clarify_options = [period_guard.followup_option(_period)]
+            _period_flagged = True
+
+    # ANSWER COMPLETENESS: the user asked to break the data down by something
+    # (employee, department, kapan, day...) but that column isn't in the result —
+    # e.g. "GIA results of Fency department EMPLOYEES" returned a correct packet
+    # table with the maker used only as a FILTER. Offer it as a one-tap follow-up
+    # rather than leaving the question half-answered. Logged so we can see whether
+    # it helps or nags (grep: DIMENSION-MISSING).
+    if ok and not clarify_options and not _period_flagged:
+        from app.agent import dimension_guard
+
+        _missing = dimension_guard.missing_dimensions(question, shown_columns, shown_rows)
+        if _missing:
+            from app.core.logging_util import logger
+
+            logger.warning("DIMENSION-MISSING | %s | q=%r", ",".join(_missing),
+                           (question or "")[:100])
+            clarify_options = [dimension_guard.followup_option(d) for d in _missing[:2]]
+
+    # PERSON COLUMN SHOWING CODES: the answer has a maker/worker column, but it
+    # is printing "M1332" / "Y111" / "CL403" instead of a name. EmpName is the
+    # CODE on ~99% of tblPacketIssue and tblPointRateLabour rows (and ~12% of
+    # tblPlanMaster), so this is a whole-factory trap, not one department's.
+    # The fix is always to resolve EmpId -> tblEmployee. Offer that as a one-tap
+    # follow-up. Logged so we can measure it (grep: NAME-AS-CODE).
+    if ok and not clarify_options and not _period_flagged:
+        from app.agent import name_guard
+
+        _coded = name_guard.code_columns(shown_columns, shown_rows)
+        if _coded:
+            from app.core.logging_util import logger
+
+            logger.warning("NAME-AS-CODE | %s | q=%r", ",".join(_coded),
+                           (question or "")[:100])
+            clarify_options = [name_guard.followup_option(c) for c in _coded[:2]]
+
+    clean = ensure_data_shown(
+        clean,
+        shown_columns,
+        shown_rows,
+        has_visual=any((w or {}).get("kind") == "dashboard" for w in widgets),
+    )
+
     return {
         "answer": clean,
         "suggestions": suggestions,
@@ -322,3 +471,53 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
         "data_columns": export_columns,
         "data_rows": export_rows,
     }
+
+
+# --- superlative claim vs the actual data ------------------------------------
+# On an UNSEEN question the model can report the ranking backwards while the
+# table beside it is correct ("the most common colour is F" when G leads
+# 34,078 to 28,405). The client reads the sentence, not the table. We cannot
+# verify prose in general, but a "most/highest/top" claim IS checkable: it must
+# name the FIRST row of the ordered result.
+_SUPERLATIVE_RE = re.compile(
+    r"\b(most common|most|highest|largest|biggest|top|leading|best)\b[^.\n]{0,60}?"
+    r"(?:\bis\b|\bwas\b|:)\s*\**\s*([A-Za-z0-9][\w .&/-]{0,40}?)\s*\**",
+    re.IGNORECASE,
+)
+
+
+def _first_text_value(columns: list, rows: list) -> str | None:
+    """The label of the top row — what a superlative claim must name."""
+    if not rows or not columns:
+        return None
+    for c in columns:
+        v = rows[0].get(c)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def superlative_mismatch(answer: str, columns: list, rows: list) -> tuple[str, str] | None:
+    """
+    Return (claimed, actual_top) when the answer's superlative names something
+    OTHER than the top row, and the claimed value appears LOWER in the same
+    result. Returns None when there is no claim, no data, or no conflict.
+
+    Deliberately conservative: it only fires when the claimed value is itself
+    present in the data (so it is a ranking error, not a different measure).
+    """
+    top = _first_text_value(columns, rows)
+    if not top or len(rows) < 2:
+        return None
+    m = _SUPERLATIVE_RE.search(answer or "")
+    if not m:
+        return None
+    claimed = (m.group(2) or "").strip().strip(".,:")
+    if not claimed or claimed.lower() == top.lower():
+        return None
+    others = {
+        str(r.get(c)).strip().lower()
+        for r in rows[1:] for c in columns
+        if isinstance(r.get(c), str)
+    }
+    return (claimed, top) if claimed.lower() in others else None

@@ -366,6 +366,21 @@ DATA_NOTES = [
     "question you can partly answer, so OFFER the available alternative — the piece-rate "
     "labour each employee EARNED (SUM(FinalLabour), which already INCLUDES the bonus component) — and give that if"
     "the user wants it.",
+    "PRODUCTION REPORT MUST NAME THE MAKER AND DEPARTMENT — the client's production "
+    "report shows WHO made each packet and in WHICH department, and tblFinalPacket has "
+    "NEITHER column, so a report built from it alone looks incomplete to them (this was "
+    "a direct complaint). ALWAYS attach them via the packet's latest MFG-stage row: "
+    "FROM tblFinalPacket fp WITH (NOLOCK) OUTER APPLY (SELECT TOP 1 EmpId FROM "
+    "tblPlanMaster WITH (NOLOCK) WHERE Packet_ID = fp.PacketID AND RapVer='MFG' ORDER BY "
+    "ID DESC) m LEFT JOIN tblEmployee e ON m.EmpId = e.ID — then select "
+    "e.FirstName + ' ' + e.LastName AS Maker and e.DepartMentName AS Department "
+    "alongside the packet's own columns (KapanName, PacketNo, Shape, Color, "
+    "Purity=Clarity, Cut, Polish, Symmetry, Florocent, CurrentWt, Lab, CreateDate). "
+    "Verified: this resolves a maker+department for 100% of finished packets (4,007/4,007 "
+    "in June 2026). Use OUTER APPLY + LEFT JOIN (not an inner join) so a packet is never "
+    "dropped, and take the LATEST MFG row (ORDER BY ID DESC) — joining all MFG rows "
+    "duplicates packets. The same pair belongs on any per-packet listing where the user "
+    "asks 'who' or 'which department'.",
     "PRODUCTION / OUTPUT — 'production' = FINISHED/polished packets in tblFinalPacket "
     "(one row per finished packet; filter CreateDate for today/this-month/date-range). "
     "tblFinalPacket has NO department column, so to scope production to ONE department "
@@ -400,12 +415,27 @@ DATA_NOTES = [
     "p.RapVer='PLS' JOIN tblKapan k ON g.KapanId=k.ID WHERE g.RapVer='GIA' AND g.CreatDate >= "
     "<period> — select the DUAL 4Cs side by side (p.Color vs g.Color, p.Purity vs g.Purity, "
     "Cut/Polish/Symmetry/Florecent) plus HasChange = CASE WHEN any of the six differ (ISNULL "
-    "both sides) THEN 'YES' ELSE 'NO' END, g.PolishedWt, g.CreatDate. The lab regrades ~42-55% "
+    "both sides) THEN 'YES' ELSE 'NO' END, g.PolishedWt, g.CreatDate. "
+    "IF THE USER MENTIONS EMPLOYEES / WORKERS / 'WHO' (e.g. 'GIA results of Fency "
+    "department employees'), ALSO SELECT THE MAKER AND DEPARTMENT — OUTER APPLY (SELECT "
+    "TOP 1 EmpId FROM tblPlanMaster WITH (NOLOCK) WHERE Packet_ID=g.Packet_ID AND "
+    "RapVer='MFG' ORDER BY ID DESC) m LEFT JOIN tblEmployee e ON m.EmpId=e.ID, then "
+    "e.FirstName+' '+e.LastName AS Maker and e.DepartMentName. The maker is what scopes "
+    "the report to a department, so using it ONLY in the WHERE clause and omitting the "
+    "column leaves the question half-answered (a real client complaint). The lab regrades ~42-55% "
     "of stones — HasChange is the headline number managers want; never give a thin single-grade "
     "list. CRITICAL: RapVer='GIA' is the final-grading STAGE done for ALL stones — its LAB "
     "column (GIA/HRD/IGI/NONE, agrees with tblFinalPacket.Lab ~100%) says which lab actually "
-    "certified, and ~34% of GIA-stage rows are LAB='NONE' (uncertified) — for 'GIA-CERTIFIED' "
-    "counts add AND g.LAB='GIA'. tblFinalPacket WHERE Lab='GIA' is fine for a quick "
+    "certified, and ~34% of GIA-stage rows are LAB='NONE' (uncertified). "
+    "DEFAULT TO *ALL* LAB-STAGE ROWS — DO NOT ADD A LAB FILTER unless the user says "
+    "'certified'. The client's OWN report filters only on RapVer IN ('GIA','HRD','IGI') "
+    "with NO LAB condition, so their figure INCLUDES the uncertified rows: for Fency in "
+    "June 2026 that is 1,024 packets across 7 firms, whereas adding AND g.LAB='GIA' gives "
+    "only 120 across 4 — a 'correct' number that does not match their report and reads as "
+    "wrong in a meeting. So answer with the full lab-stage set, and if certification "
+    "matters, add a COLUMN (g.LAB) or a closing line ('120 of these were GIA-certified') "
+    "rather than silently filtering. State which basis you used. "
+    "tblFinalPacket WHERE Lab='GIA' is fine for a quick "
     "certified-output COUNT by finish month, but its 4Cs are the in-house grade (matches the "
     "lab only ~48%) — NEVER list it as 'what GIA graded'. For HRD/IGI results swap g.RapVer (a "
     "packet has exactly ONE lab row); 'plans still pending GIA' = PLS rows with NOT EXISTS a "
@@ -418,16 +448,176 @@ DATA_NOTES = [
     "AND m.ID=(SELECT MAX(ID) FROM tblPlanMaster WITH (NOLOCK) WHERE Packet_ID=g.Packet_ID AND "
     "RapVer='MFG'), JOIN tblEmployee e ON m.EmpId=e.ID, filter/GROUP BY e.DepartMentName / e.ID "
     "with COUNT(DISTINCT g.Packet_ID) and SUM of the HasChange CASE. NEVER join ALL MFG rows "
-    "(double-counts — 80% of multi-MFG packets switch worker) and never GROUP BY EmpName (holds "
-    "the code on ~20% of rows). 'Fency' (dept 23, Y### codes) workers are JOB-WORK VENDOR FIRMS "
-    "mirrored as employee rows (MAHADEV JEMS, OM DIAMOND, SHAIRU GEMS... same names in tblParty) "
-    "— a 'Fency employee-wise' answer IS party-wise; present the firm names as-is and say they "
-    "are job-work parties, not karigars. For LABOUR/EARNINGS attribution use tblPointRateLabour "
+    "(double-counts — 80% of multi-MFG packets switch worker) . "
+    "PERSON NAMES — NEVER DISPLAY OR GROUP BY AN EmpName COLUMN. This applies to EVERY "
+    "department, not one. Measured on this DB: tblPacketIssue.EmpName is the employee CODE on "
+    "5,642,614 of 5,702,698 rows and a real name on ZERO; tblPointRateLabour.EmpName likewise "
+    "(880,250 of 902,150, zero names); tblPlanMaster.EmpName is a real name ~86% of the time but "
+    "still the bare code on ~12% (e.g. 'M1332'). Printing EmpName therefore shows the client "
+    "codes like 'M1332' / 'Y111' / 'CL403' instead of a person. ALWAYS resolve through the ID "
+    "(EmpId / Emp_ID / MfgEmpId / PolishEmpId = tblEmployee.ID) and select "
+    "e.FirstName+' '+e.LastName. Use a LEFT JOIN, never an inner one: 60,084 tblPacketIssue, "
+    "21,900 tblPointRateLabour, 30,728 tblPlanMaster and 14,516 tblPctChecker rows hold an EmpId "
+    "with no matching employee, and an inner join silently drops them. Affected work spans the "
+    "whole factory (Rough Estimation 435k, Marker-3 403k, Marker-2 398k, Weight Scale 372k, GS "
+    "Jangad, Galaxy, VL Marker, Vision 360, Laser, Blocking...). WHO-DID-WHAT for any packet or "
+    "stage: tblPacketIssue is the per-stage log (Process = the stage, EmpId -> the worker, "
+    "IssueTime), so a packet manufactured by an outside firm STILL has named in-house people on "
+    "its other stages — offer those instead of reporting 'no employee recorded'. "
+    "OUTSOURCED WORK IS A PER-ROW EXCEPTION, NOT A DEPARTMENT RULE: 55 tblParty rows are "
+    "Type='Job Work' (42 IsOutSideParty) and a few are mirrored into tblEmployee, so a resolved "
+    "'employee' is occasionally a FIRM (e.g. SHRI HARI GEMS, party code Y130). It is rare "
+    "— only 5 of 1,666 distinct MFG makers match a tblParty name — so NEVER assume a whole "
+    "department is outsourced. Detect it PER ROW (resolved name matches a tblParty.Name with "
+    "Type='Job Work') and label only those rows as a job-work party. Fency (dept 23, Y###) has "
+    "the highest concentration — 92 employee rows, 31 active, ~23 firm-looking — but most of "
+    "its roster is individual people, so do NOT describe Fency wholesale as vendor firms. A "
+    "job-work firm's tblParty.empId is NULL, so there is NO route to the individual inside that "
+    "firm: say that plainly rather than implying the firm name is a person. For LABOUR/EARNINGS attribution use tblPointRateLabour "
     "(Emp_ID, DepartmentName) instead; tblPctChecker is only partial corroboration (see its "
     "note). Dept traps: M#### codes span NINE departments (MFG-1..6 + Dhar/SDhar/FDhar) — filter "
     "by DepartMentName, never by code prefix; D### is ambiguous (Dilate vs Data Entry — resolve "
     "via tblEmployee); the three lab codes G001/HRD001/IGI001 are ONE human — never sum them as "
     "three people.",
+    "ISSUE REPORT ('issue report', 'maker and check issue', how much work went to a "
+    "department/worker in a period) — source is tblPacketIssue (the issue-OUT log): "
+    "Process = the receiving DEPARTMENT/stage, EmpId -> tblEmployee.ID = the WORKER it "
+    "went to, plus IssueWt and IssueTime. BOTH grains are available from the same table — "
+    "GROUP BY Process for department-wise, GROUP BY EmpId (JOIN tblEmployee) for "
+    "employee-wise, or both together for department + worker. Pick the grain the user "
+    "asked for; if they didn't say, follow the REPORT GRAIN rule. Measures: "
+    "COUNT(DISTINCT Packet_ID) AS PacketsIssued, SUM(IssueWt) AS IssuedWt, "
+    "COUNT(DISTINCT EmpId) AS Workers. CRITICAL: many rows per packet (re-issued at every "
+    "stage and within a stage) — COUNT(DISTINCT Packet_ID), NEVER COUNT(*): Marker-2 in "
+    "June 2026 = 4,350 packets vs 16,373 raw rows (~4x inflation). VOCABULARY: 'maker' = "
+    "the MFG-1..6 karigars; 'Marker' (with an R) is the separate marking/planning dept "
+    "(Marker-2/3/4); 'check' covers Polish Checker, Galaxy QC, Check Stock, Rough Checker "
+    "— when the word is ambiguous, include the matching departments and say which ones you "
+    "used. For the separate maker fresh/check-issue flow see the MAKER ISSUE note.",
+    "KAPAN MONEY IS A PER-CARAT RATE, NOT A TOTAL — tblKapan.RoughValue and EstValue hold "
+    "a RATE PER CARAT (avg ~86, max 1,447 across 853 kapans). SUM(RoughValue) = 73,230 for "
+    "223,052 lifetime carats, i.e. 'we bought $73k of rough in five years' — absurd but "
+    "plausible-looking. TOTAL value = SUM(Weight * RoughValue) = 9,115,298, which is 124x "
+    "the naive sum; average price per carat = SUM(Weight*RoughValue)/SUM(Weight), NEVER "
+    "AVG(RoughValue). Same for EstValue — and EstValue is a COPY of RoughValue on 781 of "
+    "804 kapans, so NEVER present the two as 'our estimate was 97% accurate'; estimation "
+    "accuracy is not measurable here. tblPacket.RoughValue is 0 on all 168,763 rows, so "
+    "packet-level rough money does not exist at all.",
+    "tblKapanValue IS A NIGHTLY SNAPSHOT, NOT A LEDGER — one row per live kapan PER DAY "
+    "(59,912 rows over 1,041 kapans; kapan 'HW' alone has 380 daily rows). The values "
+    "REPEAT unchanged day after day, so ANY SUM over this table multiplies by the number "
+    "of days: SUM(RoughWt) = 16,917,681 ct against a true latest-day 20,407 ct and a "
+    "lifetime intake of 223,052 ct — up to 829x wrong, and absurd enough to discredit "
+    "every other number on screen. RSTPoint is worse: it GROWS daily, so summing "
+    "double-counts a rising cumulative. ALWAYS de-duplicate to the latest snapshot first "
+    "(ROW_NUMBER() OVER (PARTITION BY KapanId ORDER BY CreatedAt DESC)=1, or restrict to "
+    "MAX(CAST(CreatedAt AS date))). For lifetime rough weight use tblKapan.Weight, never "
+    "this table. 189 of its KapanIds no longer exist in tblKapan — INNER JOIN tblKapan and "
+    "say so.",
+    "tblPlanMaster AGGREGATION — ONE ROW PER PACKET *PER STAGE*, SO NEVER SUM IT RAW. The "
+    "173,353 plan rows in 2026 cover only 27,803 DISTINCT packets. A naive "
+    "SUM(PolishedWt)=90,542 ct / COUNT(*)=173,353 against the truth of ~9,855 ct / 27,803 "
+    "stones at the GIA stage — 9x and 6x overstated, on the client's own headline metric. "
+    "ALWAYS pin ONE RapVer stage AND use COUNT(DISTINCT Packet_ID); the same trap applies "
+    "to Amount/OAmount. CLV additionally repeats WITHIN its own stage (1-8 alternative "
+    "plans per packet) — take the IsApproved=1 row or MAX(ID). 2026 stage volumes: CLV "
+    "47,544 · MFG 22,278 · ADM 21,986 · RST 21,358 · MKB 20,872 · PLS 19,866 · GIA 18,949; "
+    "tail LSO 231 · HRD 130 · BLK 110 · FourP 19 · IGI 6. NEVER INNER JOIN tblRapVer to "
+    "decode stages — MKB, HRD, FourP and IGI are MISSING from that lookup, so the join "
+    "silently drops 21,027 rows (12% of 2026) and loses IGI/HRD entirely; 26 of its 41 "
+    "codes have never had a plan row. Get stages from SELECT DISTINCT RapVer instead.",
+    "JANGAD DIRECTION — A NAIVE GROUP BY ACCUSES YOUR PARTNERS OF THEFT. Every lot is "
+    "recorded TWICE: TransType='Issue' (goods out, ToParty = the sub-contractor) and "
+    "TransType='Receive' (goods back, FromParty = that same sub-contractor, "
+    "ToParty='GLOW STAR'). So GROUP BY ToParty over ALL rows compares a party's issues "
+    "against nothing and reports, e.g., 'DIYORA & BHANDERI returned 1,083 of 48,473 "
+    "carats — 97.8% loss'. THE TRUTH: issues 301,427 ct vs receives 299,670 ct — about "
+    "99.4% comes back. Reporting the naive version accuses the client's largest job-work "
+    "partners of losing tens of thousands of carats; it is unrecoverable in a meeting. "
+    "ALWAYS split by TransType: outstanding per party = issues (TransType='Issue' GROUP BY "
+    "ToParty) MINUS receives (TransType='Receive' GROUP BY FromParty), and quantity truly "
+    "out = tblJangadPackets WHERE IsReceived=0 (header Pcs/Carats over-state ~2x because a "
+    "header stays open until every line returns).",
+    "EMPLOYEE IDENTIFIERS - DO NOT ASK WHICH KIND IT IS. A token with a LETTER PREFIX (M4117, PC012, Y126, G001, RE044, CL003, B146) is an employee CODE, full stop - 2,431 of 2,450 codes are letter-prefixed and only 19 are digits-only, so there is NO ambiguity with the numeric tblEmployee.ID. Look it up with WHERE Code='M4117' and answer. NEVER reply 'do you mean Code M4117 or ID 4117?' - that is a spurious clarification that wastes the user's turn (M4117 resolves to exactly one person, PANELIYA SANJAY, ID 6726). Only a BARE NUMBER ('employee 4117') is genuinely ambiguous: try Code first, then ID, and say which you used. The separate warning that Code is not unique applies to the handful of DUPLICATE codes (M3022, M2D003, M2128, B146) - check for >1 row and disambiguate ONLY then, never pre-emptively.",
+    "BOOLEAN FLAGS THAT NEVER TOGGLE — filtering on one is a no-op or a fabricated finding. ALWAYS-OFF: tblPlanMaster.IsVerified (14 of 1.28M — the real workflow flag is IsApproved, 148,887 of 173,353 in 2026; never report '0.008% of plans verified'), IsFencyColor (0 ever — fancy here is a SHAPE, Shape LIKE 'F.%'), IsCvd (5 ever — never present '0 CVD' as a natural-vs-lab-grown split), tblPacket.IsOnHold (2 of 168,763 — HOLD IS KAPAN-LEVEL: tblKapan.IsOnHold=1 on 37 kapans covering 11,835 packets), plus IsInTempStock, RFID, SubPcs, IsRepair, PCarat, OrderNo; tblKapan.FPoint/IsMakeable (0 of 853); tblJangad.IsSkipJangad/KapanId/KapanName (0 of 16,498 — kapan is NOT tagged on jangad; trace via tblJangadPackets.PacketId); tblTask.IsComplete/IsCancel (0 of 4,719 — task completion is UNTRACKED, not 0%). ALWAYS-ON (equally dangerous — the filter looks like it narrowed and did not): tblKapan.RequireRoughEst (all 853), tblDepartMent.IsActive (all 92 — derive operating depts from staffing: 62 have an active employee), tblJunk.IsRecyleble (all 209,001 — a default, not a measurement), tblRepairCommentVision.IsApproved (all 4,413 — never report a pending-approval count). tblPacket.Priority has only two values (1 and 3) — a binary flag, not a 1-5 rank; use FifoDate for queue order.",
+    "FEEDS THAT STOPPED — a 0 means the FEED died, not that the activity stopped; always state the cutoff. tblLabourResult -> 2023-04-12 (the LIVE labour table is tblPointRateLabour; the dead one has the more obvious name, so name-based table choice is wrong every time). tblPointRateLabour itself -> 2026-07-02, ~25 days behind the backup while the factory ran full-tilt: CAP any tblPointRateLabour query at 2026-06-30 and SAY SO — July returns 206 rows against a ~20,000/month baseline and reads as a 99% production collapse. tblTimeAttendance -> 2025-04-05, and its EmpId is 100% NULL on all 393,882 rows so punches can NEVER be attributed to a named employee. tblEmployeeCount (the most attractive name for 'how many workers') -> 2021-07-23, last value 420 against a true 362 actives — never use it. tblCompanySchedule (shift/holiday calendar) -> 2022-06-30: current holidays are NOT in this database. tblStockIssue/tblStockPurchage (consumables) -> March 2022. tblRepairLog -> 2022-02-19. tblKoted/tblKtdPacket -> 2019-12-09 and the parent row is corrupt — refuse Koting questions. tblAIColorPrediction has NO date column at all, so every 'this year' filter silently returns the all-time blob.",
+    "DECOY TABLES — the NAME matches the question, the CONTENT does not. tblRepairLog (657k rows) is a UI CLICK log ('Download File - CLV' 127,931) and dead since 2022. tblRepairLogNew (574k rows) is a generic CRUD audit trail: 'how many repairs in 2025' from it answers 150,706 against a true 3,302 — 46x INFLATED. The ONLY repair register is tblRepairCommentVision (4,413 rows) and its data STARTS 2025-04-08, so any earlier repair volume or year-over-year trend is fabricated; its Reason column is blank — the reason IS RepairComment (Polish 1,906 / Clarity 1,872 / Natural 411). tblDeletedTask (103k rows) is NOT deleted to-dos — it is cancelled PACKET assignments. tblOriginWiseLabour.Origin means PROCESS STAGE ('MFG'/'Marker'), NOT geography — labour-cost-by-rough-origin is not recorded. tblJangadBranch's 54 'branches' are outside VENDOR FIRMS, not GlowStar locations. tblIssuedPacket is the decoy for tblIssuedPacketDetail (1,588 vs 227,143 rows). tblEmployeeTimeAttandance is a GATE-PASS register with seeded 2017 timestamps — never use it for attendance. ZERO ROWS (say the feature was never used, don't return an empty set that reads as 'none'): tblRepairLoss, tblRejection, tblBulkPacket, tblPctIssueConfig, tblJangadDetail, tblJangadMaster, tblStockInventory, tblUserMaster.",
+    "INNER JOINS THAT SILENTLY SHRINK THE ANSWER — LEFT JOIN and state the coverage, or the total quietly drops with no error. tblFinalPacket->tblPctChecker covers only 7,662 of 19,263 2026 final packets (39.8%), so an employee-wise production report built on tblPctChecker alone UNDERSTATES every worker by ~60% while looking complete — use tblPacketHistory (Process + EmpId 100% on 2026 rows) or the tblPlanMaster MFG row instead. tblPacket->tblPacketDetail covers 64.7% of 2026 packets (ReportNo only 40.7%), so an inner join reports production a third too low; tblPacketDetail has NO usable date column — scope on tblPacket.CreDate. tblJangad->tblParty on NAME: 25% of Issue jangads have a ToParty with no master row — group on the inline ToParty text and say so. tblLeaveReport->tblEmployee: 13% orphan EmpIDs — join DeptID->tblDepartMent instead (0 orphans). tblKapanValue->tblKapan: 597 orphan rows across 189 KapanIds.",
+    "DIMENSIONS THAT MUST BE NORMALISED BEFORE GROUPING. SHAPE: fancy/special variants are SEPARATE values, not sub-types — oval in stock is OV 2,872 + F.OV 4,398 + S.OV 50 = 7,321, so Shape='OV' UNDER-REPORTS BY 61% and F.OV outnumbers plain OV; same for PS/S.PS/F.PS and MQ/S.MQ. Roll the F./S./M variants into the base shape and say you did. tblJangad.Process is FREE TEXT: 'WATER JET' 753 + 'WATER  JET' (DOUBLE SPACE) 1,681 = 2,437, so a raw GROUP BY ranks water-jet 5th instead of 2nd; it also mixes processes with vendor COMPANY names and misspellings — group on UPPER(REPLACE(Process,'  ',' ')) and warn the dimension is dirty. tblEmployee.DepartMentName: 'MFG - 1' HAS SPACES (343 people) while its siblings are 'MFG-2'/'MFG-3', so WHERE DepartMentName='MFG-1' returns 0; and LIKE 'MFG%' misses the 229 people in 'VL MFG-1'/'VL MFG-2'. Match on REPLACE(DepartMentName,' ','') and list the matched names back to the user. tblPlanMaster.Reason: the literal ' |  | ' appears 6,910 times and passes IS NOT NULL — exclude it. tblPlanMaster.Remark: 37,214 of 44,751 non-blank 2026 remarks are machine text ('Auto Copy CLV Plan') — filter NOT LIKE '%Copy CLV Plan%' for the 7,537 genuine human remarks.",
+    "STRUCTURAL ZEROS — FILTER BEFORE YOU AVERAGE. Some columns are populated only on the subset of rows where they can apply, so a company-wide AVG divides a real numerator by rows that could never have had a value. tblPacketHistory.WightLoss is recorded ONLY on cutting steps (Laser, Blocking, Blocking Auto, 4P, MFG-2/4) and is structurally 0 on IN Stock, Galaxy, Vision 360, Marker-2, Polish Checker (overall fill 17%) — a whole-table AVG ranks Laser and Blocking near the BOTTOM of 'which process loses the most weight'. Filter WightLoss<>0 or restrict to the cutting processes, or use the packet rollup tblPacket.WeightLoss/JunkLoss. tblPointRateLabour.LossWeight/LossAmount exist in only 3 of 21 departments — a loss-by-department ranking reports 18 departments as perfectly efficient; say they do not record loss rather than showing a 0. tblPointRateLabour also carries 5.04x ROW MULTIPLICITY (110,466 rows / 21,902 distinct Packet_ID in 2026, one row per packet per department per employee): use COUNT(DISTINCT Packet_ID), and de-dup to one row per packet before SUM(Weight) (naive 79,996 ct vs true ~28,904 ct). tblPlanReport.Amount/Rate exist only on the 8.5% of rows with IsDamageReport=1 — always add that filter before summing.",
+    "DAMAGE IS POINTS, NOT RUPEES — tblPlanReport.Amount = Points x Rate, a penalty-POINT deduction, NOT money: quoting 'damage cost us Rs 11,537 in 2025' is indefensible in a meeting. Report damage in POINTS (SUM(Points) WHERE IsDamageReport=1: 2023 -8,722 · 2024 -12,418 · 2025 -14,816 · 2026-to-date -6,627, a clearly worsening trend) and in CARATS via WtDiff, and say plainly that a rupee value for damage is not stored. DamageTypeName is NOT a defect taxonomy — its values ('0.25','1','0.50') are penalty MULTIPLIERS; the real cause is free Gujarati text at the front of Description ('jiram padel', 'weight vek', 'purity vek'). IsHolted is NOT a hold state — it is exactly NOT(IsDamageReport) with zero exceptions; use IsPending=1 for genuinely open items (4,217). ClearDate is 100% NULL on damage rows even though 6,141 of 6,142 carry 'Cleared by: SAMD/SAMG' in Description — WHO cleared it is parseable, WHEN is not recorded. GOOD PARTS: Points, PreValue, NewValue, PreWt, NewWt are 100% populated, live to 2026-07-27.",
+    "ORIGIN — TWO COLUMNS THAT DISAGREE ON 55% OF KAPANS. tblKapan.Mine (852/853) and RoughOrigin (716/853) agree on only 386 of 853. RoughOrigin is the normalised COUNTRY field; Mine is free text mixing countries (CANADA, ANGOLA), suppliers/channels (DTC, ALROSA, DE BEERS), mines (DIAWIK, EKATI) and junk buckets (OUTSIDE, MIX). CRITICAL FALSE NEGATIVE: WHERE RoughOrigin='RUSSIA' returns 0 rows, but Mine IN ('RUSSIAN','ALROSA') gives 75 kapans / 20,421.78 ct — ALROSA is the Russian state miner. NEVER answer a sanctions or provenance question from RoughOrigin alone. RoughOrigin was also backfilled late (2021 8/16, 2022 92/207, ~100% from 2023), so a multi-year origin trend shows a fake surge into 2023+ that is purely the backfill switching on — restrict RoughOrigin trends to 2023+ or use Mine for earlier years. Always name which column you used, disclose the NULL count, and call out 'MIX' (219 kapans / 69,599 ct) as an unresolved bucket.",
+    "COLUMNS THAT ARE GENUINELY GOOD — do NOT refuse these merely because their neighbours are dead. tblKapan.BoilLoss (801 of 853) is the real kapan process loss even though ChapkaLoss has ONE non-zero row. tblJunk.Weight is populated on 208,998 of 209,001 rows and live to 2026-07-27 (2024 18,633 ct · 2025 20,784 ct · 2026-to-date 10,674 ct) — report scrap in CARATS; its Value is 95% zero and Grede 100% NULL. tblPacket.RunningProcess / ProcessStartTime / DepartMentId / EmpId / FifoDate are 100% filled on 2026 rows and ARE the live WIP answer ('where is packet X now', 'how many stuck at Laser', 'how long at this stage') — no need to walk the 5.7M-row tblPacketHistory; note 'IN Stock' means idle stock, so exclude it from 'how many packets are in production'. tblPacketPoint.MarkerPoint/MFGPoint/PolishPoint/GIAPoint are 99.7-100% filled and ARE the piece-rate answer. tblLeaveReport (20,186 rows, live to 2026-07-27) is the ONLY live workforce-presence feed now that biometric attendance is dead — but LeaveTypeID has NO lookup table anywhere, so report codes as NUMBERS and never invent 'sick'/'casual'/'annual'. tblEmployee.JoinDate (81%) is the hiring/tenure feed — CreatDate is NOT a hire date. tblEmployee.OriginType is the workforce SKILL MIX (MFG 1,335, Blocking 279, Marker 242), NOT rough origin.",
+    "DEAD COLUMNS — NEVER ANSWER FROM THESE (verified 0-filled across ALL history). "
+    "They have useful-sounding names, so querying one returns 0 / blank and reads as a "
+    "real answer. Say the figure is NOT RECORDED and offer the live alternative: "
+    "(a) tblJangad.RejCarats, LossCarats, RejAmount, LossAmount are ALL zero on every one "
+    "of 16,498 rows — there is NO jangad rejection/loss tracking; for 'loss on jangad' say "
+    "so, and offer what IS there (packets still out via tblJangadPackets.IsReceived=0). "
+    "tblJangad.KapanName is also 100% blank — join tblJangadPackets.PacketId -> "
+    "tblPacket.Kapan_ID for the kapan. "
+    "(b) tblPacket.IsRepair is NEVER set (0 rows ever) while the real repair register "
+    "tblRepairCommentVision holds 4,413 rows — 'how many repaired' from IsRepair returns a "
+    "WRONG 0. (c) tblKapan.Labour, InvoiceNo, DollarRate, LabourGrade, ChapkaLoss are "
+    "empty — but tblKapan.BoilLoss IS populated (801 of 853 kapans) and is the usable "
+    "kapan-loss figure. (d) tblPacket.RoughValue, PCarat, OrderNo and tblPlanReport."
+    "IsAutoClear/IsDeductBonus are empty. (e) SubPcs is blank on tblPacket, tblFinalPacket, "
+    "tblPlanReport and tblPointRateLabour alike — never count sub-pieces from it.",
+    "DEPTH % / RATIO / TABLE % — tblPlanMaster.Depth AND .Ratio ARE CONSTANTS, NOT "
+    "MEASUREMENTS: every one of the 173,353 rows in 2026 holds Depth=60.0 and Ratio=1.0 "
+    "(ONE distinct value each). They are 100% FILLED, which makes them look usable — they "
+    "are placeholders. Averaging them returns a perfectly plausible '60.0% depth, 1.00 "
+    "ratio' for EVERY shape including OV/PS/EM, which no one spots by eye. The REAL "
+    "measured proportions are on tblPacketParameters (one row per packet, 2,248 distinct "
+    "depth values, true average 62.93%): use DepthPer/TablePer/Ratio from THERE, joined by "
+    "Packet_ID. Rule this generalises: a column being 100% populated does NOT mean it is "
+    "usable — check COUNT(DISTINCT col) before averaging or grouping by anything.",
+    "STONE QUALITY ATTRIBUTES on tblPlanMaster — WHICH ARE REAL AND WHICH ARE EMPTY. "
+    "The table has ~29 inclusion/finish columns and MOST ARE NEVER FILLED, so a question "
+    "about them must say 'not recorded' rather than return a misleading 0. Measured on "
+    "June-2026 GIA rows (3,552): USABLE — CutGrade (99%, the "
+    "C1..C5 internal cut grade), CrAng + PavAng (58%, crown/pavilion angle RANGES stored "
+    "as text like '29.5-40.2'), Diameter (57%, also a text range), Girdle (29%). "
+    "EFFECTIVELY EMPTY (<10%) — Brown, Green, Milky, SideBlack, TableBlack, SideWhite, "
+    "TableWhite, OpenTable, OpenCrown, OpenPavilion, OpenGirdle, Natural, Culet, EyeClean, "
+    "Luster, Tinge, Graining, Shade, HNA, RedSpot, ChipCavity, TablePer. So for 'how many "
+    "milky / eye-clean / brown / black-inclusion stones', 'average table %', or any "
+    "inclusion breakdown: say that attribute is not recorded in the system and offer what "
+    "IS available (the 4Cs, Depth, Ratio, CutGrade, the angle ranges) — NEVER report 0 as "
+    "if none exist. NOTE the angle/diameter columns are TEXT RANGES, not numbers: you "
+    "cannot AVG them without parsing, so present them as-is. The free-text 'Reason' column "
+    "holds the grader's remarks (polish marks, graining, naturals) and IS populated — it "
+    "is the closest thing to an inclusion report, but it is prose: quote it, never count it.",
+    "MAKER ISSUE — 'FRESH' vs 'CHECK' issue ('maker fresh', 'check issue', 'how many "
+    "packets issued to each maker'). The real per-packet log is tblIssuedPacketDetail "
+    "(227k rows: PacketID, EmpID -> tblEmployee.ID, IsFresh, CreatedDate). IsFresh=1 = a "
+    "FRESH packet issued to the maker (179k rows, LIVE to the data cutoff); IsFresh=0 = a "
+    "CHECK issue (48k rows) which STOPPED on 2024-11-19 — zero every month since Dec "
+    "2024. So for any recent period 'check issue' is legitimately 0: say the check-issue "
+    "flow was discontinued in Nov 2024 rather than reporting 0 as if none happened, and "
+    "give the FRESH numbers. Maker-wise pattern: JOIN tblEmployee e ON d.EmpID=e.ID, "
+    "GROUP BY e.ID with SUM(CASE WHEN d.IsFresh=1 THEN 1 ELSE 0 END) AS FreshIssued and "
+    "the IsFresh=0 counterpart, filtered on d.CreatedDate. TRAP: the header table "
+    "tblIssuedPacket (only 1,588 rows: EmpId, PctIssued, CheckIssued, IsLastCheck, "
+    "EntryDate) is NOT the issue log and its counters are dead — CheckIssued is 0 in "
+    "EVERY year and PctIssued is 0 except 29 in 2026 — never total those columns; always "
+    "count rows in tblIssuedPacketDetail instead. (Do not confuse this with "
+    "tblPacketIssue, which is the process-stage issue-out log used for the packet "
+    "journey.)",
+    "WHERE IS THIS DIAMOND / LOCATION — 'where is packet X now', 'is it in Mumbai'. The "
+    "ERP tracks location OPERATIONALLY, not geographically. What IS tracked: (a) the "
+    "current STAGE/DEPARTMENT inside the factory — tblPacket.RunningProcess + "
+    "DepartMentId (see the WIP note); (b) whether it is OUT with a job-work party — "
+    "tblJangadPackets.IsReceived=0 joined up to tblJangad.ToParty (the firm holding it) "
+    "and JangadDate; (c) its full movement history — tblPacketHistory (Process, EmpId, "
+    "ReciveTime) for 'where has it been'. What is NOT tracked: any CITY / BRANCH / OFFICE "
+    "location of a packet. The company is Surat-only (tblCompany City='Surat'), every "
+    "department is Surat, and all 54 job-work parties are Surat — 'MUMBAI' appears ONLY "
+    "as a rough SUPPLIER's city (tblSupplier), never as a packet location, and "
+    "tblJangadBranch holds counterparty FIRM names, not branches/cities. So for 'is the "
+    "diamond in Mumbai / at the Mumbai office' say plainly that packet location is not "
+    "tracked by city — then GIVE the location that IS known: its current stage/department, "
+    "or the party it is out with. NEVER infer a city from a party/supplier address.",
     "WIP / IN-PROCESS REPORT ('how many diamonds are being manufactured / in process "
     "and in which department') — this is a LIVE snapshot from tblPacket, one of the "
     "client's core ERP screens. A packet's CURRENT location is tblPacket.RunningProcess "
@@ -773,20 +963,42 @@ GUJLISH_TERMS = {
 }
 
 
-def render_data_notes() -> str:
-    """Return data notes + value codes + gujlish terms as a text block."""
+def render_data_notes(question: str = "") -> str:
+    """
+    Data notes + value codes + gujlish terms + join hints, as a text block.
+
+    With a `question`, only the notes RELEVANT to it are included (plus the
+    always-on safety notes) — see app/schema/note_router. Injecting all of them
+    on every turn buried the relevant guidance in ~10k tokens of noise, which is
+    what made the same question answer well once and thinly the next time.
+    Without a question the full block is returned (tests, offline inspection).
+    """
+    from app.schema.note_router import select_mapping, select_notes
+
+    data_notes = select_notes(list(DATA_NOTES), question) if question else list(DATA_NOTES)
+    join_hints = select_notes(list(JOIN_HINTS), question) if question else list(JOIN_HINTS)
+    value_codes = select_mapping(VALUE_CODES, question) if question else dict(VALUE_CODES)
+    gujlish = select_mapping(GUJLISH_TERMS, question, max_items=20) if question else dict(GUJLISH_TERMS)
+
     lines = ["=== DATA NOTES (column spellings & how to filter) ==="]
-    for note in DATA_NOTES:
+    for note in data_notes:
         lines.append(f"- {note}")
-    lines.append("\n=== VALUE CODES (what coded column values mean) ===")
-    for name, meaning in VALUE_CODES.items():
-        lines.append(f"- {name}: {meaning}")
-    lines.append("\n=== GUJARATI/HINGLISH PHRASES (translate intent, don't match as names) ===")
-    for phrase, meaning in GUJLISH_TERMS.items():
-        lines.append(f"- {phrase}: {meaning}")
-    lines.append("\n=== TRICKY JOINS (how to apply filters that need another table) ===")
-    for hint in JOIN_HINTS:
-        lines.append(f"- {hint}")
+    if value_codes:
+        lines.append("\n=== VALUE CODES (what coded column values mean) ===")
+        for name, meaning in value_codes.items():
+            lines.append(f"- {name}: {meaning}")
+    if gujlish:
+        lines.append("\n=== GUJARATI/HINGLISH PHRASES (translate intent, don't match as names) ===")
+        for phrase, meaning in gujlish.items():
+            lines.append(f"- {phrase}: {meaning}")
+    if join_hints:
+        lines.append("\n=== TRICKY JOINS (how to apply filters that need another table) ===")
+        for hint in join_hints:
+            lines.append(f"- {hint}")
+    lines.append(
+        "\n(Guidance is filtered to your question. If something you need isn't "
+        "here, use find_tables/get_table_columns to check the schema directly.)"
+    )
     return "\n".join(lines)
 
 
@@ -1212,17 +1424,39 @@ TABLE_NOTES = {
 # 3. RENDERING  - turn the glossary into text the LLM can read.
 #    The Phase 2 context builder will append this to the schema context.
 # ---------------------------------------------------------------------------
-def render_glossary_text() -> str:
-    """Return the full glossary as a compact, LLM-friendly text block."""
+def render_glossary_text(tables: list[str] | None = None, question: str = "") -> str:
+    """
+    Business glossary as a compact, LLM-friendly block.
+
+    `tables` limits the per-table notes to the tables actually selected for this
+    question. Describing all ~100 tables every turn added ~5k tokens of irrelevant
+    text (a jangad-rate note inside an employee question), burying the guidance
+    that matters. TERMS are filtered by the question the same way. Passing neither
+    returns everything (tests, offline inspection).
+    """
+    from app.schema.note_router import select_mapping
+
     lines = ["=== BUSINESS GLOSSARY (diamond manufacturing) ==="]
 
+    terms = TERMS
+    if question:
+        picked = select_mapping(
+            {k: v["definition"] for k, v in TERMS.items()}, question, max_items=14
+        )
+        terms = {k: TERMS[k] for k in picked} or TERMS
     lines.append("\n-- Industry terms --")
-    for term, info in TERMS.items():
+    for term, info in terms.items():
         lines.append(f"- {term}: {info['definition']}")
 
-    lines.append("\n-- Key tables (business meaning) --")
-    for table, info in TABLE_NOTES.items():
-        lines.append(f"- {table}: {info['note']}")
+    if tables:
+        wanted = {t.lower() for t in tables}
+        notes = {t: i for t, i in TABLE_NOTES.items() if t.lower() in wanted}
+    else:
+        notes = TABLE_NOTES
+    if notes:
+        lines.append("\n-- Key tables (business meaning) --")
+        for table, info in notes.items():
+            lines.append(f"- {table}: {info['note']}")
 
     return "\n".join(lines)
 

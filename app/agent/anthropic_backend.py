@@ -338,7 +338,11 @@ def ask_anthropic(
             model=model, max_tokens=_MAX_TOKENS, system=system, messages=messages, temperature=0
         )
         answer = "".join(b.text for b in final.content if b.type == "text").strip()
-    except Exception:
+    except Exception as exc:
+        # Log WHY the write-up failed. Without this the user sees only the
+        # "couldn't write the summary" fallback with no trace of the cause -
+        # the groq and gemini backends already log it here. Grep: SYNTH-FAIL
+        log_interaction(question, sql_used, last_row_count, error=f"SYNTH-FAIL {exc}")
         answer = ""
         synth_ok = False
 

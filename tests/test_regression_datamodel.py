@@ -330,6 +330,58 @@ def test_wip_in_process_report_guidance():
     assert _note_has("RunningProcess", "TERMINAL", "FINISHED")
 
 
+def test_location_is_operational_not_geographic():
+    # Client asked "where is the diamond now - maybe Mumbai". Verified: the company,
+    # every department and all 54 job-work parties are SURAT; 'MUMBAI' exists only as
+    # a rough SUPPLIER's city. Packet location is stage/party, never a city.
+    assert _note_has("MUMBAI", "SUPPLIER", "supplier")
+    assert _note_has("WHERE IS THIS DIAMOND", "not tracked", "NOT tracked")
+
+
+def test_unknown_question_ladder_present():
+    # The systemic fix: never dead-end. Search first, admit the gap in one line,
+    # then give the nearest real data.
+    from app.agent.tools import RULES
+
+    assert "UNKNOWN / NOT-TRACKED QUESTIONS" in RULES
+    assert "NEAREST" in RULES.upper()
+    assert "find_tables" in RULES
+
+
+def test_unanswered_questions_are_logged():
+    # Each unanswerable question must land in the log as a to-do, not vanish.
+    from app.core.logging_util import log_unanswered
+
+    assert log_unanswered("is it in mumbai", "The system does not record the city.", 0) is True
+    assert log_unanswered("june production", "There were 4007 packets.", 4007) is False
+
+
+def test_maker_fresh_vs_check_issue_guidance():
+    # Client ERP screens "maker fresh" / "check issue". Verified: the real log is
+    # tblIssuedPacketDetail.IsFresh; CHECK issue stopped 2024-11-19 (0 since), and
+    # the header tblIssuedPacket.CheckIssued/PctIssued counters are dead.
+    assert _note_has("IsFresh", "FRESH")
+    assert _note_has("tblIssuedPacketDetail", "2024-11")
+    assert _note_has("tblIssuedPacket", "dead", "never total")
+
+
+def test_issue_report_supports_both_grains():
+    # Must NOT be hardcoded to department-wise: the same table answers
+    # department-wise AND employee-wise; the agent picks from the question.
+    assert _note_has("tblPacketIssue", "COUNT(DISTINCT Packet_ID)")
+    assert _note_has("BOTH grains", "employee-wise")
+    assert _note_has("Marker", "MFG-1..6", "karigars")
+
+
+def test_report_grain_is_chosen_from_the_question():
+    # The general rule behind it: never assume one fixed breakdown.
+    from app.agent.tools import RULES
+
+    assert "REPORT GRAIN" in RULES
+    assert "employee wise" in RULES and "department wise" in RULES
+    assert "SHOW BOTH" in RULES
+
+
 def test_stale_snapshot_examples_removed():
     # Old-backup artifacts must not survive a refresh edit.
     assert not any("2026-05-30" in n for n in _ALL_NOTES)
@@ -440,3 +492,200 @@ def test_date_picker_rule_present_in_rules():
 
     assert "ASKDATE:" in RULES, "the date-picker rule is missing from the always-on RULES"
     assert "DATE PICKER" in RULES
+
+
+def test_thin_answer_backstop_shows_the_data():
+    # THE failure the client kept seeing: the model writes prose ABOUT a table it
+    # never printed ("the makers listed above..."), or nothing at all, even though
+    # the query returned rows. Deterministic backstop: render the rows ourselves.
+    from app.agent.postprocess import ensure_data_shown
+
+    cols = ["Maker", "Packets"]
+    rows = [{"Maker": "MAHADEV JEMS", "Packets": 808}]
+
+    # prose with no table -> the real rows get appended
+    assert "MAHADEV JEMS" in ensure_data_shown("The makers listed above.", cols, rows, False)
+    # empty answer -> still shows the data
+    assert "MAHADEV JEMS" in ensure_data_shown("", cols, rows, False)
+    # already has a table -> untouched (no duplication)
+    already = "| A | B |\n|---|---|\n| 1 | 2 |"
+    assert ensure_data_shown(already, cols, rows, False) == already
+    # a DASHBOARD carries its own tables -> don't duplicate
+    assert ensure_data_shown("See dashboard.", cols, rows, True) == "See dashboard."
+    # no rows -> nothing invented
+    assert ensure_data_shown("No data.", cols, [], False) == "No data."
+
+
+def test_report_style_matches_the_client_erp():
+    # Learned from the ONE query the client shared: their reports are WIDE
+    # (~20 cols), show two gradings SIDE BY SIDE, and carry a derived comparison
+    # flag (HasChange). Our old rule capped answers at "~4-8 columns", which is
+    # exactly why our output looked thin next to their ERP.
+    from app.agent.tools import RULES
+
+    assert "MATCH THEIR REPORT STYLE" in RULES
+    assert "10-20" in RULES and "do NOT trim to 4-8" in RULES
+    assert "SIDE-BY-SIDE" in RULES
+    assert "DERIVED COLUMN" in RULES
+    # the old cap must be gone, or the model will keep trimming
+    assert "reasonable ~4-8 columns" not in RULES
+
+
+def test_entity_report_is_a_full_profile():
+    # Client asked "past month report of employee M4117" and their ERP shows the
+    # whole profile — including how many diamonds he MANUFACTURED. Our answer gave
+    # only damage + bonus + incentive. A named-entity report must cover every area.
+    from app.agent.tools import RULES
+
+    assert "360 PROFILE" in RULES or "FULL 360" in RULES
+    assert "PRODUCTION / MANUFACTURED" in RULES
+    assert "PROCESSES HANDLED" in RULES
+    assert "BONUS + INCENTIVE" in RULES
+    # must not leak salary while doing it
+    assert "NEVER salary/FinalLabour" in RULES
+    # generalises beyond employees
+    assert "KAPAN:" in RULES and "DEPARTMENT:" in RULES
+
+
+def test_production_report_names_maker_and_department():
+    # Client complaint: "report of all diamonds processed" returned packet columns
+    # only. Their report also shows WHO made it and WHICH department — and
+    # tblFinalPacket has neither column, so it must be joined via the latest
+    # MFG-stage row (verified 100% coverage: 4,007/4,007 packets in June 2026).
+    assert _note_has("MAKER AND DEPARTMENT", "tblFinalPacket")
+    assert _note_has("OUTER APPLY", "RapVer='MFG'")
+    assert _note_has("DepartMentName", "Maker")
+
+
+def test_data_is_shown_even_when_the_writeup_fails():
+    # The inconsistency the client saw: the model runs the right query, then
+    # writes prose about the data ("production trend shows a surge") with NO
+    # table. Worst case is a provider hiccup AFTER a good query — previously the
+    # backstop was gated on ok=True and stayed silent exactly then.
+    cols = ["ProductionDate", "Packets"]
+    rows = [{"ProductionDate": "2026-06-01", "Packets": 84}]
+
+    prose = enrich({"answer": "The production trend shows a mid-month surge.",
+                    "sql_used": ["SELECT 1"], "rows_returned": 26, "ok": True,
+                    "data_columns": cols, "data_rows": rows})
+    assert "2026-06-01" in prose["answer"], "prose-only answer must show the rows"
+
+    failed_writeup = enrich({"answer": "I fetched the data but couldn't write the summary.",
+                             "sql_used": ["SELECT 1"], "rows_returned": 26, "ok": False,
+                             "data_columns": cols, "data_rows": rows})
+    assert "2026-06-01" in failed_writeup["answer"], (
+        "a failed write-up after a good query must still show the data"
+    )
+
+    # ...but never invent data: no query -> the ungrounded guard still wins.
+    ungrounded = enrich({"answer": "| A | B |\n|---|---|\n| 1 | 2 |", "sql_used": [],
+                         "rows_returned": 0, "ok": True,
+                         "data_columns": [], "data_rows": []})
+    assert ungrounded["answer"] == _UNGROUNDED_MSG
+
+
+def test_superlative_claims_are_checked_against_the_data():
+    # COLD-TEST finding (unseen question): asked which colour grade is most
+    # common, the model answered "F, closely followed by G" while the data had
+    # G first (34,078 vs 28,405). The table was right; the SENTENCE was wrong,
+    # and the client reads the sentence.
+    from app.agent.postprocess import superlative_mismatch
+    from app.agent.tools import RULES
+
+    cols = ["Color", "n"]
+    rows = [{"Color": "G", "n": 34078}, {"Color": "F", "n": 28405},
+            {"Color": "H", "n": 25982}]
+
+    assert superlative_mismatch("The most common colour is **F**, then G.", cols, rows) == ("F", "G")
+    # correct claims, non-claims and unrelated values must NOT be flagged
+    assert superlative_mismatch("The most common colour is **G**.", cols, rows) is None
+    assert superlative_mismatch("Here is the colour breakdown.", cols, rows) is None
+    assert superlative_mismatch("The most common shape is RD.", cols, rows) is None
+
+    # and the model is told to read superlatives off the ordered result
+    assert "SUPERLATIVES COME FROM THE DATA" in RULES
+
+
+def test_gia_defaults_to_all_lab_stage_rows_not_certified_only():
+    # Manual client test: "GIA results of Fency employees" returned 120 packets /
+    # 4 firms (arithmetically correct: LAB='GIA' certified only). But the CLIENT'S
+    # own SQL filters on RapVer IN ('GIA','HRD','IGI') with NO LAB condition, so
+    # their report shows 1,024 / 7 firms. A right number that doesn't match their
+    # report reads as wrong in a meeting.
+    assert _note_has("DEFAULT TO *ALL* LAB-STAGE ROWS", "DO NOT ADD A LAB FILTER")
+    assert _note_has("1,024", "120")
+
+
+def test_empty_quality_attributes_are_flagged():
+    # Preparedness for questions never asked yet: tblPlanMaster has ~29 inclusion
+    # /finish columns and 22 are effectively EMPTY. "How many milky stones?" must
+    # say "not recorded" — reporting 0 would read as a real (wrong) answer.
+    assert _note_has("Milky", "EFFECTIVELY EMPTY", "not recorded")
+    assert _note_has("EyeClean", "EMPTY", "not recorded")
+    # ...and the genuinely usable ones must stay usable
+    assert _note_has("CutGrade", "USABLE")
+    # the angle columns are TEXT RANGES — averaging them is wrong
+    assert _note_has("CrAng", "RANGE", "ranges", "TEXT RANGES")
+
+
+def test_dead_columns_are_flagged():
+    # Proactive sweep (not client-reported): columns with useful-sounding names
+    # that are 0-filled across ALL history. Querying one returns 0/blank and reads
+    # as a real answer — the same shape as the Tops and CheckIssued bugs.
+    #   tblJangad Rej/Loss*  : 0 of 16,498 rows  -> "no loss on jangad" (wrong)
+    #   tblPacket.IsRepair   : never set; real register has 4,413 rows
+    #   tblKapan.BoilLoss    : ALIVE (801/853) — must stay usable
+    assert _note_has("RejCarats", "16,498", "NEVER ANSWER FROM THESE")
+    assert _note_has("IsRepair", "4,413")
+    assert _note_has("BoilLoss", "801", "populated")
+    assert _note_has("SubPcs", "blank", "never count")
+
+
+# --- 2026-07-31 proactive gap sweep: the five catastrophic traps ------------
+# Found by sweeping the DB ourselves (no client input). Each would produce a
+# confidently-WRONG number in a meeting; #5 was caused by our OWN guidance.
+
+def test_kapan_value_is_a_per_carat_rate():
+    # SUM(RoughValue)=73,230 vs the true SUM(Weight*RoughValue)=9,115,298 (124x).
+    assert _note_has("PER-CARAT RATE", "SUM(Weight * RoughValue)", "124x")
+    # and the estimate-accuracy trap: EstValue is a copy on 781 of 804 kapans
+    assert _note_has("EstValue", "COPY")
+
+
+def test_kapanvalue_is_a_daily_snapshot():
+    # Summing it multiplies by the number of days: 16.9M ct vs 20,407 real.
+    assert _note_has("NIGHTLY SNAPSHOT", "16,917,681", "829x")
+    assert _note_has("tblKapanValue", "ROW_NUMBER", "latest snapshot")
+
+
+def test_planmaster_must_not_be_summed_raw():
+    # 173,353 rows cover only 27,803 packets -> 9x/6x overstatement.
+    assert _note_has("27,803", "173,353")
+    assert _note_has("COUNT(DISTINCT Packet_ID)", "RapVer")
+    # tblRapVer is an incomplete lookup — joining it drops 12% of rows
+    assert _note_has("tblRapVer", "21,027", "MISSING")
+
+
+def test_jangad_direction_cannot_accuse_a_partner():
+    # A naive GROUP BY ToParty reports "97.8% loss" at the client's biggest partner.
+    assert _note_has("TransType", "301,427", "99.4%")
+    assert _note_has("Issue", "Receive", "FromParty")
+
+
+def test_depth_and_ratio_are_constants_not_measurements():
+    # OUR OWN NOTE called these "USABLE" because they are 100% filled — but every
+    # 2026 row holds Depth=60.0 / Ratio=1.0. Fill rate != usefulness.
+    assert _note_has("CONSTANTS, NOT", "60.0")
+    assert _note_has("tblPacketParameters", "62.93", "DepthPer")
+    # the retracted claim must be GONE, or the model still trusts it
+    assert not any("Depth (100%), Ratio (100%)" in n for n in _ALL_NOTES)
+    # and the generalisable lesson is stated
+    assert _note_has("COUNT(DISTINCT", "100% populated does NOT mean")
+
+
+def test_letter_prefixed_employee_code_is_unambiguous():
+    # Live failure (NVIDIA run): asked for "report of employee id M4117" the model
+    # replied "do you mean Code M4117 or numeric ID 4117?" — a wasted turn. M4117
+    # matches exactly one person and 2,431 of 2,450 codes are letter-prefixed.
+    assert _note_has("LETTER PREFIX", "M4117")
+    assert _note_has("2,431", "NO ambiguity", "spurious")

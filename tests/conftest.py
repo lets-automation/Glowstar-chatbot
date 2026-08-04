@@ -27,3 +27,24 @@ def bypass_auth():
     app.dependency_overrides[enforce_rate_limit] = lambda: _FAKE_USER
     yield
     app.dependency_overrides.clear()
+
+
+# --- Live-LLM guard ---------------------------------------------------------
+# Some tests call the real provider. On the free tier that is ~20 requests/DAY
+# TOTAL, shared with the client demo — so a routine `pytest tests/` run was
+# quietly eating the quota the demo needed (and then the demo failed).
+#
+# Live tests are now OPT-IN. Run them deliberately when you have quota:
+#     RUN_LIVE_LLM_TESTS=true python -m pytest tests/ -q
+import os
+
+
+def pytest_collection_modifyitems(config, items):
+    if os.getenv("RUN_LIVE_LLM_TESTS", "").strip().lower() in ("1", "true", "yes"):
+        return
+    skip = pytest.mark.skip(
+        reason="calls the live LLM (costs demo quota) — set RUN_LIVE_LLM_TESTS=true to run"
+    )
+    for item in items:
+        if "live_llm" in item.keywords:
+            item.add_marker(skip)
