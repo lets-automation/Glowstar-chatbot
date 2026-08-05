@@ -1,7 +1,7 @@
 """
 generate_db_guide.py
 --------------------
-Generates DATABASE_GUIDE.md - a complete, human/AI-readable data dictionary
+Generates docs/DATABASE_GUIDE.md - a complete, human/AI-readable data dictionary
 of the GlowStar/AasthaErp database: every table, its columns, row counts,
 categories, relationships, and the business glossary.
 
@@ -132,8 +132,10 @@ def main():
 
     out_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "docs",
         "DATABASE_GUIDE.md",
     )
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 

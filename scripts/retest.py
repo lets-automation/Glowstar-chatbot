@@ -6,6 +6,7 @@ Re-run specific question numbers (to confirm fixes).
 """
 
 import json
+import os
 import re
 import sys
 import time
@@ -28,7 +29,15 @@ def parse_questions(path):
 def main():
     nums = [int(x) for x in sys.argv[1].split(",")]
     out_file = sys.argv[2] if len(sys.argv) > 2 else "logs/retest.jsonl"
-    qs = parse_questions("question_claude.md")
+    # docs/ is gitignored (internal working material) - see run_test_suite.py.
+    q_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "docs",
+        "question_claude.md",
+    )
+    if not os.path.exists(q_path):
+        sys.exit(f"Question bank not found: {q_path}\nIt is not in git - copy it in before running this suite.")
+    qs = parse_questions(q_path)
 
     with open(out_file, "w", encoding="utf-8") as out:
         for n in nums:

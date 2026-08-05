@@ -140,7 +140,7 @@ TERMS = {
         ),
         "status": "confirmed",
     },
-    # --- Industry terms added from GLOWSTAR_KNOWLEDGE.md (§2.3 pipeline, §4 trade) ---
+    # --- Industry terms added from docs/GLOWSTAR_KNOWLEDGE.md (§2.3 pipeline, §4 trade) ---
     "Ghanti": {
         "definition": (
             "The polishing wheel (Gujarati; Western term 'scaife') - a diamond-"
@@ -899,7 +899,7 @@ GUJLISH_TERMS = {
     "thayu / thaya / thai": "happened / done / made.",
     "malyu": "got / received.",
     "pending": "still out / not returned (for jangad, IsReceived = 0).",
-    # --- Merged from GLOWSTAR_KNOWLEDGE.md §6 (intent words, NEVER data values) ---
+    # --- Merged from docs/GLOWSTAR_KNOWLEDGE.md §6 (intent words, NEVER data values) ---
     # §6.1 manufacturing-floor terms
     "hira": "diamond ('hira bazar' = diamond market).",
     "hira karigar": "diamond cutter-polisher (same as karigar).",

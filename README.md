@@ -49,7 +49,7 @@ pip install -r requirements.txt
 - [x] **Phase 5** — Guardrails, Safety & Accuracy (17/17 count questions verified live)
 - [x] **Phase 6** — Artifact Generation (Excel/PDF/charts + /export)
 - [~] **Phase 7** — Semantic Search (scaffold; optional, needs Voyage+Pinecone keys)
-- [x] **Phase 8** — Demo UI (Streamlit) & Handover docs (INTEGRATION.md)
+- [x] **Phase 8** — Demo UI (Streamlit) & Handover docs (docs/INTEGRATION.md)
 
 ## Run the connection test
 

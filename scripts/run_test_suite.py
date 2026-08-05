@@ -1,7 +1,7 @@
 """
 run_test_suite.py
 -----------------
-Runs the 60 test questions from question_claude.md through the chatbot and
+Runs the 60 test questions from docs/question_claude.md through the chatbot and
 saves each result to logs/test_results.jsonl incrementally (so progress
 survives a rate-limit / interruption).
 
@@ -10,6 +10,7 @@ Run from the project root:
 """
 
 import json
+import os
 import re
 import sys
 import time
@@ -35,9 +36,18 @@ def main():
     end = int(sys.argv[2]) if len(sys.argv) > 2 else 60
     out_file = sys.argv[3] if len(sys.argv) > 3 else "logs/test_results.jsonl"
 
-    questions = [
-        (n, q) for (n, q) in parse_questions("question_claude.md") if start <= n <= end
-    ]
+    # docs/ is gitignored (internal working material), so a fresh clone will not
+    # have the question bank. Say so plainly instead of dying on a bare
+    # FileNotFoundError from inside parse_questions().
+    q_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "docs",
+        "question_claude.md",
+    )
+    if not os.path.exists(q_path):
+        sys.exit(f"Question bank not found: {q_path}\nIt is not in git - copy it in before running this suite.")
+
+    questions = [(n, q) for (n, q) in parse_questions(q_path) if start <= n <= end]
     print(f"Running questions {start}-{end} ({len(questions)} total)...")
 
     with open(out_file, "w", encoding="utf-8") as out:

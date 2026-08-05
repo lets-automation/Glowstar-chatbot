@@ -428,7 +428,7 @@ DATES (natural language):
 """
 
 
-# Company + industry background (from GLOWSTAR_KNOWLEDGE.md §7). Small enough
+# Company + industry background (from docs/GLOWSTAR_KNOWLEDGE.md §7). Small enough
 # (~35 lines) to include on every call; gives the agent identity answers ("who
 # is GlowStar?") and a mental model of the diamond pipeline. This is CONTEXT,
 # not SQL logic — table/column/value rules stay governed by the glossary.

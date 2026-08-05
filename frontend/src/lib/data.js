@@ -1,5 +1,5 @@
 // Static UI data: diamond-ERP starter cards.
-// Questions are grounded in the real AasthaERP schema (see DATABASE_GUIDE.md),
+// Questions are grounded in the real AasthaERP schema (see docs/DATABASE_GUIDE.md),
 // not the generic screenshot — each maps to actual tables and is answerable.
 // (Chat history is no longer seeded here; it's real + persisted via chatStore.)
 

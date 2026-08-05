@@ -31,12 +31,14 @@ db_backup/*
 *.mdf
 *.ldf
 
-# Docs: internal working notes, client material and generated dictionaries
-# stay local. Only the READMEs are published.
+# Docs: internal working notes, client material and generated dictionaries live
+# in /docs and stay local. Only the READMEs are published. The whole folder is
+# ignored, so anything dropped in there is private by default - including the
+# question bank scripts/retest.py and scripts/run_test_suite.py read.
+/docs/
 *.md
 !README.md
 !frontend/README.md
-GLOWSTAR_AI_CHATBOT_PROPOSAL.pdf
 
 # Editor
 .vscode/

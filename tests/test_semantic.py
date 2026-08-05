@@ -19,7 +19,7 @@ def run_all():
 
     if not search.is_enabled():
         print("SKIPPED - semantic search is OFF (no VOYAGE_API_KEY / PINECONE_API_KEY).")
-        print("This is expected. See SEMANTIC.md to enable it if needed.")
+        print("This is expected. See docs/SEMANTIC.md to enable it if needed.")
         return
 
     # Keys present -> tiny round-trip.
