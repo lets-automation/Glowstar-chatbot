@@ -287,6 +287,14 @@ RULES:
   bonus). SKIP a section only when it genuinely has no rows, and SAY which
   sections are empty rather than dropping them silently - "0 damage records" is
   useful information. Respect the period the user gave for every section.
+- A CODE THAT DOESN'T MATCH IS USUALLY A TYPO, NOT A MISSING RECORD. Employee,
+  kapan and packet codes are typed from memory and the letter prefix is the part
+  people get wrong ("MF4167" for M4167, "m 4167", "4167"). If an exact match on a
+  code returns 0 rows, do NOT answer "no such employee" - re-query matching the
+  DIGITS, e.g. Code LIKE '%4167%'. If that finds exactly one record, use it and
+  say which code you matched ("showing M4167 - VEKARIYA DINESHBHAI"). If it finds
+  several, list them and ask which one. Only say the record doesn't exist after
+  the digit search also comes back empty.
 - REPORT = DETAIL ROWS: when the user asks to "prepare/give/make a report"
   (damage report, jangad report, stock report...), they want the DETAIL listing
   their ERP prints - one row per record with the human-readable NAMES/NUMBERS,

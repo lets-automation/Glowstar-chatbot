@@ -276,6 +276,7 @@ def _ask_gemini_once(
     data_sections: list[dict] = []  # every result, for a multi-sheet export
     nudged_dashboard = False  # one corrective round if a requested dashboard was skipped
     nudged_report_detail = False  # one corrective round if a "report" came back aggregated
+    nudged_entity_report = False  # one corrective round if a 'report of X' was just the WHO row
     execute_nudges = 0        # how many times we've forced a stalled model to run its SQL
     dashboard_built = False
 
@@ -410,6 +411,26 @@ def _ask_gemini_once(
                     )
                 )
                 emit("Building the detailed report…")
+                continue
+            # Thin entity report: "report of <entity>" answered with only the
+            # WHO row - section 1 of several. The client asked for a full report
+            # of employee M4167 and the Excel held a single identity row.
+            if (
+                not nudged_entity_report
+                and not file_grounded
+                and sql_used
+                and policy.thin_entity_report(question, data_sections)
+            ):
+                nudged_entity_report = True
+                if cand and cand.content:
+                    contents.append(cand.content)
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=policy.ENTITY_REPORT_NUDGE)],
+                    )
+                )
+                emit("Building the full profile…")
                 continue
             # Dashboard guard (mirrors groq_backend): the question asked for
             # analytics/overview/dashboard/analysis but no dashboard was built.

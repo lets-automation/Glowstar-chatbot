@@ -194,10 +194,11 @@ def ask_groq(
     widgets: list[dict] = []  # visuals emitted via show_widget, shown to the user
     data_columns: list[str] = []  # columns/rows from the LAST successful run_sql,
     data_rows: list[dict] = []
-    data_sections: list[dict] = []  # every result, for a multi-sheet export    # captured so export uses the exact data shown
+    data_sections: list[dict] = []  # every result, for a multi-sheet export
 
     execute_nudges = 0         # how many times we've forced a stalled model to run its SQL
     nudged_report_detail = False  # one corrective round if a "report" came back aggregated
+    nudged_entity_report = False  # one corrective round if a 'report of X' was just the WHO row
     nudged_dashboard = False   # have we already asked it to build the requested dashboard?
     force_tool = False         # require a tool call on the NEXT request (set by the nudge)
     dashboard_built = False    # did show_dashboard actually render this turn?
@@ -356,6 +357,22 @@ def ask_groq(
                 messages.append({"role": "assistant", "content": answer})
                 messages.append({"role": "user", "content": policy.REPORT_DETAIL_NUDGE})
                 emit("Building the detailed report…")
+                continue
+            # Thin entity report: "report of <entity>" answered with only the
+            # WHO row. The client asked for a full report of employee M4167 and
+            # got a one-row identity record - name, code, department - which is
+            # section 1 of several, and the Excel download was that single row.
+            if (
+                not nudged_entity_report
+                and not file_grounded
+                and sql_used
+                and policy.thin_entity_report(question, data_sections)
+            ):
+                nudged_entity_report = True
+                force_tool = True
+                messages.append({"role": "assistant", "content": answer})
+                messages.append({"role": "user", "content": policy.ENTITY_REPORT_NUDGE})
+                emit("Building the full profile…")
                 continue
             # Dashboard guard: the question asked for analytics/overview/
             # dashboard/analysis but the model finished without building one

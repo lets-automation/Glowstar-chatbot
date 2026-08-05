@@ -104,6 +104,48 @@ REPORT_DETAIL_NUDGE = (
 )
 
 
+# THIN ENTITY REPORT: "report of <entity>" answered with only the WHO row.
+#
+# The rules already spell out that a report of a named thing (an employee, a
+# kapan, a department) means the ERP's all-round profile - who they are, then
+# production, processes, damage, bonus - each its own section. Weak models run
+# section 1 and stop, so the client asked for a full report of employee M4167
+# and got a one-row identity record: name, code, department. The Excel download
+# was that single row, which is what they saw as the report.
+#
+# Prompt text alone did not hold, so this is checked in code, once per turn.
+ENTITY_REPORT_NUDGE = (
+    "That is NOT the full report the user asked for. You have only identified "
+    "WHO/WHAT they named - that is section 1 of several. A report of a named "
+    "employee, kapan, department or party means their ALL-ROUND profile, the "
+    "same one their ERP prints. Run ONE query per remaining section NOW, using "
+    "the id you just resolved: what they PRODUCED (packets and weight), which "
+    "PROCESSES they handled, any DAMAGE/repair, and their BONUS/INCENTIVE "
+    "points. Skip a section only if the schema genuinely has no such data for "
+    "this kind of entity. Then answer with each section as its own small titled "
+    "block, led by a 1-2 line summary. Never present the identity row alone as "
+    "the report."
+)
+
+
+def thin_entity_report(question: str, sections: list[dict]) -> bool:
+    """
+    True when a REPORT question came back with essentially one small result.
+
+    Deliberately crude: one section holding a couple of rows is not a profile,
+    whatever the entity was. It cannot know which sections a given entity
+    supports - that depends on the schema and is the model's job - so it only
+    detects that far too little came back.
+    """
+    q = question or ""
+    if not REPORT_ASKED_RE.search(q) or SUMMARY_INTENT_RE.search(q):
+        return False
+    usable = [s for s in (sections or []) if s.get("rows")]
+    if len(usable) > 1:
+        return False
+    return sum(len(s["rows"]) for s in usable) <= 2
+
+
 # The final "stop calling tools and write the answer" instruction.
 #
 # It MUST re-state the SUGGESTIONS contract. The rules block asks every answer to

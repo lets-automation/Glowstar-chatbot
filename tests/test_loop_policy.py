@@ -112,3 +112,44 @@ def test_nudges_are_non_empty():
     # and carries on exactly as before.
     for nudge in (lp.EXECUTE_NUDGE, lp.DASHBOARD_NUDGE, lp.REPORT_DETAIL_NUDGE):
         assert nudge and len(nudge) > 80
+
+
+# --- thin entity report ("report of <entity>" = only the WHO row) ----------
+WHO_ROW = {"columns": ["FirstName", "LastName", "DepartMentName", "Code"],
+           "rows": [{"FirstName": "VEKARIYA", "LastName": "DINESHBHAI",
+                     "DepartMentName": "MFG-4", "Code": "M4167"}]}
+PRODUCTION = {"columns": ["KapanName", "PacketNo", "Carats"],
+              "rows": [{"KapanName": "NS26", "PacketNo": i, "Carats": 1.0}
+                       for i in range(40)]}
+
+
+def test_a_report_that_is_only_the_identity_row_is_flagged():
+    # The client's case: "full report of employee code MF4167" produced one row
+    # of name/code/department, and the Excel download was that single row.
+    assert lp.thin_entity_report("give me full report of employee code M4167",
+                                 [WHO_ROW]) is True
+
+
+def test_a_real_multi_section_report_is_not_flagged():
+    assert lp.thin_entity_report("give me full report of employee M4167",
+                                 [WHO_ROW, PRODUCTION]) is False
+
+
+def test_one_big_section_is_not_flagged():
+    # A department report that is one long detail listing IS a report.
+    assert lp.thin_entity_report("give me full report of MFG - 1", [PRODUCTION]) is False
+
+
+def test_a_question_that_is_not_a_report_is_left_alone():
+    assert lp.thin_entity_report("who is employee M4167", [WHO_ROW]) is False
+
+
+def test_an_explicit_summary_is_left_alone():
+    # "summary"/"how many" legitimately return one small result.
+    assert lp.thin_entity_report("summary report of employee M4167", [WHO_ROW]) is False
+    assert lp.thin_entity_report("how many packets report", [WHO_ROW]) is False
+
+
+def test_no_sections_at_all_is_flagged():
+    # Nothing came back for a report question - worth one corrective round.
+    assert lp.thin_entity_report("full report of employee M4167", []) is True

@@ -124,10 +124,11 @@ def ask_anthropic(
     widgets: list[dict] = []  # visuals emitted via show_widget, shown to the user
     data_columns: list[str] = []  # columns/rows from the LAST successful run_sql,
     data_rows: list[dict] = []
-    data_sections: list[dict] = []  # every result, for a multi-sheet export    # captured so export uses the exact data shown
+    data_sections: list[dict] = []  # every result, for a multi-sheet export
 
     execute_nudges = 0        # forced run-the-query rounds used (grounding guard)
     nudged_report_detail = False  # one corrective round if a "report" came back aggregated
+    nudged_entity_report = False  # one corrective round if a 'report of X' was just the WHO row
     nudged_dashboard = False  # one corrective round if a requested dashboard was skipped
     force_tool = False        # require a tool call on the NEXT request (set by the nudge)
     dashboard_built = False   # did show_dashboard actually render this turn?
@@ -220,6 +221,20 @@ def ask_anthropic(
                 force_tool = True
                 messages.append({"role": "user", "content": policy.REPORT_DETAIL_NUDGE})
                 emit("Building the detailed report…")
+                continue
+            # Thin entity report: "report of <entity>" answered with only the
+            # WHO row - section 1 of several (see the M4167 case in groq).
+            if (
+                not nudged_entity_report
+                and not file_grounded
+                and sql_used
+                and policy.thin_entity_report(question, data_sections)
+            ):
+                nudged_entity_report = True
+                force_tool = True
+                # the assistant turn was already appended before this branch
+                messages.append({"role": "user", "content": policy.ENTITY_REPORT_NUDGE})
+                emit("Building the full profile…")
                 continue
             # Dashboard guard (parity with groq/gemini): the question asked for
             # analytics/overview but no dashboard was built - one corrective round.
