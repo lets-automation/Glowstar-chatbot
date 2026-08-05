@@ -2,13 +2,47 @@
 venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/dist/
 
 # Secrets - NEVER commit this
 .env
+.env.*
+!.env.docker.example
 
 # Logs and generated outputs
 logs/
 outputs/
+
+# Generated exports (report.xlsx, packet.xlsx, ...) - rebuilt on demand.
+# Leading slash: root-level only, so app/artifacts/ source code is untouched.
+/artifacts/
+
+# Operator data - real AasthaErp backups and chat-history dumps.
+# backups/history keeps its own .gitignore: it is a compose bind-mount, so the
+# directory must survive a clone even though every *.dump in it is ignored.
+db_backup/*
+!db_backup/.gitkeep
+*.dump
+*.bak
+*.mdf
+*.ldf
+
+# Docs: internal working notes, client material and generated dictionaries
+# stay local. Only the READMEs are published.
+*.md
+!README.md
+!frontend/README.md
+GLOWSTAR_AI_CHATBOT_PROPOSAL.pdf
+
+# Editor
+.vscode/
+.idea/
+.claude/
+*.swp
 
 # OS
 Thumbs.db
