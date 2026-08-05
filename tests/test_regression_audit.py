@@ -290,10 +290,13 @@ def test_pdf_chart_temp_files_are_unique():
 #     wise" can never again come back as a "Top 10 kapans" summary with no
 #     joined names.
 # ---------------------------------------------------------------------------
-from app.agent.groq_backend import (  # noqa: E402
+# These moved out of groq_backend into loop_policy: they are provider-agnostic
+# policy, and living in a provider file meant the other two backends imported
+# PRIVATE names across module boundaries to reach them.
+from app.agent.loop_policy import (  # noqa: E402
     REPORT_ASKED_RE,
-    _SUMMARY_INTENT_RE,
-    _all_sql_aggregated,
+    SUMMARY_INTENT_RE as _SUMMARY_INTENT_RE,
+    all_sql_aggregated as _all_sql_aggregated,
 )
 
 

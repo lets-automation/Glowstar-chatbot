@@ -17,6 +17,7 @@ from google import genai
 from google.genai import types
 
 from app.agent import attachments as attachments_mod
+from app.agent import loop_policy as policy
 from app.agent import result_capture, tools, widget
 from app.config import settings
 from app.core.logging_util import log_interaction, log_provider_error
@@ -276,36 +277,55 @@ def _ask_gemini_once(
         if not calls:
             # No more tool calls -> this is the final answer.
             answer = "".join(p.text for p in parts if getattr(p, "text", None)).strip()
+
+            # The model stopped WITHOUT writing anything. Returning here hands
+            # back a blank answer and skips the forced write-up below, which only
+            # runs when the rounds are exhausted. Same fault, same fix as the
+            # groq backend (see the employee-360 case there): with data, break to
+            # the write-up; with nothing yet, push it to actually run the query
+            # rather than end the turn having queried nothing - that produced
+            # "I don't have that information in the database" about an employee
+            # who plainly exists.
+            if not answer:
+                if data_rows:
+                    break
+                if execute_nudges < policy.MAX_EXECUTE_NUDGES:
+                    execute_nudges += 1
+                    if cand and cand.content:
+                        contents.append(cand.content)
+                    contents.append(
+                        types.Content(
+                            role="user",
+                            parts=[types.Part.from_text(text=policy.EXECUTE_NUDGE)],
+                        )
+                    )
+                    emit("Running the query…")
+                    continue
+                break
             # Grounding guard (mirrors groq_backend): the model returned a data
             # table, a chart/dashboard, or written-out SQL but ran NO query, so
             # nothing it shows is real. Force a real run_sql round rather than
             # letting the fabrication fall through to the "ungrounded" refusal
-            # the user sees. Fires up to _MAX_EXECUTE_NUDGES times.
-            from app.agent.groq_backend import (
-                _EXECUTE_NUDGE,
-                _MAX_EXECUTE_NUDGES,
-                _has_data_visual,
-                _looks_like_unrun_sql,
-            )
+            # the user sees. Fires up to policy.MAX_EXECUTE_NUDGES times.
             from app.agent.postprocess import looks_like_data_table
             ungrounded_fabrication = (
                 not sql_used
                 and not file_grounded
                 and (
-                    _looks_like_unrun_sql(answer)
+                    policy.looks_like_unrun_sql(answer)
                     or looks_like_data_table(answer)
-                    or _has_data_visual(widgets)
+                    or policy.has_data_visual(widgets)
                 )
             )
-            if ungrounded_fabrication and execute_nudges < _MAX_EXECUTE_NUDGES:
+            if ungrounded_fabrication and execute_nudges < policy.MAX_EXECUTE_NUDGES:
                 execute_nudges += 1
-                widgets = [w for w in widgets if not _has_data_visual([w])]
+                widgets = [w for w in widgets if not policy.has_data_visual([w])]
                 if cand and cand.content:
                     contents.append(cand.content)
                 contents.append(
                     types.Content(
                         role="user",
-                        parts=[types.Part.from_text(text=_EXECUTE_NUDGE)],
+                        parts=[types.Part.from_text(text=policy.EXECUTE_NUDGE)],
                     )
                 )
                 emit("Running the query…")
@@ -313,18 +333,12 @@ def _ask_gemini_once(
             # Report-detail guard (mirrors groq_backend; client-flagged bug):
             # a "…report…" question answered with a GROUP BY aggregate instead
             # of the mandated detail listing with joined names.
-            from app.agent.groq_backend import (
-                REPORT_ASKED_RE,
-                REPORT_DETAIL_NUDGE,
-                _all_sql_aggregated,
-                _SUMMARY_INTENT_RE,
-            )
             if (
                 not nudged_report_detail
                 and not file_grounded
-                and _all_sql_aggregated(sql_used)
-                and REPORT_ASKED_RE.search(question or "")
-                and not _SUMMARY_INTENT_RE.search(question or "")
+                and policy.all_sql_aggregated(sql_used)
+                and policy.REPORT_ASKED_RE.search(question or "")
+                and not policy.SUMMARY_INTENT_RE.search(question or "")
             ):
                 nudged_report_detail = True
                 if cand and cand.content:
@@ -332,7 +346,7 @@ def _ask_gemini_once(
                 contents.append(
                     types.Content(
                         role="user",
-                        parts=[types.Part.from_text(text=REPORT_DETAIL_NUDGE)],
+                        parts=[types.Part.from_text(text=policy.REPORT_DETAIL_NUDGE)],
                     )
                 )
                 emit("Building the detailed report…")
@@ -340,13 +354,12 @@ def _ask_gemini_once(
             # Dashboard guard (mirrors groq_backend): the question asked for
             # analytics/overview/dashboard/analysis but no dashboard was built.
             # Nudge one corrective round; requires queried data (sql_used).
-            from app.agent.groq_backend import DASHBOARD_ASKED_RE, DASHBOARD_NUDGE
             if (
                 not dashboard_built
                 and not nudged_dashboard
                 and sql_used
                 and not file_grounded
-                and DASHBOARD_ASKED_RE.search(question or "")
+                and policy.DASHBOARD_ASKED_RE.search(question or "")
             ):
                 nudged_dashboard = True
                 if cand and cand.content:
@@ -354,7 +367,7 @@ def _ask_gemini_once(
                 contents.append(
                     types.Content(
                         role="user",
-                        parts=[types.Part.from_text(text=DASHBOARD_NUDGE)],
+                        parts=[types.Part.from_text(text=policy.DASHBOARD_NUDGE)],
                     )
                 )
                 emit("Building your dashboard…")
@@ -460,9 +473,15 @@ def _ask_gemini_once(
         # Never claim "no data" while holding rows: when the write-up call fails
         # (e.g. provider quota) AFTER the query succeeded, say so honestly - the
         # UI then renders the captured rows as a table instead of a false denial.
+        # Three situations, three different truths. Saying "I don't have that
+        # information in the database" when NO query ever ran is a false denial -
+        # it tells the user their data is missing when in fact we never looked.
         "answer": answer or (
             "I fetched the data but couldn't write the summary just now - here it is."
-            if data_rows else "I don't have that information in the database."
+            if data_rows
+            else "I don't have that information in the database."
+            if sql_used  # we DID query and it genuinely came back empty
+            else "I couldn't complete that just now - please ask again."
         ),
         "sql_used": sql_used,
         "rows_returned": last_row_count,

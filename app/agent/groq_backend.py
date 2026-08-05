@@ -11,6 +11,7 @@ import re
 from groq import Groq
 
 from app.agent import attachments as attachments_mod
+from app.agent import loop_policy as policy
 from app.agent import result_capture, tools, widget
 from app.agent._retry import call_with_retry
 from app.agent.postprocess import looks_like_data_table
@@ -122,74 +123,15 @@ def _client():
     return Groq(api_key=settings.GROQ_API_KEY)
 
 
-def _looks_like_unrun_sql(text: str) -> bool:
-    """True if the reply EMBEDS a SELECT query — i.e. the model wrote the SQL in
-    its answer instead of calling the run_sql tool. Some Groq models (notably
-    llama-4-scout) do this on list/ranking questions, so no query runs and the
-    user sees no data. Detecting it lets us force an actual execution."""
-    if not text:
-        return False
-    low = text.lower()
-    return "select" in low and "from" in low
 
 
-# The user asked for an analytics dashboard/overview. Weak models often answer
-# such questions in plain text and skip the show_dashboard tool entirely; when
-# this matches and no dashboard was built, we nudge one corrective round.
-DASHBOARD_ASKED_RE = re.compile(
-    r"\b(dashboards?|analytics?|overview|analysis|analyse|analyze)\b", re.IGNORECASE
-)
-
-DASHBOARD_NUDGE = (
-    "The user asked for an analytics view, but you have not called the "
-    "show_dashboard tool, so they see no dashboard. Do it NOW: if you need "
-    "more figures, run 1-3 more quick aggregate run_sql queries (e.g. a "
-    "monthly trend, a breakdown by department/category); then call "
-    "show_dashboard ONCE with 3-6 KPI tiles and 1-2 sections built ONLY from "
-    "numbers your run_sql queries actually returned. Then give a short text "
-    "summary."
-)
-
-# REPORT = DETAIL ROWS guard (client-flagged bug): the user asked for a
-# "report" but the model answered with a GROUP BY aggregate ("Top 10 kapans by
-# damage count") instead of the detail listing with joined names the rules
-# mandate. Prompt rules alone did not stop weak models, so this is enforced
-# deterministically: report-intent question + aggregated final query -> one
-# corrective round. Summary-intent words exempt (an explicitly-asked summary
-# may aggregate).
-REPORT_ASKED_RE = re.compile(r"\breports?\b", re.IGNORECASE)
-_SUMMARY_INTENT_RE = re.compile(
-    r"\b(summar(y|ies|ise|ize)|total|count|how many|average|avg|trend|"
-    r"overview|analytics?|dashboards?|charts?|graphs?)\b",
-    re.IGNORECASE,
-)
-
-REPORT_DETAIL_NUDGE = (
-    "The user asked for a REPORT. In this system a report ALWAYS means the "
-    "DETAIL listing - one row per record - NEVER a GROUP BY summary, and never "
-    "a 'Top N' ranking they didn't ask for. Your last query AGGREGATED. Re-run "
-    "ONE corrected query that lists the individual records with human-readable "
-    "columns: JOIN tblEmployee on the numeric emp id for EmployeeName + "
-    "DepartMentName where the table has one; show KapanName and PacketNo, "
-    "never raw IDs. 'X wise' means ORDER BY that column (kapan wise = ORDER BY "
-    "KapanName), NOT GROUP BY. Then present the first ~30 rows as a Markdown "
-    "table and tell the user the full data is in the Excel/PDF download. "
-    "Aggregate ONLY if the user explicitly asked for totals or a summary."
-)
 
 
-def _all_sql_aggregated(sql_used: list[str]) -> bool:
-    """True if EVERY executed query was a GROUP BY aggregate - i.e. the model
-    never pulled the detail rows at all. (Checking only the LAST query would
-    false-positive on the good pattern 'detail query, then a small total for
-    the headline'.)"""
-    return bool(sql_used) and all("group by" in s.lower() for s in sql_used)
 
 
-# How many times, in ONE turn, we force a stalled model to actually run its
-# query before giving up. Weak models (e.g. llama-4-scout) sometimes ignore the
-# first push, so we allow a second.
-_MAX_EXECUTE_NUDGES = 2
+
+
+
 
 # Output budget per model call. 1024 was too small for the mandated answer
 # format (intro + ~30-row preview table + conclusion + download pointer +
@@ -204,7 +146,7 @@ _MAX_TOKENS = settings.LLM_MAX_TOKENS
 # so it ALSO catches a fabricated Markdown table that contains no literal SELECT
 # — the exact failure that let "packet report for kapan AA" fall through to the
 # canned refusal.
-_EXECUTE_NUDGE = (
+policy.EXECUTE_NUDGE = (
     "You presented data (a table, figures, or a query) but you did NOT call "
     "run_sql, so nothing you showed is real. You MUST call the run_sql tool "
     "NOW to fetch the actual rows from the database, then answer ONLY from the "
@@ -215,10 +157,6 @@ _EXECUTE_NUDGE = (
 )
 
 
-def _has_data_visual(widgets: list[dict]) -> bool:
-    """True if a chart/dashboard was emitted — it presents numbers like a table,
-    so an ungrounded one is as fabricated as an invented table."""
-    return any((w or {}).get("kind") in ("chart", "dashboard") for w in widgets)
 
 
 def ask_groq(
@@ -354,10 +292,10 @@ def ask_groq(
             if not answer.strip():
                 if data_rows:
                     break
-                if execute_nudges < _MAX_EXECUTE_NUDGES:
+                if execute_nudges < policy.MAX_EXECUTE_NUDGES:
                     execute_nudges += 1
                     force_tool = True
-                    messages.append({"role": "user", "content": _EXECUTE_NUDGE})
+                    messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
                     emit("Running the query…")
                     continue
                 break
@@ -380,25 +318,25 @@ def ask_groq(
             # refusal the user sees ("I couldn't pull that…"). This catches the
             # common weak-model quirk where it prints a clean Markdown table with
             # no literal SELECT text, which the old SQL-text-only check missed.
-            # Fires up to _MAX_EXECUTE_NUDGES times (weak models may need a second
+            # Fires up to policy.MAX_EXECUTE_NUDGES times (weak models may need a second
             # push); force_tool makes the next request require a tool call.
             ungrounded_fabrication = (
                 not sql_used
                 and not file_grounded
                 and (
-                    _looks_like_unrun_sql(answer)
+                    policy.looks_like_unrun_sql(answer)
                     or looks_like_data_table(answer)
-                    or _has_data_visual(widgets)
+                    or policy.has_data_visual(widgets)
                 )
             )
-            if ungrounded_fabrication and execute_nudges < _MAX_EXECUTE_NUDGES:
+            if ungrounded_fabrication and execute_nudges < policy.MAX_EXECUTE_NUDGES:
                 execute_nudges += 1
                 force_tool = True
                 # Drop any fabricated widget from this stalled round so it can't
                 # be shown; the forced round rebuilds it from real rows.
-                widgets = [w for w in widgets if not _has_data_visual([w])]
+                widgets = [w for w in widgets if not policy.has_data_visual([w])]
                 messages.append({"role": "assistant", "content": answer})
-                messages.append({"role": "user", "content": _EXECUTE_NUDGE})
+                messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
                 emit("Running the query…")
                 continue
             # Report-detail guard (client-flagged): "…report…" question answered
@@ -408,14 +346,14 @@ def ask_groq(
             if (
                 not nudged_report_detail
                 and not file_grounded
-                and _all_sql_aggregated(sql_used)
-                and REPORT_ASKED_RE.search(question or "")
-                and not _SUMMARY_INTENT_RE.search(question or "")
+                and policy.all_sql_aggregated(sql_used)
+                and policy.REPORT_ASKED_RE.search(question or "")
+                and not policy.SUMMARY_INTENT_RE.search(question or "")
             ):
                 nudged_report_detail = True
                 force_tool = True
                 messages.append({"role": "assistant", "content": answer})
-                messages.append({"role": "user", "content": REPORT_DETAIL_NUDGE})
+                messages.append({"role": "user", "content": policy.REPORT_DETAIL_NUDGE})
                 emit("Building the detailed report…")
                 continue
             # Dashboard guard: the question asked for analytics/overview/
@@ -428,11 +366,11 @@ def ask_groq(
                 and not nudged_dashboard
                 and sql_used
                 and not file_grounded
-                and DASHBOARD_ASKED_RE.search(question or "")
+                and policy.DASHBOARD_ASKED_RE.search(question or "")
             ):
                 nudged_dashboard = True
                 messages.append({"role": "assistant", "content": answer})
-                messages.append({"role": "user", "content": DASHBOARD_NUDGE})
+                messages.append({"role": "user", "content": policy.DASHBOARD_NUDGE})
                 emit("Building your dashboard…")
                 continue
             log_interaction(question, sql_used, last_row_count)
