@@ -46,7 +46,11 @@ def test_failover_moves_to_the_next_key():
 
     assert out["answer"] == "ok", "the turn must succeed on the backup key"
     assert len(tried) == 2, "it must actually try the second key"
-    assert "key-one" in gb._EXHAUSTED_KEYS, "the dead key must be remembered"
+    # Exhaustion is tracked per (MODEL, key): the free-tier quota is per project
+    # per model, so a key that ran out on one model still has capacity on the
+    # next one. Recording the key alone threw that capacity away.
+    assert ("gemini-2.5-flash", "key-one") in gb._EXHAUSTED_KEYS,         "the dead (model, key) pair must be remembered"
+    assert "key-one" not in gb._EXHAUSTED_KEYS,         "a bare key must NOT be marked dead for every model"
     gb._EXHAUSTED_KEYS.clear()
 
 

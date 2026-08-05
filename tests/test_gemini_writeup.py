@@ -22,9 +22,12 @@ class _Boom(Exception):
 @pytest.fixture(autouse=True)
 def _clean_key_state(monkeypatch):
     # _EXHAUSTED_KEYS is process-global; leaking it between tests would make
-    # later cases silently skip keys.
+    # later cases silently skip combinations.
     monkeypatch.setattr(gb, "_EXHAUSTED_KEYS", set())
-    monkeypatch.setattr(gb, "_usable_keys", lambda: ["k1", "k2", "k3"])
+    # Rotation is over (model, key) pairs now, not keys: the free-tier quota is
+    # per project per MODEL, so extra keys in one project share a pool and only
+    # a different model recovers capacity.
+    monkeypatch.setattr(gb, "_attempts", lambda m: [("m", "k1"), ("m", "k2"), ("m", "k3")])
 
 
 def _client_that(behaviour):
@@ -53,7 +56,7 @@ def test_write_up_rotates_to_the_next_key_on_quota_error(monkeypatch):
         return _ok("In July 2026 MFG - 1 finished 305 packets.")
 
     monkeypatch.setattr(gb, "_client", _client_that(behaviour))
-    answer, ok = gb._write_up([], "sys", "gemini-3-flash-preview", "k1")
+    answer, ok = gb._write_up([], "sys", "m", "k1")
 
     assert ok is True
     assert "305 packets" in answer
@@ -68,7 +71,7 @@ def test_the_exhausted_key_is_remembered(monkeypatch):
 
     monkeypatch.setattr(gb, "_client", _client_that(behaviour))
     gb._write_up([], "sys", "m", "k1")
-    assert "k1" in gb._EXHAUSTED_KEYS, "a dead key must not be retried all turn"
+    assert ("m", "k1") in gb._EXHAUSTED_KEYS, "a dead pair must not be retried all turn"
 
 
 def test_a_real_bug_does_not_burn_every_key(monkeypatch):
@@ -84,7 +87,7 @@ def test_a_real_bug_does_not_burn_every_key(monkeypatch):
     answer, ok = gb._write_up([], "sys", "m", "k1")
 
     assert ok is False and answer == ""
-    assert seen == ["k1"], "a non-quota error must stop after the first key"
+    assert seen == ["k1"], "a non-quota error must stop after the first attempt"
 
 
 def test_all_keys_exhausted_reports_failure_rather_than_raising(monkeypatch):

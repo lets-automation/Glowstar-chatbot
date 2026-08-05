@@ -12,6 +12,7 @@ provider-specific call + function-calling format differ.
 """
 
 import base64
+from functools import lru_cache
 
 from google import genai
 from google.genai import types
@@ -23,10 +24,14 @@ from app.config import settings
 from app.core.logging_util import log_interaction, log_provider_error
 
 
-# Keys the free tier has already rejected today (quota/permission). Skipped on
-# later turns so one dead key can't keep costing every request a failed attempt.
+# (model, key) pairs the free tier has already rejected today. Skipped on later
+# turns so a dead combination can't keep costing every request a failed attempt.
 # Cleared on restart — the daily quota resets anyway.
-_EXHAUSTED_KEYS: set[str] = set()
+#
+# Keyed by MODEL as well as key because the free-tier quota is per model:
+# the 429 reports GenerateRequestsPerMinutePerProjectPerModel. Tracking keys
+# alone marked a key dead for every model once ONE model ran out.
+_EXHAUSTED_KEYS: set[tuple[str, str]] = set()
 
 
 def _is_quota_error(exc: Exception) -> bool:
@@ -39,20 +44,41 @@ def _is_quota_error(exc: Exception) -> bool:
     )
 
 
+@lru_cache(maxsize=16)
+def _client_for(key: str) -> genai.Client:
+    """
+    One client per API key, kept alive for the process.
+
+    Cached because mid-turn model rotation builds a client per swap, and the SDK
+    shares an underlying HTTP transport between Client objects: when a discarded
+    one was garbage-collected it closed that transport for the others, and the
+    next call died with "Cannot send a request, as the client has been closed".
+    """
+    return genai.Client(api_key=key)
+
+
 def _client(api_key: str | None = None) -> genai.Client:
     key = api_key or settings.GEMINI_API_KEY
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not set in .env.")
-    return genai.Client(api_key=key)
+    return _client_for(key)
 
 
-def _usable_keys() -> list[str]:
-    """Configured keys minus the ones already exhausted today (all, if all are)."""
-    keys = settings.gemini_keys()
-    if not keys:
-        raise RuntimeError("GEMINI_API_KEY is not set in .env.")
-    fresh = [k for k in keys if k not in _EXHAUSTED_KEYS]
-    return fresh or keys  # all exhausted -> retry them (the quota may have reset)
+def _attempts(primary_model: str) -> list[tuple[str, str]]:
+    """
+    (model, key) pairs to try, in order, skipping combinations already refused.
+
+    MODEL first, key second: the free-tier limit is per project per MODEL, and
+    extra keys in the same project share one pool - so moving to the next model
+    is what actually recovers capacity. Rotating keys alone was the old
+    behaviour and could not finish a single report question.
+    """
+    fresh, spent = [], []
+    for model in settings.gemini_model_chain():
+        for key in settings.gemini_keys():
+            (spent if (model, key) in _EXHAUSTED_KEYS else fresh).append((model, key))
+    # Everything spent -> try again anyway; a per-MINUTE bucket may have refilled.
+    return fresh or spent
 
 
 def _to_schema(js: dict) -> types.Schema:
@@ -134,18 +160,20 @@ def ask_gemini(
     transparently move to the next one on a quota/permission error and remember
     the dead key for the rest of the process, so a demo keeps working.
     """
-    keys = _usable_keys()
+    attempts = _attempts(model)
     last_exc: Exception | None = None
-    for idx, key in enumerate(keys):
+    for idx, (try_model, key) in enumerate(attempts):
         try:
-            return _ask_gemini_once(question, model, history, on_event, file_context, key)
+            return _ask_gemini_once(
+                question, try_model, history, on_event, file_context, key
+            )
         except Exception as exc:  # noqa: BLE001 - decide by error kind below
             if not _is_quota_error(exc):
-                raise  # a real bug: don't burn the other keys on it
-            _EXHAUSTED_KEYS.add(key)
+                raise  # a real bug: don't burn the other combinations on it
+            _EXHAUSTED_KEYS.add((try_model, key))
             last_exc = exc
-            log_provider_error("gemini", model, exc)
-            if idx + 1 < len(keys) and on_event:
+            log_provider_error("gemini", try_model, exc)
+            if idx + 1 < len(attempts) and on_event:
                 on_event("Switching to a backup connection…")
 
     # EVERY key is exhausted. Return the friendly provider message (HTTP 200,
@@ -179,22 +207,25 @@ def _write_up(contents, system, model, api_key: str | None, on_event=None) -> tu
     rotation is instant, and making a user wait 16 seconds mid-answer is its own
     kind of failure.
     """
-    tried = [api_key] if api_key else []
-    tried += [k for k in _usable_keys() if k != api_key]
+    # Start with the model/key that ran the queries (its cache is warm), then
+    # fall back across the other MODELS - the per-minute bucket is per model, so
+    # a different model is what actually has capacity left.
+    tried = [(model, api_key)] if api_key else []
+    tried += [pair for pair in _attempts(model) if pair != (model, api_key)]
 
-    for idx, key in enumerate(tried):
+    for idx, (try_model, key) in enumerate(tried):
         try:
             final = _client(key).models.generate_content(
-                model=model,
+                model=try_model,
                 contents=contents,
                 config=types.GenerateContentConfig(system_instruction=system, temperature=0),
             )
             return (final.text or "").strip(), True
         except Exception as exc:  # noqa: BLE001 - decide by error kind
-            log_provider_error("gemini", model, exc)
+            log_provider_error("gemini", try_model, exc)
             if not _is_quota_error(exc):
-                return "", False        # a real bug: another key won't help
-            _EXHAUSTED_KEYS.add(key)
+                return "", False        # a real bug: another model won't help
+            _EXHAUSTED_KEYS.add((try_model, key))
             if idx + 1 < len(tried) and on_event:
                 on_event("Switching to a backup connection…")
     return "", False
@@ -247,16 +278,44 @@ def _ask_gemini_once(
     execute_nudges = 0        # how many times we've forced a stalled model to run its SQL
     dashboard_built = False
 
+    # MID-TURN MODEL ROTATION.
+    #
+    # The free-tier limit is 5 requests/minute PER MODEL, and one report question
+    # spends ~6 model calls - so a single model cannot finish one. Restarting the
+    # turn on another model would throw away every query already run (and spend
+    # the same budget again), so instead we swap the model/key for the NEXT ROUND
+    # and carry the conversation forward untouched: `contents` is just Gemini
+    # Content objects, it does not belong to any one model.
+    #
+    # Rotating models, not keys, is the part that matters: the quota is per
+    # project per model, so extra keys in one project share a single pool.
+    pairs = [(model, api_key)] + [p for p in _attempts(model) if p != (model, api_key)]
+    pair_i = 0
+    cur_model, cur_key = pairs[0]
+
     for _ in range(tools.MAX_TOOL_ROUNDS):
         try:
-            resp = client.models.generate_content(
-                model=model, contents=contents, config=config
-            )
+            # Inner loop so a rotation does NOT consume one of the tool rounds -
+            # a swap is a retry of the same step, not a step of its own.
+            while True:
+                try:
+                    resp = client.models.generate_content(
+                        model=cur_model, contents=contents, config=config
+                    )
+                    break
+                except Exception as exc:  # noqa: PERF203
+                    if not (_is_quota_error(exc) and pair_i + 1 < len(pairs)):
+                        raise
+                    _EXHAUSTED_KEYS.add((cur_model, cur_key))
+                    log_provider_error("gemini", cur_model, exc)
+                    pair_i += 1
+                    cur_model, cur_key = pairs[pair_i]
+                    client = _client(cur_key)
+                    emit("Switching to a backup connection…")
         except Exception as exc:
-            # A quota/permission failure must RAISE so ask_gemini can fail over to
-            # the next API key (returning "busy" here would strand the user on a
-            # dead key). Only do that while nothing useful has been produced yet;
-            # mid-answer we keep the partial result rather than redo the work.
+            # Every model/key is spent. Raise only while nothing useful exists,
+            # so ask_gemini can report it; mid-answer we keep the partial result
+            # rather than redo the work.
             if _is_quota_error(exc) and not sql_used:
                 raise
             log_interaction(question, sql_used, last_row_count, error=str(exc))
@@ -463,7 +522,9 @@ def _ask_gemini_once(
             ],
         )
     )
-    answer, synth_ok = _write_up(contents, system, model, api_key, on_event)
+    # cur_model/cur_key, not the originals: if the loop rotated, the original
+    # pair is exhausted and starting there would waste an attempt on a dead one.
+    answer, synth_ok = _write_up(contents, system, cur_model, cur_key, on_event)
     if not synth_ok:
         log_interaction(question, sql_used, last_row_count,
                         error="write-up call failed on every key")

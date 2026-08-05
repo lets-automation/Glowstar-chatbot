@@ -51,6 +51,35 @@ class Settings:
     GEMINI_API_KEY_3: str = os.getenv("GEMINI_API_KEY_3", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+    # FALLBACK MODELS - the free tier's real escape hatch.
+    #
+    # The 429 names its own quota id: GenerateRequestsPerMinutePerProjectPerModel
+    # (limit 5/min, 20/day). It is scoped PER MODEL, so every model carries its
+    # own budget - but it is also per PROJECT, so extra API KEYS in the same
+    # project share one pool and rotating them buys nothing. Rotating MODELS
+    # does. Verified: gemini-2.5-flash answered in 1.9s while gemini-3-flash was
+    # still exhausted.
+    #
+    # One report question costs ~6 calls against a 5/min limit, so a single model
+    # cannot finish one. Three models make it comfortable.
+    # Ordered fastest-first (measured: 3.1-flash-lite 1.0s, 2.5-flash 1.9s,
+    # 3-flash-preview 19.5s). All three were confirmed to support tool calling -
+    # a model without it returns chat text and zero data.
+    GEMINI_FALLBACK_MODELS: str = os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-2.5-flash,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-2.0-flash",
+    )
+
+    def gemini_model_chain(self) -> list[str]:
+        """The configured model first, then the fallbacks, de-duplicated."""
+        chain, seen = [], set()
+        for m in [self.GEMINI_MODEL, *self.GEMINI_FALLBACK_MODELS.split(",")]:
+            m = m.strip()
+            if m and m not in seen:
+                seen.add(m)
+                chain.append(m)
+        return chain
+
     def gemini_keys(self) -> list[str]:
         """All configured Gemini keys, in priority order, de-duplicated."""
         raw = [self.GEMINI_API_KEY, *self.GEMINI_API_KEYS.split(","),
