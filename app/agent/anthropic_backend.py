@@ -123,7 +123,8 @@ def ask_anthropic(
     last_row_count = 0
     widgets: list[dict] = []  # visuals emitted via show_widget, shown to the user
     data_columns: list[str] = []  # columns/rows from the LAST successful run_sql,
-    data_rows: list[dict] = []    # captured so export uses the exact data shown
+    data_rows: list[dict] = []
+    data_sections: list[dict] = []  # every result, for a multi-sheet export    # captured so export uses the exact data shown
 
     execute_nudges = 0        # forced run-the-query rounds used (grounding guard)
     nudged_report_detail = False  # one corrective round if a "report" came back aggregated
@@ -252,6 +253,7 @@ def ask_anthropic(
                 "widgets": widgets,
                 "data_columns": data_columns,
                 "data_rows": data_rows,
+        "data_sections": data_sections,
                 "file_grounded": file_grounded,
             }
 
@@ -319,6 +321,7 @@ def ask_anthropic(
                     cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
+                    result_capture.add_section(data_sections, cols_full, rows_full)
             tool_results.append(
                 {
                     "type": "tool_result",
@@ -332,13 +335,7 @@ def ask_anthropic(
     messages.append(
         {
             "role": "user",
-            "content": (
-                "Give your best final answer now in plain text, based on what you "
-                "found. If you could NOT find the requested data, tell the user "
-                "plainly that this information is not tracked in the system "
-                "(e.g. 'Sales are not recorded in this system'). Do NOT say you "
-                "couldn't complete the request."
-            ),
+            "content": policy.WRITE_UP_PROMPT,
         }
     )
     synth_ok = True
@@ -376,5 +373,6 @@ def ask_anthropic(
         "ok": synth_ok,
         "data_columns": data_columns,
         "data_rows": data_rows,
+        "data_sections": data_sections,
         "file_grounded": file_grounded,
     }

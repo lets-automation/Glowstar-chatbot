@@ -494,6 +494,12 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
         # Exact rows behind the answer — exported as a stable snapshot (no re-run).
         "data_columns": export_columns,
         "data_rows": export_rows,
+        # EVERY query result from this turn, one per section, so a multi-part
+        # report exports as a multi-sheet workbook. Without this the download
+        # carried only the single biggest result: the client asked for a full
+        # report, saw production + damage + bonus + GIA in the chat, and got an
+        # Excel file containing production alone.
+        "data_sections": result.get("data_sections") or [],
     }
 
 

@@ -39,6 +39,28 @@ def is_lookup(columns: list[str]) -> bool:
     return len(columns or []) <= 1
 
 
+def add_section(sections: list[dict], columns: list[str], rows: list) -> None:
+    """
+    Record one query result as an exportable SECTION.
+
+    A "full report" runs several queries - production, damage, bonus, GIA - and
+    the chat answer narrates all of them. Only ONE of them used to survive into
+    the Excel file, because the export was built from the single `better()`
+    winner: the client downloaded a 318-row production sheet with the bonus, GIA
+    and damage sections missing entirely.
+
+    Every non-empty, non-lookup result is kept so the workbook can carry one
+    sheet per section. Exact duplicates are dropped - models re-run the same
+    query after a nudge, and a duplicated sheet reads as a mistake.
+    """
+    if not rows or is_lookup(columns):
+        return
+    for existing in sections:
+        if existing["columns"] == columns and len(existing["rows"]) == len(rows):
+            return
+    sections.append({"columns": list(columns), "rows": rows})
+
+
 def better(new_cols: list[str], new_rows: list, cur_cols: list[str], cur_rows: list) -> bool:
     """
     Should the new result replace the one held so far?

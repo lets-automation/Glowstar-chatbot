@@ -273,6 +273,7 @@ def _ask_gemini_once(
     widgets: list[dict] = []
     data_columns: list[str] = []
     data_rows: list[dict] = []
+    data_sections: list[dict] = []  # every result, for a multi-sheet export
     nudged_dashboard = False  # one corrective round if a requested dashboard was skipped
     nudged_report_detail = False  # one corrective round if a "report" came back aggregated
     execute_nudges = 0        # how many times we've forced a stalled model to run its SQL
@@ -439,6 +440,7 @@ def _ask_gemini_once(
                 "widgets": widgets,
                 "data_columns": data_columns,
                 "data_rows": data_rows,
+        "data_sections": data_sections,
                 "file_grounded": file_grounded,
             }
 
@@ -501,6 +503,7 @@ def _ask_gemini_once(
                     cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
+                    result_capture.add_section(data_sections, cols_full, rows_full)
             responses.append(
                 types.Part.from_function_response(name=name, response={"result": result_text})
             )
@@ -512,12 +515,7 @@ def _ask_gemini_once(
             role="user",
             parts=[
                 types.Part(
-                    text=(
-                        "Give your best final answer now in plain text, based on what "
-                        "you found. If you could NOT find the requested data, tell the "
-                        "user plainly that it is not tracked in the system. Do NOT say "
-                        "you couldn't complete the request."
-                    )
+                    text=policy.WRITE_UP_PROMPT
                 )
             ],
         )
@@ -550,5 +548,6 @@ def _ask_gemini_once(
         "ok": synth_ok,
         "data_columns": data_columns,
         "data_rows": data_rows,
+        "data_sections": data_sections,
         "file_grounded": file_grounded,
     }

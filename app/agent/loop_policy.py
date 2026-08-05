@@ -104,6 +104,28 @@ REPORT_DETAIL_NUDGE = (
 )
 
 
+# The final "stop calling tools and write the answer" instruction.
+#
+# It MUST re-state the SUGGESTIONS contract. The rules block asks every answer to
+# end with a `SUGGESTIONS: a | b | c` line, which postprocess turns into the
+# follow-up buttons - but this write-up call is a fresh instruction at the end of
+# a long conversation, and models follow the last thing they were told. All three
+# backends omitted it, so every answer that came through this path (which is most
+# of them now) silently lost its follow-ups. Reported by the client: "it doesn't
+# give follow up question like if they want any other report".
+WRITE_UP_PROMPT = (
+    "Give your best final answer now in plain text, based on what you found. "
+    "If you could NOT find the requested data, tell the user plainly that this "
+    "information is not tracked in the system (e.g. 'Sales are not recorded in "
+    "this system'). Do NOT say you couldn't complete the request.\n\n"
+    "You MUST end your reply with one line of follow-ups, exactly in this form:\n"
+    "SUGGESTIONS: <short follow-up 1> | <short follow-up 2> | <short follow-up 3>\n"
+    "Make them the natural NEXT questions for what you just showed - a different "
+    "period, a breakdown by employee/kapan/department, or a related report the "
+    "same data supports. Keep each under about 8 words."
+)
+
+
 def looks_like_unrun_sql(text: str) -> bool:
     """True if the reply EMBEDS a SELECT query — i.e. the model wrote the SQL in
     its answer instead of calling the run_sql tool. Some models (notably

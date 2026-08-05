@@ -78,3 +78,28 @@ def test_no_false_denial_when_nothing_was_queried(backend):
 def test_capture_uses_the_shared_rule(backend):
     # Which result counts as "the answer" - the lookup-shown-as-report bug.
     assert "result_capture.better(" in _src(backend)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_the_write_up_asks_for_follow_up_suggestions(backend):
+    """
+    The rules require every answer to end with `SUGGESTIONS: a | b | c`, which
+    postprocess turns into the follow-up buttons. The forced write-up call is a
+    fresh instruction at the end of a long conversation, and models follow the
+    last thing they were told - all three backends omitted it, so every answer
+    coming through that path silently lost its follow-ups.
+
+    Client report: "it doesn't give follow up question like if they want any
+    other report".
+    """
+    assert "policy.WRITE_UP_PROMPT" in _src(backend), (
+        f"{backend} rolls its own write-up prompt - it will drift and lose SUGGESTIONS"
+    )
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_every_section_is_captured_for_export(backend):
+    """A multi-part report must export every section, not just the biggest."""
+    src = _src(backend)
+    assert "result_capture.add_section(" in src, f"{backend} drops report sections"
+    assert '"data_sections"' in src, f"{backend} does not return the sections"

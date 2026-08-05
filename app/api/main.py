@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from app.agent import access_guard, date_gate, smalltalk_gate
 from app.artifacts.charts import to_chart
-from app.artifacts.excel import to_excel
+from app.artifacts.excel import to_excel, to_excel_sections
 from app.artifacts.pdf import to_pdf
 from app.config import settings
 from app.core import auth, history
@@ -207,6 +207,10 @@ class ExportRowsRequest(BaseModel):
     # force a giant in-memory file build (the SQL path is capped; this wasn't).
     columns: list[str] = []
     rows: list[dict] = Field(..., max_length=5000)
+    # Every section of a multi-part report ({columns, rows} each), so a "full
+    # report" exports one sheet per section instead of only the biggest result.
+    # Optional: older clients and single-result answers just send rows.
+    sections: list[dict] = Field(default_factory=list, max_length=20)
     format: str = Field("excel", pattern="^(excel|pdf|chart)$")
     title: str = "Report"
     x_col: str | None = None
@@ -632,6 +636,22 @@ def export_rows(req: ExportRowsRequest, user: dict = Depends(enforce_rate_limit)
             y_col = req.y_col or columns[-1]
             path = to_chart(rows, x_col, y_col, f"export-{uid}.png", title=req.title)
             return _download(path, "image/png", "export.png")
+
+        # Multi-section report -> one sheet per section. PDF/chart stay
+        # single-result: a chart of several unrelated result sets is meaningless.
+        if len(req.sections) > 1:
+            clean_sections = []
+            for sec in req.sections:
+                s_rows = sec.get("rows") or []
+                if not s_rows:
+                    continue
+                s_cols, s_rows = sanitize_export(
+                    sec.get("columns") or list(s_rows[0].keys()), s_rows
+                )
+                clean_sections.append({"columns": s_cols, "rows": s_rows})
+            if len(clean_sections) > 1:
+                path = to_excel_sections(clean_sections, f"export-{uid}.xlsx")
+                return _download(path, _EXCEL_MEDIA, "export.xlsx")
 
         path = to_excel(columns, rows, f"export-{uid}.xlsx")
         return _download(path, _EXCEL_MEDIA, "export.xlsx")

@@ -179,11 +179,15 @@ export async function uploadFile(file) {
 
 // Export the EXACT rows the chat already showed as Excel/PDF — a stable
 // snapshot (no query re-run), so the file is identical every download.
-export async function exportRows(columns, rows, format, title = 'Report') {
+// `sections` carries every part of a multi-part report ({columns, rows} each)
+// so a "full report" downloads as one sheet per section. A full report shows
+// production + damage + bonus + GIA in the chat; before this the Excel file
+// held only the single biggest result.
+export async function exportRows(columns, rows, format, title = 'Report', sections = []) {
   const res = await fetch(`${API_URL}/export_rows`, {
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ columns, rows, format, title }),
+    body: JSON.stringify({ columns, rows, format, title, sections }),
   })
   handle401(res.status)
   if (!res.ok) throw new Error('Export failed')

