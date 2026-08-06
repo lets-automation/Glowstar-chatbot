@@ -11,5 +11,5 @@ The Aastha ERP is mostly STRUCTURED, numeric data (weights, rates, counts,
 dates), which Text-to-SQL already answers well. Semantic search is only
 worth enabling if the client asks meaning-based questions over free-text
 columns (e.g. plan remarks, comments). Enable it only if a real need shows
-up - see SEMANTIC.md.
+up - see docs/SEMANTIC.md.
 """

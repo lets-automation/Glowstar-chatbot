@@ -66,7 +66,28 @@ body {
 .markdown pre code { background: none; border: none; padding: 0; }
 
 /* Tables — the headline feature for SQL results. */
-.markdown .table-wrap { overflow-x: auto; margin: 4px 0 12px; }
+.markdown .table-block { margin: 4px 0 12px; }
+.markdown .table-wrap { overflow-x: auto; }
+.markdown .table-block > .table-wrap { margin: 0; }
+
+/* Duplicate scrollbar ABOVE a wide table (see ScrollableTable in Thread.jsx),
+   so hidden right-hand columns are discoverable without scrolling to the
+   bottom of a long result first. Empty strip — the inner div only carries the
+   table's full width so the browser draws a proportional thumb. */
+.markdown .table-scroll-top {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  margin-bottom: 3px;
+}
+.markdown .table-scroll-top > div { height: 1px; }
+/* WebKit hides overlay scrollbars on an empty strip unless given a size. */
+.markdown .table-scroll-top::-webkit-scrollbar { height: 8px; }
+.markdown .table-scroll-top::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.markdown .table-scroll-top::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 .markdown table {
   width: 100%;
   border-collapse: collapse;

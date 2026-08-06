@@ -11,6 +11,7 @@ formatted) live in groq_backend.py and anthropic_backend.py.
 
 import json
 import re
+from functools import lru_cache
 
 from sqlalchemy import text
 
@@ -22,6 +23,7 @@ from app.database.connection import get_engine
 from app.database.runner import run_select
 from app.schema import extractor
 from app.schema.context import build_schema_context
+from app.schema.glossary import render_data_notes
 from app.schema.router import select_tables
 
 # Max tool-use rounds before we force a final answer. Higher now because the
@@ -106,6 +108,22 @@ RULES:
   find_tables when the data is already in a shown table. Fewer steps = faster.
 - If a run_sql query succeeds and returns data, ANSWER from it - do NOT re-run
   variations of the same query.
+- UNKNOWN / NOT-TRACKED QUESTIONS - NEVER dead-end the user. Business people ask
+  things this ERP was never built to answer (a packet's CITY, profit, sale price,
+  a customer order...). When the exact thing is missing, work through this ladder
+  and NEVER invent a number or a column:
+    1. SEARCH FIRST before concluding it's absent - use find_tables("keyword") and
+       get_table_columns on anything promising. Most "we don't have that" answers
+       are really "I didn't look"; the glossary shows only the tables picked for
+       this question, not all ~260.
+    2. If it truly isn't there, say so in ONE plain line naming what is missing
+       ("the system doesn't record which city a packet is in").
+    3. THEN GIVE THE NEAREST THING IT DOES HAVE, with real numbers - the closest
+       available measure, dimension or period. A "where is it?" question still
+       has a good answer: its current stage/department, or the party holding it.
+    4. Offer 1-2 follow-ups (via the SUGGESTIONS line) for what you CAN answer.
+  A bare "I don't have that information" with nothing after it is a FAILED answer:
+  always pair the honest limit with the closest real data.
 - FALLBACK only: the database has 239 tables. If what you need is genuinely NOT
   in the shown schema (e.g. some employee/party/supplier detail not listed),
   THEN use find_tables("keyword") to locate the table and get_table_columns to
@@ -224,8 +242,59 @@ RULES:
   asked (e.g. for "top employees by incentive": name, department, total
   incentive, and the points/transaction count; for damage: kapan, employee name,
   department, damage type, points, amount, date). Prefer ONE richer query with
-  JOINs over a bare single-column answer. Keep it to a reasonable ~4-8 columns -
-  relevant context, not every column in the table.
+  JOINs over a bare single-column answer.
+- MATCH THEIR REPORT STYLE (this is how the client's own ERP reports are written -
+  their real GIA query is the model to copy). Their reports are WIDE and
+  SELF-EXPLANATORY, not minimal:
+    * MANY columns, not few. ~10-20 is normal for a report; do NOT trim to 4-8. A
+      diamond report shows the WHOLE quality picture together - Shape, Color,
+      Purity (clarity), Cut, Polish, Symmetry, Florecent, weight, amount, lab,
+      date - not just a name and a number. Include every attribute belonging to
+      the thing reported; drop only raw internal ids and dead columns.
+    * SIDE-BY-SIDE when two versions of the same measure exist (in-house PLS grade
+      vs lab GIA grade, planned vs actual, issued vs received, rough vs polished):
+      put BOTH as adjacent labelled columns, one row per item.
+    * ADD THE DERIVED COLUMN they would compute themselves - the comparison flag or
+      variance that makes the report actionable (e.g. HasChange = YES when any
+      grade differs; weight loss; yield %; days pending). One CASE expression is
+      usually enough, and it is often the column the manager actually reads.
+    * ALWAYS carry the identifying columns (KapanName + PacketNo, or employee name
+      + department) so a row can be traced back in their ERP.
+    * ORDER rows the way the report is read (KapanName, PacketNo; or the ranking
+      measure DESC).
+  A thin table is the single most common complaint about this assistant: when in
+  doubt, include the extra attribute column rather than leaving it out.
+- "REPORT OF <ENTITY>" = A FULL 360 PROFILE, NOT ONE SECTION. When the user asks
+  for the report of a NAMED THING - an employee/karigar ("past month report of
+  employee M4117"), a kapan, a department, a party, a packet - they expect the
+  SAME all-round profile their ERP prints: every area where that entity has data,
+  each as its own small titled section, in ONE answer. Giving only one or two
+  areas is the "thin report" failure.
+  Work out the sections from the schema, then run ONE query per section and lead
+  with a 1-2 line summary. For an EMPLOYEE the sections are, in this order:
+    1. WHO - name, code, department, active (tblEmployee)
+    2. PRODUCTION / MANUFACTURED - packets they made and the weight: their MFG
+       rows in tblPlanMaster (RapVer='MFG', EmpId, CreatDate) and/or
+       tblPointRateLabour (Emp_ID, COUNT(DISTINCT Packet_ID), SUM(Weight))
+    3. PROCESSES HANDLED - tblPacketHistory (EmpId, Process, ReciveTime)
+    4. WORK ISSUED TO THEM - tblPacketIssue / tblIssuedPacketDetail
+    5. QUALITY - GIA regrades on packets they made, tblRepairCommentVision flags
+    6. DAMAGE - tblPlanReport (IsDamageReport=1, EmpID)
+    7. BONUS + INCENTIVE - BonusAmount (tblPointRateLabour) and
+       CreditPoints/DebitPoints (tblIncentiveAmount).  NEVER salary/FinalLabour.
+  Apply the same idea to other entities (a KAPAN: packets, production, yield/loss,
+  damage, jangad, GIA results; a DEPARTMENT: WIP, production, issue, damage,
+  bonus). SKIP a section only when it genuinely has no rows, and SAY which
+  sections are empty rather than dropping them silently - "0 damage records" is
+  useful information. Respect the period the user gave for every section.
+- A CODE THAT DOESN'T MATCH IS USUALLY A TYPO, NOT A MISSING RECORD. Employee,
+  kapan and packet codes are typed from memory and the letter prefix is the part
+  people get wrong ("MF4167" for M4167, "m 4167", "4167"). If an exact match on a
+  code returns 0 rows, do NOT answer "no such employee" - re-query matching the
+  DIGITS, e.g. Code LIKE '%4167%'. If that finds exactly one record, use it and
+  say which code you matched ("showing M4167 - VEKARIYA DINESHBHAI"). If it finds
+  several, list them and ask which one. Only say the record doesn't exist after
+  the digit search also comes back empty.
 - REPORT = DETAIL ROWS: when the user asks to "prepare/give/make a report"
   (damage report, jangad report, stock report...), they want the DETAIL listing
   their ERP prints - one row per record with the human-readable NAMES/NUMBERS,
@@ -247,6 +316,18 @@ RULES:
   ROW GRAIN: some named reports have their OWN grain - e.g. the STOCK/YIELD report
   is one row per KAPAN. When the glossary defines a report's shape, that grain IS
   the detail: follow it and do NOT append a second packet-level listing.
+- REPORT GRAIN - READ THE QUESTION, never assume one fixed breakdown. Most data
+  here can be grouped several ways (by DEPARTMENT, by EMPLOYEE/worker, by KAPAN,
+  by PACKET, by DATE, by SHAPE/COLOUR...). Choose from the user's own words:
+    * "department wise / dept wise / which department" -> group by department
+    * "employee wise / worker wise / maker wise / karigar wise / who" -> by person
+    * "kapan wise" / "date wise / daily" / "shape wise" -> that column
+    * a NAMED entity ("Fency department", "M2139") -> filter to it, then break it
+      down one level FINER (a department -> its workers; a worker -> their packets)
+  If they did NOT say, pick the grain that answers the question best and SHOW BOTH
+  when both are genuinely useful (e.g. a per-department summary followed by the
+  per-employee detail), stating which is which. Never silently force one grain -
+  and if the choice really changes the answer, ask with a CLARIFY: line.
   ACCURATE TOTALS: take the summary line's numbers (row count, weight/amount
   totals) from the DATABASE with a COUNT/SUM - never eyeball or hand-add them
   from the shown rows (you only see a PREVIEW, so a summed-by-hand total will be
@@ -312,6 +393,20 @@ a colleague, NEVER a raw database dump. Build a substantive answer in three beat
   in your answer text as well, and never answer with only a sentence describing
   the chart ("the chart above shows...") - the user cannot read numbers off it,
   and the table is what they came for. Chart = extra, table = the answer.
+- SHOW THE THING THEY ASKED TO BREAK IT DOWN BY. If the question names a
+  dimension - "employee wise", "by department", "for each kapan", "which worker",
+  "who", "daily", or a report "of ... employees" - that column MUST APPEAR in the
+  output, whichever grain you choose. Using it only in the WHERE clause to filter
+  and then leaving it out is a half-answer: they asked to see it. So either GROUP
+  BY it, or keep the detail rows and ADD the column (e.g. the maker's name +
+  department alongside each packet). Never make the user ask twice for a column
+  they already named.
+- SUPERLATIVES COME FROM THE DATA, NEVER FROM MEMORY OR ESTIMATE. Before writing
+  "the most / highest / top / best X is ...", ORDER the query by that measure and
+  read the FIRST ROW. Do not eyeball a preview, do not average in your head, and
+  do not name a value you did not see ranked first - a confident sentence that
+  contradicts the table beside it is the worst kind of wrong answer here. If two
+  values are close, give both WITH their numbers ("G 34,078, then F 28,405").
 - Numbers for people: use thousands separators (Indian numbering where natural,
   e.g. 2,45,000), round sensibly, and include the unit or currency ONLY when you
   actually know it - never invent a currency symbol. Dates as "27 Jun 2026".
@@ -341,7 +436,7 @@ DATES (natural language):
 """
 
 
-# Company + industry background (from GLOWSTAR_KNOWLEDGE.md §7). Small enough
+# Company + industry background (from docs/GLOWSTAR_KNOWLEDGE.md §7). Small enough
 # (~35 lines) to include on every call; gives the agent identity answers ("who
 # is GlowStar?") and a mental model of the diamond pipeline. This is CONTEXT,
 # not SQL logic — table/column/value rules stay governed by the glossary.
@@ -398,12 +493,96 @@ def dynamic_schema_for(question: str) -> str:
         f"activity'.\n\n"
     )
     relevant = select_tables(question)
-    return date_line + build_schema_context(relevant)
+    return date_line + build_schema_context(relevant, question=question)
+
+
+# ---------------------------------------------------------------------------
+# THE CACHEABLE PREFIX
+#
+# Prompt caching matches a PREFIX: the provider bills the repeated head of the
+# prompt at a fraction of the normal rate, but only up to the first byte that
+# differs. So everything identical on every question must come FIRST, and
+# anything per-question must come LAST.
+#
+# One question costs several model calls (a tool round each, plus the write-up),
+# and the whole system prompt is resent every time. Measured before this split:
+# 28,015 tokens x ~6 calls for a single report question. RULES and the data
+# notes are ~19k of that and never vary - they were being re-billed at full
+# price on every round because the data notes sat AFTER the per-question schema.
+#
+# Built once at import so it is the same object, byte for byte, every call.
+# Anything appended here must be genuinely question-independent; a single
+# per-question value (a date, a table name) silently un-caches all ~19k.
+# ---------------------------------------------------------------------------
+# Small dimensions whose EXACT spellings the model would otherwise have to
+# discover with a query. Each is a short, stable list (measured: 92 departments =
+# 256 tokens, 19 stages = 23, 36 shapes = 42).
+#
+# Worth far more than those ~320 cached tokens. "give me full report of MFG - 1"
+# spent a whole round on
+#     SELECT DISTINCT DepartmentName FROM ... WHERE DepartmentName LIKE '%MFG%'
+# before it could write the real query - a round costs the entire prompt plus a
+# result that can never be cached. It also guesses badly, because the spellings
+# are not consistent: 'MFG - 1' has spaces, 'MFG-2' does not, and there is a
+# 'VL MFG -1 Checker'. That inconsistency is why the model fell back to
+# REPLACE(DepartMentName,' ',''). Handing it the real values removes the round
+# AND the guesswork.
+_DIMENSION_SOURCES = (
+    ("DEPARTMENTS", "SELECT DISTINCT Name FROM tblDepartMent "
+                    "WHERE Name IS NOT NULL AND Name <> '' ORDER BY Name"),
+    ("PROCESS STAGES (tblPlanMaster.RapVer)",
+     "SELECT DISTINCT RapVer FROM tblPlanMaster WHERE RapVer IS NOT NULL ORDER BY RapVer"),
+    ("SHAPES", "SELECT DISTINCT Shape FROM tblFinalPacket "
+               "WHERE Shape IS NOT NULL AND Shape <> '' ORDER BY Shape"),
+)
+
+
+@lru_cache(maxsize=1)
+def dimension_values() -> str:
+    """
+    The exact stored values for the small dimensions, read once per process.
+
+    Read LAZILY rather than at import: the backend imports this module while the
+    database may still be starting, and an import-time failure would silently
+    drop these lists for the whole process life. Memoised so the text stays
+    byte-identical between calls - it sits in the cached prefix, so a value that
+    varied would un-cache ~24k tokens on every question.
+    """
+    blocks = []
+    for label, sql in _DIMENSION_SOURCES:
+        try:
+            res = run_select(sql, max_rows=500)
+            if not res.get("ok") or not res["rows"]:
+                continue
+            values = [str(list(r.values())[0]).strip() for r in res["rows"]]
+            blocks.append(f"{label}: " + ", ".join(v for v in values if v))
+        except Exception:  # noqa: BLE001
+            continue  # never let this break a question; the model can still query
+    if not blocks:
+        return ""
+    return (
+        "=== EXACT STORED VALUES (use these spellings verbatim; do NOT "
+        "run a query to discover them) ===\n" + "\n".join(blocks)
+    )
+
+
+@lru_cache(maxsize=1)
+def static_prompt() -> str:
+    """The question-independent prompt head. Memoised so it is byte-stable."""
+    parts = [RULES, render_data_notes()]
+    dims = dimension_values()
+    if dims:
+        parts.append(dims)
+    return "\n\n".join(parts)
 
 
 def system_prompt_for(question: str) -> str:
-    """Rules + the question-specific schema, combined (for Groq)."""
-    return RULES + "\n\nDATABASE SCHEMA AND GLOSSARY:\n\n" + dynamic_schema_for(question)
+    """The cacheable prefix + this question's schema (for Groq/Gemini)."""
+    return (
+        static_prompt()
+        + "\n\nDATABASE SCHEMA AND GLOSSARY:\n\n"
+        + dynamic_schema_for(question)
+    )
 
 
 def routing_text(question: str, history: list[dict] | None = None) -> str:
@@ -421,7 +600,19 @@ def routing_text(question: str, history: list[dict] | None = None) -> str:
 # Rows actually shown to the LLM. The model only needs a sample to summarise;
 # sending hundreds of rows explodes token usage (and blows rate limits). The
 # FULL rows are still returned separately for export.
-MODEL_ROW_LIMIT = 50
+#
+# Kept in step with ROWS_TO_DISPLAY below. This was 50 while the rules asked the
+# model to show ~30, so 20 rows per query were sent, billed, and never used.
+# Tool results are the part of the prompt that CANNOT be cached - they are new
+# text appended to the conversation and resent on every later round of the same
+# question - so they are the expensive rows. A wide result (22 columns) measured
+# 5,027 tokens at 50 rows.
+MODEL_ROW_LIMIT = 30
+
+# How many rows the RULES instruct the model to render as a Markdown table. The
+# preview above must cover this: if the model is shown fewer rows than it is
+# told to display, it either shows less than asked or invents the difference.
+ROWS_TO_DISPLAY = 30
 
 # A downloaded report/export must be the COMPLETE detail list, so it is fetched
 # with a much higher row cap than the model-facing preview. Guards against a

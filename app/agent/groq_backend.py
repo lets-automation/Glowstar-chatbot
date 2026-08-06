@@ -11,7 +11,8 @@ import re
 from groq import Groq
 
 from app.agent import attachments as attachments_mod
-from app.agent import tools, widget
+from app.agent import loop_policy as policy
+from app.agent import result_capture, tools, widget
 from app.agent._retry import call_with_retry
 from app.agent.postprocess import looks_like_data_table
 from app.config import settings
@@ -55,101 +56,97 @@ _GROQ_TOOLS = [
 ]
 
 
+# LM Studio compiles the tool schemas into a sampling grammar and cannot handle
+# a UNION type ("type": ["number", "string"]). It answers HTTP 500
+#   NotImplemented: map: filter-mapping not implemented
+# which surfaces as a 400 and kills the whole turn before a single tool runs —
+# show_dashboard has three such unions, so EVERY question failed, not just
+# dashboard ones. Remote providers accept unions, so the rewrite below is scoped
+# to the engines that need it rather than changing the shared tool specs.
+_UNION_INTOLERANT = {"lmstudio"}
+
+
+def _collapse_union_types(node):
+    """Recursively rewrite {"type": [a, b]} to a single type.
+
+    Collapses to "string": any value can be expressed as one, and nothing is
+    lost downstream because widget.py coerces on the way in (chart values via
+    float(x), labels and tile values via str(x)).
+    """
+    if isinstance(node, dict):
+        return {
+            k: ("string" if "string" in v else (v[0] if v else "string"))
+            if k == "type" and isinstance(v, list)
+            else _collapse_union_types(v)
+            for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [_collapse_union_types(x) for x in node]
+    return node
+
+
+def _tools_for_provider():
+    """The tool specs, adjusted for engines that reject parts of JSON Schema."""
+    if settings.LLM_PROVIDER.lower() in _UNION_INTOLERANT:
+        return _collapse_union_types(_GROQ_TOOLS)
+    return _GROQ_TOOLS
+
+
+# Providers that speak the OpenAI dialect and therefore reuse this whole
+# backend — only the base_url and key differ. They are reached with the real
+# OpenAI SDK, NOT the Groq client: the Groq SDK hardcodes Groq's "/openai/v1/…"
+# request path and would 404 against them. The OpenAI client honours base_url
+# and exposes the identical chat.completions.create surface used below.
+#   provider -> (base_url attr, api-key attr, key-name for the error message)
+# A blank key-name means no key is needed (local Ollama / LM Studio).
+_OPENAI_COMPATIBLE = {
+    "ollama":   ("OLLAMA_BASE_URL",   None,                ""),
+    "lmstudio": ("LMSTUDIO_BASE_URL", None,                ""),
+    "cerebras": ("CEREBRAS_BASE_URL", "CEREBRAS_API_KEY",  "CEREBRAS_API_KEY"),
+    "nvidia":   ("NVIDIA_BASE_URL",   "NVIDIA_API_KEY",    "NVIDIA_API_KEY"),
+}
+
+
 def _client():
-    # Local Ollama: OpenAI-compatible endpoint on this machine — no key, no
-    # internet, no quota. Use the real OpenAI SDK here, NOT the Groq client:
-    # the Groq SDK hardcodes Groq's "/openai/v1/…" request path and would 404
-    # against Ollama. The OpenAI client honours base_url correctly, and exposes
-    # the identical chat.completions.create surface this backend relies on.
-    if settings.LLM_PROVIDER.lower() == "ollama":
+    provider = settings.LLM_PROVIDER.lower()
+    spec = _OPENAI_COMPATIBLE.get(provider)
+    if spec:
         from openai import OpenAI
-        return OpenAI(api_key="ollama", base_url=settings.OLLAMA_BASE_URL)
+
+        base_attr, key_attr, key_name = spec
+        key = getattr(settings, key_attr) if key_attr else provider
+        if key_name and not key:
+            raise RuntimeError(f"{key_name} is not set in .env.")
+        return OpenAI(api_key=key, base_url=getattr(settings, base_attr))
     if not settings.GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in .env.")
     return Groq(api_key=settings.GROQ_API_KEY)
 
 
-def _looks_like_unrun_sql(text: str) -> bool:
-    """True if the reply EMBEDS a SELECT query — i.e. the model wrote the SQL in
-    its answer instead of calling the run_sql tool. Some Groq models (notably
-    llama-4-scout) do this on list/ranking questions, so no query runs and the
-    user sees no data. Detecting it lets us force an actual execution."""
-    if not text:
-        return False
-    low = text.lower()
-    return "select" in low and "from" in low
 
 
-# The user asked for an analytics dashboard/overview. Weak models often answer
-# such questions in plain text and skip the show_dashboard tool entirely; when
-# this matches and no dashboard was built, we nudge one corrective round.
-DASHBOARD_ASKED_RE = re.compile(
-    r"\b(dashboards?|analytics?|overview|analysis|analyse|analyze)\b", re.IGNORECASE
-)
-
-DASHBOARD_NUDGE = (
-    "The user asked for an analytics view, but you have not called the "
-    "show_dashboard tool, so they see no dashboard. Do it NOW: if you need "
-    "more figures, run 1-3 more quick aggregate run_sql queries (e.g. a "
-    "monthly trend, a breakdown by department/category); then call "
-    "show_dashboard ONCE with 3-6 KPI tiles and 1-2 sections built ONLY from "
-    "numbers your run_sql queries actually returned. Then give a short text "
-    "summary."
-)
-
-# REPORT = DETAIL ROWS guard (client-flagged bug): the user asked for a
-# "report" but the model answered with a GROUP BY aggregate ("Top 10 kapans by
-# damage count") instead of the detail listing with joined names the rules
-# mandate. Prompt rules alone did not stop weak models, so this is enforced
-# deterministically: report-intent question + aggregated final query -> one
-# corrective round. Summary-intent words exempt (an explicitly-asked summary
-# may aggregate).
-REPORT_ASKED_RE = re.compile(r"\breports?\b", re.IGNORECASE)
-_SUMMARY_INTENT_RE = re.compile(
-    r"\b(summar(y|ies|ise|ize)|total|count|how many|average|avg|trend|"
-    r"overview|analytics?|dashboards?|charts?|graphs?)\b",
-    re.IGNORECASE,
-)
-
-REPORT_DETAIL_NUDGE = (
-    "The user asked for a REPORT. In this system a report ALWAYS means the "
-    "DETAIL listing - one row per record - NEVER a GROUP BY summary, and never "
-    "a 'Top N' ranking they didn't ask for. Your last query AGGREGATED. Re-run "
-    "ONE corrected query that lists the individual records with human-readable "
-    "columns: JOIN tblEmployee on the numeric emp id for EmployeeName + "
-    "DepartMentName where the table has one; show KapanName and PacketNo, "
-    "never raw IDs. 'X wise' means ORDER BY that column (kapan wise = ORDER BY "
-    "KapanName), NOT GROUP BY. Then present the first ~30 rows as a Markdown "
-    "table and tell the user the full data is in the Excel/PDF download. "
-    "Aggregate ONLY if the user explicitly asked for totals or a summary."
-)
 
 
-def _all_sql_aggregated(sql_used: list[str]) -> bool:
-    """True if EVERY executed query was a GROUP BY aggregate - i.e. the model
-    never pulled the detail rows at all. (Checking only the LAST query would
-    false-positive on the good pattern 'detail query, then a small total for
-    the headline'.)"""
-    return bool(sql_used) and all("group by" in s.lower() for s in sql_used)
 
 
-# How many times, in ONE turn, we force a stalled model to actually run its
-# query before giving up. Weak models (e.g. llama-4-scout) sometimes ignore the
-# first push, so we allow a second.
-_MAX_EXECUTE_NUDGES = 2
+
+
+
 
 # Output budget per model call. 1024 was too small for the mandated answer
 # format (intro + ~30-row preview table + conclusion + download pointer +
 # SUGGESTIONS) and cut listing answers off mid-table. 2048 fits it while
-# staying inside the free tier's tokens-per-minute budget.
-_MAX_TOKENS = 2048
+# staying inside the free tier's tokens-per-minute budget. Overridable via
+# LLM_MAX_TOKENS because reasoning models (Gemma 4 in LM Studio) spend part of
+# this budget on hidden thinking, leaving too little for the answer itself.
+_MAX_TOKENS = settings.LLM_MAX_TOKENS
 
 # Shown to the model when it presents data (a table, figures, or written-out
 # SQL) without having called run_sql. Generalises the old "you wrote SQL" nudge
 # so it ALSO catches a fabricated Markdown table that contains no literal SELECT
 # — the exact failure that let "packet report for kapan AA" fall through to the
 # canned refusal.
-_EXECUTE_NUDGE = (
+policy.EXECUTE_NUDGE = (
     "You presented data (a table, figures, or a query) but you did NOT call "
     "run_sql, so nothing you showed is real. You MUST call the run_sql tool "
     "NOW to fetch the actual rows from the database, then answer ONLY from the "
@@ -160,10 +157,6 @@ _EXECUTE_NUDGE = (
 )
 
 
-def _has_data_visual(widgets: list[dict]) -> bool:
-    """True if a chart/dashboard was emitted — it presents numbers like a table,
-    so an ungrounded one is as fabricated as an invented table."""
-    return any((w or {}).get("kind") in ("chart", "dashboard") for w in widgets)
 
 
 def ask_groq(
@@ -200,10 +193,12 @@ def ask_groq(
     last_row_count = 0
     widgets: list[dict] = []  # visuals emitted via show_widget, shown to the user
     data_columns: list[str] = []  # columns/rows from the LAST successful run_sql,
-    data_rows: list[dict] = []    # captured so export uses the exact data shown
+    data_rows: list[dict] = []
+    data_sections: list[dict] = []  # every result, for a multi-sheet export
 
     execute_nudges = 0         # how many times we've forced a stalled model to run its SQL
     nudged_report_detail = False  # one corrective round if a "report" came back aggregated
+    nudged_entity_report = False  # one corrective round if a 'report of X' was just the WHO row
     nudged_dashboard = False   # have we already asked it to build the requested dashboard?
     force_tool = False         # require a tool call on the NEXT request (set by the nudge)
     dashboard_built = False    # did show_dashboard actually render this turn?
@@ -218,7 +213,7 @@ def ask_groq(
                 lambda: client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    tools=_GROQ_TOOLS,
+                    tools=_tools_for_provider(),
                     tool_choice=choice,
                     temperature=0,  # deterministic: same question -> same SQL, no drift
                     max_tokens=_MAX_TOKENS,
@@ -261,10 +256,52 @@ def ask_groq(
                 "ok": False,
             }
 
+        # An OpenAI-compatible provider can return an EMPTY choices list. It is
+        # a valid HTTP 200, so no exception is raised until choices[0] raises
+        # IndexError and kills the whole turn - the user sees a server error
+        # after waiting through every query. Seen live on nvidia/gpt-oss-20b.
+        # Treat it as a round that produced nothing and let the loop continue:
+        # the data gathered so far is preserved, and the end-of-loop write-up
+        # still runs.
+        if not response.choices:
+            log_provider_error(
+                settings.LLM_PROVIDER, model,
+                RuntimeError("provider returned no choices"),
+            )
+            continue
+
         msg = response.choices[0].message
 
         if not msg.tool_calls:
             answer = msg.content or ""
+
+            # The model stopped calling tools but wrote NOTHING. Returning here
+            # hands back a blank answer, and the forced write-up further down
+            # (which asks it plainly for the final text) never runs because that
+            # only happens when the loop exhausts its rounds.
+            #
+            # This is the employee-360 failure: "report of employee M4117 for
+            # June 2026" gathered 32 rows across 2 queries and then produced no
+            # prose at all, so the user got a bare table under "I fetched the
+            # data but couldn't write the summary".
+            #
+            # WITH data, breaking out is right: the write-up call has material.
+            # With NO data it is not - breaking on the very first empty round
+            # ended the turn having run zero queries, and the turn then reported
+            # "I don't have that information in the database" about an employee
+            # who plainly exists. Nudge it to actually run the query instead,
+            # bounded by the same counter the fabrication guard uses.
+            if not answer.strip():
+                if data_rows:
+                    break
+                if execute_nudges < policy.MAX_EXECUTE_NUDGES:
+                    execute_nudges += 1
+                    force_tool = True
+                    messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
+                    emit("Running the query…")
+                    continue
+                break
+
             # Honesty on output-length truncation: finish_reason "length" means
             # the answer was cut mid-generation - never return a silently
             # sliced table as if it were the whole answer.
@@ -283,25 +320,25 @@ def ask_groq(
             # refusal the user sees ("I couldn't pull that…"). This catches the
             # common weak-model quirk where it prints a clean Markdown table with
             # no literal SELECT text, which the old SQL-text-only check missed.
-            # Fires up to _MAX_EXECUTE_NUDGES times (weak models may need a second
+            # Fires up to policy.MAX_EXECUTE_NUDGES times (weak models may need a second
             # push); force_tool makes the next request require a tool call.
             ungrounded_fabrication = (
                 not sql_used
                 and not file_grounded
                 and (
-                    _looks_like_unrun_sql(answer)
+                    policy.looks_like_unrun_sql(answer)
                     or looks_like_data_table(answer)
-                    or _has_data_visual(widgets)
+                    or policy.has_data_visual(widgets)
                 )
             )
-            if ungrounded_fabrication and execute_nudges < _MAX_EXECUTE_NUDGES:
+            if ungrounded_fabrication and execute_nudges < policy.MAX_EXECUTE_NUDGES:
                 execute_nudges += 1
                 force_tool = True
                 # Drop any fabricated widget from this stalled round so it can't
                 # be shown; the forced round rebuilds it from real rows.
-                widgets = [w for w in widgets if not _has_data_visual([w])]
+                widgets = [w for w in widgets if not policy.has_data_visual([w])]
                 messages.append({"role": "assistant", "content": answer})
-                messages.append({"role": "user", "content": _EXECUTE_NUDGE})
+                messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
                 emit("Running the query…")
                 continue
             # Report-detail guard (client-flagged): "…report…" question answered
@@ -311,15 +348,31 @@ def ask_groq(
             if (
                 not nudged_report_detail
                 and not file_grounded
-                and _all_sql_aggregated(sql_used)
-                and REPORT_ASKED_RE.search(question or "")
-                and not _SUMMARY_INTENT_RE.search(question or "")
+                and policy.all_sql_aggregated(sql_used)
+                and policy.REPORT_ASKED_RE.search(question or "")
+                and not policy.SUMMARY_INTENT_RE.search(question or "")
             ):
                 nudged_report_detail = True
                 force_tool = True
                 messages.append({"role": "assistant", "content": answer})
-                messages.append({"role": "user", "content": REPORT_DETAIL_NUDGE})
+                messages.append({"role": "user", "content": policy.REPORT_DETAIL_NUDGE})
                 emit("Building the detailed report…")
+                continue
+            # Thin entity report: "report of <entity>" answered with only the
+            # WHO row. The client asked for a full report of employee M4167 and
+            # got a one-row identity record - name, code, department - which is
+            # section 1 of several, and the Excel download was that single row.
+            if (
+                not nudged_entity_report
+                and not file_grounded
+                and sql_used
+                and policy.thin_entity_report(question, data_sections)
+            ):
+                nudged_entity_report = True
+                force_tool = True
+                messages.append({"role": "assistant", "content": answer})
+                messages.append({"role": "user", "content": policy.ENTITY_REPORT_NUDGE})
+                emit("Building the full profile…")
                 continue
             # Dashboard guard: the question asked for analytics/overview/
             # dashboard/analysis but the model finished without building one
@@ -331,11 +384,11 @@ def ask_groq(
                 and not nudged_dashboard
                 and sql_used
                 and not file_grounded
-                and DASHBOARD_ASKED_RE.search(question or "")
+                and policy.DASHBOARD_ASKED_RE.search(question or "")
             ):
                 nudged_dashboard = True
                 messages.append({"role": "assistant", "content": answer})
-                messages.append({"role": "user", "content": DASHBOARD_NUDGE})
+                messages.append({"role": "user", "content": policy.DASHBOARD_NUDGE})
                 emit("Building your dashboard…")
                 continue
             log_interaction(question, sql_used, last_row_count)
@@ -346,6 +399,7 @@ def ask_groq(
                 "widgets": widgets,
                 "data_columns": data_columns,
                 "data_rows": data_rows,
+        "data_sections": data_sections,
                 "file_grounded": file_grounded,
             }
 
@@ -424,18 +478,16 @@ def ask_groq(
                 sql_used.append(sql)
                 last_row_count = row_count
                 # Capture the FULL rows from a successful run_sql (the model only
-                # sees a sample) so export is the exact, complete data. The
-                # LARGEST result wins: don't let a smaller aggregate/breakdown the
-                # model runs AFTERWARDS clobber the detail listing — the download
-                # must be the full list (e.g. all 3,200 packets of a kapan
-                # report), not the 12-row monthly breakdown or 1-row "summary at
-                # a glance" queried after it for the prose/dashboard.
-                if (
-                    tc.function.name == "run_sql"
-                    and rows_full
-                    and len(rows_full) > len(data_rows)
+                # sees a sample) so export is the exact, complete data. Which
+                # result counts as "the answer" is decided by result_capture -
+                # one rule, shared by every backend, tested against both the bugs
+                # it fixes (a lookup shown as the report; a summary clobbering a
+                # detail listing).
+                if tc.function.name == "run_sql" and result_capture.better(
+                    cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
+                    result_capture.add_section(data_sections, cols_full, rows_full)
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result_text}
             )
@@ -445,13 +497,7 @@ def ask_groq(
     messages.append(
         {
             "role": "user",
-            "content": (
-                "Give your best final answer now in plain text, based on what you "
-                "found. If you could NOT find the requested data, tell the user "
-                "plainly that this information is not tracked in the system "
-                "(e.g. 'Sales are not recorded in this system'). Do NOT say you "
-                "couldn't complete the request."
-            ),
+            "content": policy.WRITE_UP_PROMPT,
         }
     )
     synth_ok = True
@@ -459,7 +505,12 @@ def ask_groq(
         final = client.chat.completions.create(
             model=model, messages=messages, temperature=0, max_tokens=_MAX_TOKENS
         )
-        answer = (final.choices[0].message.content or "").strip()
+        # Same empty-choices guard as the tool loop: a 200 with no choices must
+        # not become an IndexError after every query has already run.
+        answer = (
+            (final.choices[0].message.content or "").strip()
+            if final.choices else ""
+        )
     except Exception as exc:
         log_interaction(question, sql_used, last_row_count, error=str(exc))
         answer = ""
@@ -470,9 +521,17 @@ def ask_groq(
         # Never claim "no data" while holding rows: when the write-up call fails
         # (e.g. provider quota) AFTER the query succeeded, say so honestly - the
         # UI then renders the captured rows as a table instead of a false denial.
+        # Three different situations, three different truths. Saying "I don't
+        # have that information in the database" when NO query ever ran is a
+        # false denial - it tells the user their data is missing when in fact we
+        # never looked. Observed on "report of employee M4117", an employee who
+        # plainly exists.
         "answer": answer or (
             "I fetched the data but couldn't write the summary just now - here it is."
-            if data_rows else "I don't have that information in the database."
+            if data_rows
+            else "I don't have that information in the database."
+            if sql_used  # we DID query and it genuinely came back empty
+            else "I couldn't complete that just now - please ask again."
         ),
         "sql_used": sql_used,
         "rows_returned": last_row_count,
@@ -480,5 +539,6 @@ def ask_groq(
         "ok": synth_ok,
         "data_columns": data_columns,
         "data_rows": data_rows,
+        "data_sections": data_sections,
         "file_grounded": file_grounded,
     }

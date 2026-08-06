@@ -25,9 +25,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
-from app.agent import access_guard, date_gate
+from app.agent import access_guard, date_gate, smalltalk_gate
 from app.artifacts.charts import to_chart
-from app.artifacts.excel import to_excel
+from app.artifacts.excel import to_excel, to_excel_sections
 from app.artifacts.pdf import to_pdf
 from app.config import settings
 from app.core import auth, history
@@ -37,12 +37,43 @@ from app.database.runner import run_select
 
 # --- AgentCost (optional cost tracking; agentcost.tech) ---
 # Must run BEFORE any LLM client is used: the SDK monkey-patches the anthropic/
-# openai client libraries so every call reports model, token counts, cost and
-# latency (metadata only — no prompt or answer content) to the AgentCost
+# openai/google-genai client libraries so every call reports model, token counts,
+# cost and latency (metadata only — no prompt or answer content) to the AgentCost
 # dashboard. Best-effort by design: this is a young third-party SDK, so a
 # failure here logs a warning and the chatbot runs WITHOUT tracking — it must
-# never take the API down. Covers anthropic + ollama (openai lib); the native
-# groq SDK is not patched, so groq turns are invisible to it.
+# never take the API down. Covers anthropic, gemini, and the OpenAI-compatible
+# providers (ollama/lmstudio/cerebras/nvidia); the native groq SDK is NOT
+# patched, so LLM_PROVIDER=groq turns are still invisible to it.
+
+# Rates in dollars per 1K tokens for every model this app can select. These go
+# in via custom_pricing, which the SDK consults FIRST — ahead of its own model
+# table. That ordering is the whole point: the SDK's bundled table knows neither
+# claude-sonnet-4-6 nor gemini-3-flash-preview, and its 2000-model table is
+# fetched from the backend in a BACKGROUND thread, so calls made before that
+# fetch lands are silently costed at $0.00. With a free-tier Gemini key capped
+# near 20 requests/day, those early calls are most of the traffic — which is why
+# every Gemini turn was showing up on the dashboard priced at zero. Listing the
+# rates here removes the race entirely.
+# Source: AgentCost's own /v1/pricing table, read 2026-08-04. Re-check when
+# switching models — a model missing here is recorded at $0.00, not refused.
+_AGENTCOST_PRICING = {
+    # Gemini (GEMINI_MODEL) — free tier bills $0, priced here at list rate
+    # so the dashboard shows what the traffic WOULD cost on a paid key.
+    "gemini-3-flash-preview": {"input": 0.0005, "output": 0.003},
+    "gemini-2.5-flash": {"input": 0.0003, "output": 0.0025},
+    # Anthropic (ANTHROPIC_MODEL)
+    "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
+    # Groq (GROQ_MODEL) — listed for when the native SDK does get patched.
+    "llama-3.3-70b-versatile": {"input": 0.00059, "output": 0.00079},
+    "meta-llama/llama-4-scout-17b-16e-instruct": {"input": 0.00018, "output": 0.00059},
+    # Cerebras / NVIDIA (OpenAI-compatible, tracked via the openai lib)
+    "gpt-oss-120b": {"input": 0.00022, "output": 0.00059},
+    "openai/gpt-oss-20b": {"input": 0.00005, "output": 0.0002},
+    "kimi-k2.6": {"input": 0.00095, "output": 0.004},
+    # LM Studio / Ollama run locally: no per-token cost.
+    "google/gemma-4-12b-qat": {"input": 0.0, "output": 0.0},
+}
+
 _agentcost_track_costs = None
 if settings.AGENTCOST_API_KEY and settings.AGENTCOST_PROJECT_ID:
     try:
@@ -52,12 +83,7 @@ if settings.AGENTCOST_API_KEY and settings.AGENTCOST_PROJECT_ID:
             api_key=settings.AGENTCOST_API_KEY,
             project_id=settings.AGENTCOST_PROJECT_ID,
             debug=settings.AGENTCOST_DEBUG,
-            # AgentCost's pricing table doesn't know our demo model (it logged
-            # "Unknown model 'claude-sonnet-4-6' - cost will be $0.00"), so
-            # supply the rate: dollars per 1K tokens = $3/M input, $15/M output.
-            custom_pricing={
-                "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
-            },
+            custom_pricing=_AGENTCOST_PRICING,
         )
         logger.info(
             "AgentCost tracking enabled (project %s).", settings.AGENTCOST_PROJECT_ID
@@ -82,6 +108,9 @@ def _log_startup_banner() -> None:
         "anthropic": settings.ANTHROPIC_API_KEY,
         "claude": settings.ANTHROPIC_API_KEY,
         "ollama": "local",  # local model needs no key
+        "lmstudio": "local",  # local model needs no key
+        "cerebras": settings.CEREBRAS_API_KEY,
+        "nvidia": settings.NVIDIA_API_KEY,
     }.get(provider, "")
     log_startup(provider, model, key_present=bool(key))
 
@@ -178,6 +207,10 @@ class ExportRowsRequest(BaseModel):
     # force a giant in-memory file build (the SQL path is capped; this wasn't).
     columns: list[str] = []
     rows: list[dict] = Field(..., max_length=5000)
+    # Every section of a multi-part report ({columns, rows} each), so a "full
+    # report" exports one sheet per section instead of only the biggest result.
+    # Optional: older clients and single-result answers just send rows.
+    sections: list[dict] = Field(default_factory=list, max_length=20)
     format: str = Field("excel", pattern="^(excel|pdf|chart)$")
     title: str = "Report"
     x_col: str | None = None
@@ -251,6 +284,12 @@ def _active_provider_key_missing() -> str | None:
     if provider == "gemini":
         # Configured = ANY key (primary or a failover key in GEMINI_API_KEYS).
         return "GEMINI_API_KEY" if not settings.gemini_keys() else None
+    if provider == "cerebras":
+        return "CEREBRAS_API_KEY" if not settings.CEREBRAS_API_KEY else None
+    if provider == "nvidia":
+        return "NVIDIA_API_KEY" if not settings.NVIDIA_API_KEY else None
+    if provider in ("ollama", "lmstudio"):
+        return None  # local model — no key required
     return "GROQ_API_KEY" if not settings.GROQ_API_KEY else None
 
 
@@ -412,6 +451,15 @@ def chat(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
 
     from app.api import sessions
 
+    # Pure greeting / thanks / "ok" -> canned reply, no LLM call. Checked first
+    # because it is the most specific gate (whole-string match) and the cheapest:
+    # "hi" was costing a full ~29k-token round trip and 5-10s of latency.
+    if smalltalk_gate.is_smalltalk(request.question):
+        return ChatResponse(**{
+            k: v for k, v in smalltalk_gate.smalltalk_response(request.question).items()
+            if k in ChatResponse.model_fields
+        })
+
     # RESTRICTED: salary/pay is off limits (client policy) - refuse before the LLM.
     if access_guard.is_pay_question(request.question):
         return ChatResponse(**{
@@ -488,6 +536,16 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
             status_code=503,
             detail=f"AI is not configured: {missing} is missing in .env.",
         )
+
+    # Pure greeting / thanks / "ok" -> stream the canned reply immediately (no
+    # LLM call, no DB hit). See the same gate on /chat above.
+    if smalltalk_gate.is_smalltalk(request.question):
+        _small = smalltalk_gate.smalltalk_response(request.question)
+
+        def _smalltalk_stream():
+            yield f"data: {json.dumps({'type': 'result', 'data': _small})}\n\n"
+
+        return StreamingResponse(_smalltalk_stream(), media_type="text/event-stream")
 
     # RESTRICTED: salary/pay is off limits (client policy) - refuse before the LLM.
     if access_guard.is_pay_question(request.question):
@@ -578,6 +636,22 @@ def export_rows(req: ExportRowsRequest, user: dict = Depends(enforce_rate_limit)
             y_col = req.y_col or columns[-1]
             path = to_chart(rows, x_col, y_col, f"export-{uid}.png", title=req.title)
             return _download(path, "image/png", "export.png")
+
+        # Multi-section report -> one sheet per section. PDF/chart stay
+        # single-result: a chart of several unrelated result sets is meaningless.
+        if len(req.sections) > 1:
+            clean_sections = []
+            for sec in req.sections:
+                s_rows = sec.get("rows") or []
+                if not s_rows:
+                    continue
+                s_cols, s_rows = sanitize_export(
+                    sec.get("columns") or list(s_rows[0].keys()), s_rows
+                )
+                clean_sections.append({"columns": s_cols, "rows": s_rows})
+            if len(clean_sections) > 1:
+                path = to_excel_sections(clean_sections, f"export-{uid}.xlsx")
+                return _download(path, _EXCEL_MEDIA, "export.xlsx")
 
         path = to_excel(columns, rows, f"export-{uid}.xlsx")
         return _download(path, _EXCEL_MEDIA, "export.xlsx")

@@ -12,20 +12,26 @@ provider-specific call + function-calling format differ.
 """
 
 import base64
+from functools import lru_cache
 
 from google import genai
 from google.genai import types
 
 from app.agent import attachments as attachments_mod
-from app.agent import tools, widget
+from app.agent import loop_policy as policy
+from app.agent import result_capture, tools, widget
 from app.config import settings
 from app.core.logging_util import log_interaction, log_provider_error
 
 
-# Keys the free tier has already rejected today (quota/permission). Skipped on
-# later turns so one dead key can't keep costing every request a failed attempt.
+# (model, key) pairs the free tier has already rejected today. Skipped on later
+# turns so a dead combination can't keep costing every request a failed attempt.
 # Cleared on restart — the daily quota resets anyway.
-_EXHAUSTED_KEYS: set[str] = set()
+#
+# Keyed by MODEL as well as key because the free-tier quota is per model:
+# the 429 reports GenerateRequestsPerMinutePerProjectPerModel. Tracking keys
+# alone marked a key dead for every model once ONE model ran out.
+_EXHAUSTED_KEYS: set[tuple[str, str]] = set()
 
 
 def _is_quota_error(exc: Exception) -> bool:
@@ -38,20 +44,41 @@ def _is_quota_error(exc: Exception) -> bool:
     )
 
 
+@lru_cache(maxsize=16)
+def _client_for(key: str) -> genai.Client:
+    """
+    One client per API key, kept alive for the process.
+
+    Cached because mid-turn model rotation builds a client per swap, and the SDK
+    shares an underlying HTTP transport between Client objects: when a discarded
+    one was garbage-collected it closed that transport for the others, and the
+    next call died with "Cannot send a request, as the client has been closed".
+    """
+    return genai.Client(api_key=key)
+
+
 def _client(api_key: str | None = None) -> genai.Client:
     key = api_key or settings.GEMINI_API_KEY
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not set in .env.")
-    return genai.Client(api_key=key)
+    return _client_for(key)
 
 
-def _usable_keys() -> list[str]:
-    """Configured keys minus the ones already exhausted today (all, if all are)."""
-    keys = settings.gemini_keys()
-    if not keys:
-        raise RuntimeError("GEMINI_API_KEY is not set in .env.")
-    fresh = [k for k in keys if k not in _EXHAUSTED_KEYS]
-    return fresh or keys  # all exhausted -> retry them (the quota may have reset)
+def _attempts(primary_model: str) -> list[tuple[str, str]]:
+    """
+    (model, key) pairs to try, in order, skipping combinations already refused.
+
+    MODEL first, key second: the free-tier limit is per project per MODEL, and
+    extra keys in the same project share one pool - so moving to the next model
+    is what actually recovers capacity. Rotating keys alone was the old
+    behaviour and could not finish a single report question.
+    """
+    fresh, spent = [], []
+    for model in settings.gemini_model_chain():
+        for key in settings.gemini_keys():
+            (spent if (model, key) in _EXHAUSTED_KEYS else fresh).append((model, key))
+    # Everything spent -> try again anyway; a per-MINUTE bucket may have refilled.
+    return fresh or spent
 
 
 def _to_schema(js: dict) -> types.Schema:
@@ -133,18 +160,20 @@ def ask_gemini(
     transparently move to the next one on a quota/permission error and remember
     the dead key for the rest of the process, so a demo keeps working.
     """
-    keys = _usable_keys()
+    attempts = _attempts(model)
     last_exc: Exception | None = None
-    for idx, key in enumerate(keys):
+    for idx, (try_model, key) in enumerate(attempts):
         try:
-            return _ask_gemini_once(question, model, history, on_event, file_context, key)
+            return _ask_gemini_once(
+                question, try_model, history, on_event, file_context, key
+            )
         except Exception as exc:  # noqa: BLE001 - decide by error kind below
             if not _is_quota_error(exc):
-                raise  # a real bug: don't burn the other keys on it
-            _EXHAUSTED_KEYS.add(key)
+                raise  # a real bug: don't burn the other combinations on it
+            _EXHAUSTED_KEYS.add((try_model, key))
             last_exc = exc
-            log_provider_error("gemini", model, exc)
-            if idx + 1 < len(keys) and on_event:
+            log_provider_error("gemini", try_model, exc)
+            if idx + 1 < len(attempts) and on_event:
                 on_event("Switching to a backup connection…")
 
     # EVERY key is exhausted. Return the friendly provider message (HTTP 200,
@@ -157,6 +186,49 @@ def ask_gemini(
         "rows_returned": 0,
         "ok": False,
     }
+
+
+def _write_up(contents, system, model, api_key: str | None, on_event=None) -> tuple[str, bool]:
+    """
+    The final plain-text answer, retried across API keys. Returns (answer, ok).
+
+    Why this is separate from the whole-turn failover in ask_gemini: by the time
+    we get here every query has ALREADY run and been paid for. The free tier caps
+    requests per MINUTE (limit 5), and one question spends up to MAX_TOOL_ROUNDS
+    of them, so the write-up is the call most likely to be the one refused - and
+    losing it means the user waited 30 seconds and got a table with no answer,
+    which is exactly the failure the client reported on "full report of MFG - 1".
+
+    Re-running the whole turn on a fresh key would re-run every query and spend
+    another round-trip budget for a write-up we could get in one call. So rotate
+    the key for THIS call only.
+
+    We rotate rather than honour the API's retryDelay (~16s): with several keys a
+    rotation is instant, and making a user wait 16 seconds mid-answer is its own
+    kind of failure.
+    """
+    # Start with the model/key that ran the queries (its cache is warm), then
+    # fall back across the other MODELS - the per-minute bucket is per model, so
+    # a different model is what actually has capacity left.
+    tried = [(model, api_key)] if api_key else []
+    tried += [pair for pair in _attempts(model) if pair != (model, api_key)]
+
+    for idx, (try_model, key) in enumerate(tried):
+        try:
+            final = _client(key).models.generate_content(
+                model=try_model,
+                contents=contents,
+                config=types.GenerateContentConfig(system_instruction=system, temperature=0),
+            )
+            return (final.text or "").strip(), True
+        except Exception as exc:  # noqa: BLE001 - decide by error kind
+            log_provider_error("gemini", try_model, exc)
+            if not _is_quota_error(exc):
+                return "", False        # a real bug: another model won't help
+            _EXHAUSTED_KEYS.add((try_model, key))
+            if idx + 1 < len(tried) and on_event:
+                on_event("Switching to a backup connection…")
+    return "", False
 
 
 def _ask_gemini_once(
@@ -177,10 +249,14 @@ def _ask_gemini_once(
 
     emit("Analyzing your question…")
     routing = tools.routing_text(question, history)
+    # ORDER IS BILLING, NOT STYLE. Caching matches a prefix, so every static
+    # block goes in front of the per-question schema. The widget prompt used to
+    # trail system_prompt_for(), which put 2k of never-changing text behind a
+    # per-question boundary where it could never be cached.
     system = (
-        tools.system_prompt_for(routing)
+        widget.WIDGET_SYSTEM_PROMPT
         + "\n\n"
-        + widget.WIDGET_SYSTEM_PROMPT
+        + tools.system_prompt_for(routing)
     )
     config = types.GenerateContentConfig(
         system_instruction=system,
@@ -197,21 +273,51 @@ def _ask_gemini_once(
     widgets: list[dict] = []
     data_columns: list[str] = []
     data_rows: list[dict] = []
+    data_sections: list[dict] = []  # every result, for a multi-sheet export
     nudged_dashboard = False  # one corrective round if a requested dashboard was skipped
     nudged_report_detail = False  # one corrective round if a "report" came back aggregated
+    nudged_entity_report = False  # one corrective round if a 'report of X' was just the WHO row
     execute_nudges = 0        # how many times we've forced a stalled model to run its SQL
     dashboard_built = False
 
+    # MID-TURN MODEL ROTATION.
+    #
+    # The free-tier limit is 5 requests/minute PER MODEL, and one report question
+    # spends ~6 model calls - so a single model cannot finish one. Restarting the
+    # turn on another model would throw away every query already run (and spend
+    # the same budget again), so instead we swap the model/key for the NEXT ROUND
+    # and carry the conversation forward untouched: `contents` is just Gemini
+    # Content objects, it does not belong to any one model.
+    #
+    # Rotating models, not keys, is the part that matters: the quota is per
+    # project per model, so extra keys in one project share a single pool.
+    pairs = [(model, api_key)] + [p for p in _attempts(model) if p != (model, api_key)]
+    pair_i = 0
+    cur_model, cur_key = pairs[0]
+
     for _ in range(tools.MAX_TOOL_ROUNDS):
         try:
-            resp = client.models.generate_content(
-                model=model, contents=contents, config=config
-            )
+            # Inner loop so a rotation does NOT consume one of the tool rounds -
+            # a swap is a retry of the same step, not a step of its own.
+            while True:
+                try:
+                    resp = client.models.generate_content(
+                        model=cur_model, contents=contents, config=config
+                    )
+                    break
+                except Exception as exc:  # noqa: PERF203
+                    if not (_is_quota_error(exc) and pair_i + 1 < len(pairs)):
+                        raise
+                    _EXHAUSTED_KEYS.add((cur_model, cur_key))
+                    log_provider_error("gemini", cur_model, exc)
+                    pair_i += 1
+                    cur_model, cur_key = pairs[pair_i]
+                    client = _client(cur_key)
+                    emit("Switching to a backup connection…")
         except Exception as exc:
-            # A quota/permission failure must RAISE so ask_gemini can fail over to
-            # the next API key (returning "busy" here would strand the user on a
-            # dead key). Only do that while nothing useful has been produced yet;
-            # mid-answer we keep the partial result rather than redo the work.
+            # Every model/key is spent. Raise only while nothing useful exists,
+            # so ask_gemini can report it; mid-answer we keep the partial result
+            # rather than redo the work.
             if _is_quota_error(exc) and not sql_used:
                 raise
             log_interaction(question, sql_used, last_row_count, error=str(exc))
@@ -232,36 +338,55 @@ def _ask_gemini_once(
         if not calls:
             # No more tool calls -> this is the final answer.
             answer = "".join(p.text for p in parts if getattr(p, "text", None)).strip()
+
+            # The model stopped WITHOUT writing anything. Returning here hands
+            # back a blank answer and skips the forced write-up below, which only
+            # runs when the rounds are exhausted. Same fault, same fix as the
+            # groq backend (see the employee-360 case there): with data, break to
+            # the write-up; with nothing yet, push it to actually run the query
+            # rather than end the turn having queried nothing - that produced
+            # "I don't have that information in the database" about an employee
+            # who plainly exists.
+            if not answer:
+                if data_rows:
+                    break
+                if execute_nudges < policy.MAX_EXECUTE_NUDGES:
+                    execute_nudges += 1
+                    if cand and cand.content:
+                        contents.append(cand.content)
+                    contents.append(
+                        types.Content(
+                            role="user",
+                            parts=[types.Part.from_text(text=policy.EXECUTE_NUDGE)],
+                        )
+                    )
+                    emit("Running the query…")
+                    continue
+                break
             # Grounding guard (mirrors groq_backend): the model returned a data
             # table, a chart/dashboard, or written-out SQL but ran NO query, so
             # nothing it shows is real. Force a real run_sql round rather than
             # letting the fabrication fall through to the "ungrounded" refusal
-            # the user sees. Fires up to _MAX_EXECUTE_NUDGES times.
-            from app.agent.groq_backend import (
-                _EXECUTE_NUDGE,
-                _MAX_EXECUTE_NUDGES,
-                _has_data_visual,
-                _looks_like_unrun_sql,
-            )
+            # the user sees. Fires up to policy.MAX_EXECUTE_NUDGES times.
             from app.agent.postprocess import looks_like_data_table
             ungrounded_fabrication = (
                 not sql_used
                 and not file_grounded
                 and (
-                    _looks_like_unrun_sql(answer)
+                    policy.looks_like_unrun_sql(answer)
                     or looks_like_data_table(answer)
-                    or _has_data_visual(widgets)
+                    or policy.has_data_visual(widgets)
                 )
             )
-            if ungrounded_fabrication and execute_nudges < _MAX_EXECUTE_NUDGES:
+            if ungrounded_fabrication and execute_nudges < policy.MAX_EXECUTE_NUDGES:
                 execute_nudges += 1
-                widgets = [w for w in widgets if not _has_data_visual([w])]
+                widgets = [w for w in widgets if not policy.has_data_visual([w])]
                 if cand and cand.content:
                     contents.append(cand.content)
                 contents.append(
                     types.Content(
                         role="user",
-                        parts=[types.Part.from_text(text=_EXECUTE_NUDGE)],
+                        parts=[types.Part.from_text(text=policy.EXECUTE_NUDGE)],
                     )
                 )
                 emit("Running the query…")
@@ -269,18 +394,12 @@ def _ask_gemini_once(
             # Report-detail guard (mirrors groq_backend; client-flagged bug):
             # a "…report…" question answered with a GROUP BY aggregate instead
             # of the mandated detail listing with joined names.
-            from app.agent.groq_backend import (
-                REPORT_ASKED_RE,
-                REPORT_DETAIL_NUDGE,
-                _all_sql_aggregated,
-                _SUMMARY_INTENT_RE,
-            )
             if (
                 not nudged_report_detail
                 and not file_grounded
-                and _all_sql_aggregated(sql_used)
-                and REPORT_ASKED_RE.search(question or "")
-                and not _SUMMARY_INTENT_RE.search(question or "")
+                and policy.all_sql_aggregated(sql_used)
+                and policy.REPORT_ASKED_RE.search(question or "")
+                and not policy.SUMMARY_INTENT_RE.search(question or "")
             ):
                 nudged_report_detail = True
                 if cand and cand.content:
@@ -288,21 +407,40 @@ def _ask_gemini_once(
                 contents.append(
                     types.Content(
                         role="user",
-                        parts=[types.Part.from_text(text=REPORT_DETAIL_NUDGE)],
+                        parts=[types.Part.from_text(text=policy.REPORT_DETAIL_NUDGE)],
                     )
                 )
                 emit("Building the detailed report…")
                 continue
+            # Thin entity report: "report of <entity>" answered with only the
+            # WHO row - section 1 of several. The client asked for a full report
+            # of employee M4167 and the Excel held a single identity row.
+            if (
+                not nudged_entity_report
+                and not file_grounded
+                and sql_used
+                and policy.thin_entity_report(question, data_sections)
+            ):
+                nudged_entity_report = True
+                if cand and cand.content:
+                    contents.append(cand.content)
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=policy.ENTITY_REPORT_NUDGE)],
+                    )
+                )
+                emit("Building the full profile…")
+                continue
             # Dashboard guard (mirrors groq_backend): the question asked for
             # analytics/overview/dashboard/analysis but no dashboard was built.
             # Nudge one corrective round; requires queried data (sql_used).
-            from app.agent.groq_backend import DASHBOARD_ASKED_RE, DASHBOARD_NUDGE
             if (
                 not dashboard_built
                 and not nudged_dashboard
                 and sql_used
                 and not file_grounded
-                and DASHBOARD_ASKED_RE.search(question or "")
+                and policy.DASHBOARD_ASKED_RE.search(question or "")
             ):
                 nudged_dashboard = True
                 if cand and cand.content:
@@ -310,7 +448,7 @@ def _ask_gemini_once(
                 contents.append(
                     types.Content(
                         role="user",
-                        parts=[types.Part.from_text(text=DASHBOARD_NUDGE)],
+                        parts=[types.Part.from_text(text=policy.DASHBOARD_NUDGE)],
                     )
                 )
                 emit("Building your dashboard…")
@@ -323,6 +461,7 @@ def _ask_gemini_once(
                 "widgets": widgets,
                 "data_columns": data_columns,
                 "data_rows": data_rows,
+        "data_sections": data_sections,
                 "file_grounded": file_grounded,
             }
 
@@ -379,18 +518,13 @@ def _ask_gemini_once(
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
-                # Prefer a multi-row DETAIL result for export; don't let a 1-row
-                # summary/aggregate run afterwards clobber the full list (see
-                # groq_backend for the rationale — the kapan-report download bug).
-                # LARGEST result wins for the export capture; a smaller
-                # aggregate/breakdown run afterwards must not clobber the full
-                # detail list (see groq_backend — the kapan-report download bug).
-                if (
-                    name == "run_sql"
-                    and rows_full
-                    and len(rows_full) > len(data_rows)
+                # Which result is "the answer"? See result_capture - one rule,
+                # shared by every backend, tested against both the bugs it fixes.
+                if name == "run_sql" and result_capture.better(
+                    cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
+                    result_capture.add_section(data_sections, cols_full, rows_full)
             responses.append(
                 types.Part.from_function_response(name=name, response={"result": result_text})
             )
@@ -402,37 +536,32 @@ def _ask_gemini_once(
             role="user",
             parts=[
                 types.Part(
-                    text=(
-                        "Give your best final answer now in plain text, based on what "
-                        "you found. If you could NOT find the requested data, tell the "
-                        "user plainly that it is not tracked in the system. Do NOT say "
-                        "you couldn't complete the request."
-                    )
+                    text=policy.WRITE_UP_PROMPT
                 )
             ],
         )
     )
-    synth_ok = True
-    try:
-        final = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(system_instruction=system, temperature=0),
-        )
-        answer = (final.text or "").strip()
-    except Exception as exc:
-        log_interaction(question, sql_used, last_row_count, error=str(exc))
-        answer = ""
-        synth_ok = False
+    # cur_model/cur_key, not the originals: if the loop rotated, the original
+    # pair is exhausted and starting there would waste an attempt on a dead one.
+    answer, synth_ok = _write_up(contents, system, cur_model, cur_key, on_event)
+    if not synth_ok:
+        log_interaction(question, sql_used, last_row_count,
+                        error="write-up call failed on every key")
 
     log_interaction(question, sql_used, last_row_count)
     return {
         # Never claim "no data" while holding rows: when the write-up call fails
         # (e.g. provider quota) AFTER the query succeeded, say so honestly - the
         # UI then renders the captured rows as a table instead of a false denial.
+        # Three situations, three different truths. Saying "I don't have that
+        # information in the database" when NO query ever ran is a false denial -
+        # it tells the user their data is missing when in fact we never looked.
         "answer": answer or (
             "I fetched the data but couldn't write the summary just now - here it is."
-            if data_rows else "I don't have that information in the database."
+            if data_rows
+            else "I don't have that information in the database."
+            if sql_used  # we DID query and it genuinely came back empty
+            else "I couldn't complete that just now - please ask again."
         ),
         "sql_used": sql_used,
         "rows_returned": last_row_count,
@@ -440,5 +569,6 @@ def _ask_gemini_once(
         "ok": synth_ok,
         "data_columns": data_columns,
         "data_rows": data_rows,
+        "data_sections": data_sections,
         "file_grounded": file_grounded,
     }

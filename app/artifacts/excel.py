@@ -130,6 +130,52 @@ def _add_chart_sheet(wb, data_ws, columns: list[str], rows: list[dict]) -> None:
     chart_ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
 
 
+def _write_sheet(ws, columns: list[str], rows: list[dict]) -> None:
+    """Header + rows + readable column widths on an existing worksheet."""
+    ws.append([_clean(c) for c in columns])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        ws.append([_clean(row.get(col)) for col in columns])
+    for i, col in enumerate(columns, start=1):
+        max_len = max([len(str(col))] + [len(str(r.get(col, ""))) for r in rows])
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(
+            max_len + 2, 50
+        )
+
+
+def to_excel_sections(sections: list[dict], filename: str = "report.xlsx") -> str:
+    """
+    Write ONE SHEET PER SECTION.
+
+    A "full report" question runs several queries - production, damage, bonus,
+    GIA - and the chat answer narrates all of them. The single-sheet export
+    carried only the biggest one, so a client who asked for a full report
+    downloaded 318 rows of production with the other sections silently missing.
+
+    Sheet names are derived from each section's columns: the model decides what
+    a "full report" contains, so there is no fixed list of section names to map
+    to, and the columns are the only honest description of what a sheet holds.
+    """
+    usable = [s for s in (sections or []) if s.get("rows") and s.get("columns")]
+    if not usable:
+        raise ValueError("no sections to export")
+    if len(usable) == 1:
+        return to_excel(usable[0]["columns"], usable[0]["rows"], filename)
+
+    wb = Workbook()
+    wb.remove(wb.active)          # drop the default empty sheet
+    used: set = set()
+    for sec in usable:
+        cols = sec["columns"]
+        title = _safe_sheet_name("-".join(str(c) for c in cols[:2]) or "Data", used)
+        _write_sheet(wb.create_sheet(title=title), cols, sec["rows"])
+
+    path = output_path(filename)
+    wb.save(path)
+    return path
+
+
 def to_excel(columns: list[str], rows: list[dict], filename: str = "report.xlsx") -> str:
     """
     Write columns + rows to an .xlsx file. The numbers go on a 'Data' sheet; if

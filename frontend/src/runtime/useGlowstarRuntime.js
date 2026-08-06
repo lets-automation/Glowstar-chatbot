@@ -527,6 +527,7 @@ export function useGlowstarRuntime() {
                 forQuestion: data.ask_date === true ? question : '',
                 exportColumns: cols,
                 exportRows: rows,
+                exportSections: data.data_sections || [],
                 exportQuery: data.export_query || null,
               })
             } else if (rows.length) {

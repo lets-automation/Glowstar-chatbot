@@ -19,13 +19,21 @@ logs/
 # NEVER bake the operator's data/backups or generated reports into the image
 # ("COPY . ." would otherwise ship the real AasthaErp backup + exports).
 db_backup/
+backups/
 artifacts/
 *.bak
 *.mdf
 *.ldf
+*.dump
 *.xlsx
 *.pdf
 tests/
+
+# Internal notes and client material - nothing here is needed at runtime, and
+# docs/ holds the meeting notes, the commercial proposal and a full dictionary
+# of the real database.
+docs/
+*.md
 
 # Editor/OS cruft
 .vscode/

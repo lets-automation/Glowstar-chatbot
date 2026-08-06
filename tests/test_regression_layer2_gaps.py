@@ -3,7 +3,7 @@ test_regression_layer2_gaps.py
 ------------------------------
 REGRESSION LOCK for the Layer-2 gap fixes (2026-07-10).
 
-The Layer-2 trap-bank audit (LAYER2_RESULTS.md) graded 60 realistic client
+The Layer-2 trap-bank audit (docs/LAYER2_RESULTS.md) graded 60 realistic client
 questions against real-DB ground truth and found 12 where the bot would still
 misfire EVEN ON CLAUDE — because the router never surfaced the table holding the
 answer, and/or the glossary never flagged the trap. Each fix was made in

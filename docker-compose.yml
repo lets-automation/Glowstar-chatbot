@@ -75,7 +75,7 @@ services:
   # 40 dumps (~10 days) and pruning older ones. This is what makes history
   # recoverable no matter what erases it — an operator mistake, a bad deploy, or a
   # disk problem — instead of being one accident away from gone. First backup runs
-  # immediately on startup. Restore instructions are in HANDOFF.md ("Restore chat
+  # immediately on startup. Restore instructions are in docs/HANDOFF.md ("Restore chat
   # history"). Same postgres image so pg_dump/pg_restore versions match the DB.
   history-backup:
     image: postgres:16-alpine

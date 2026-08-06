@@ -107,7 +107,7 @@ def _relationships_for(table: str, foreign_keys: list[dict]) -> list[str]:
     return lines
 
 
-def build_schema_context(table_names: list[str] | None = None) -> str:
+def build_schema_context(table_names: list[str] | None = None, question: str = "") -> str:
     """
     Build the full schema context text for the agent:
       - per key table: row count, business meaning, columns, relationships
@@ -161,12 +161,17 @@ def build_schema_context(table_names: list[str] | None = None) -> str:
             parts.append("  links: " + "; ".join(rels))
 
     # Append the business glossary (industry terms + table meanings).
-    parts.append("\n" + render_glossary_text())
+    # Only the tables selected for THIS question — describing all ~100 on every
+    # turn buried the relevant guidance in irrelevant text.
+    parts.append("\n" + render_glossary_text(tables, question))
 
-    # Append the data notes (coded values + misspelled columns) - critical
-    # for accuracy on things like fluorescence ('Florecent') and colour codes.
-    parts.append("\n" + render_data_notes())
-
+    # NOTE: the data notes (coded values, misspelled columns) used to be appended
+    # HERE. They are the same ~11k tokens on every question, and sitting at the
+    # END of the prompt they could never be cached - prompt caching matches a
+    # PREFIX, so one per-question byte in front of a static block makes the whole
+    # block un-cacheable. They now go in tools.static_prompt(), ahead of everything
+    # question-specific. Same text, same guidance, billed once instead of per
+    # round. See tools.static_prompt() before moving anything back in here.
     return "\n".join(parts)
 
 

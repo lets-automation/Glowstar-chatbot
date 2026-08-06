@@ -132,3 +132,15 @@ def test_stream_returns_the_picker_without_calling_the_model(monkeypatch):
     assert r.status_code == 200
     assert '"ask_date": true' in r.text.replace("'", '"').lower()
     assert not called, "the date gate must not spend an LLM call"
+
+
+@pytest.mark.parametrize("q", [
+    # COLD-TEST finding: "how many oval diamonds do we have in stock?" was met
+    # with a date picker. Stock/hold are LIVE snapshots — a period is nonsense.
+    "how many oval diamonds do we have in stock",
+    "atyare ketla diamond hold par che",          # Gujlish: how many on hold now
+    "how many stones are out on memo right now",
+    "how many packets are on hold",
+])
+def test_current_state_questions_never_ask_for_a_date(q):
+    assert needs_date(q) is False, q

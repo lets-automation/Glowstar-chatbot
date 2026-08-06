@@ -110,17 +110,26 @@ def test_widget_prompt_no_longer_mentions_create_report():
 
 
 # ---------------------------------------------------------------------------
-# 4. Export-capture guard parity: in ALL three backends the LARGEST result
-#    wins, so a later small aggregate can't clobber the full detail listing.
+# 4. Export-capture parity: every backend must decide "which result is the
+#    answer" with the SHARED rule in result_capture.
+#
+#    This used to assert the literal expression `len(rows_full) > len(data_rows)`
+#    in all three files - i.e. it policed three copies of one rule staying
+#    identical. That copy-paste is exactly what let the "largest wins" bug (a
+#    10-row department lookup shown as the MFG-1 report) need finding and fixing
+#    three times. The rule now lives in ONE tested module; what needs policing
+#    here is only that no backend goes back to rolling its own.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "backend",
     ["app/agent/groq_backend.py", "app/agent/gemini_backend.py", "app/agent/anthropic_backend.py"],
 )
-def test_capture_guard_largest_wins(backend):
+def test_capture_uses_the_shared_rule(backend):
     src = _src(backend)
-    assert "len(rows_full) > len(data_rows)" in src, f"{backend} lost the largest-wins capture guard"
-    assert "len(rows_full) > 1 or not data_rows" not in src, f"{backend} regressed to the clobber-prone guard"
+    assert "result_capture.better(" in src, f"{backend} does not use the shared capture rule"
+    assert "len(rows_full) > len(data_rows)" not in src, (
+        f"{backend} re-inlined its own capture rule - it must delegate to result_capture"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +150,52 @@ def test_anthropic_handles_max_tokens_stop():
 def test_groq_handles_length_finish_reason():
     src = _src("app/agent/groq_backend.py")
     assert '== "length"' in src
-    assert "_MAX_TOKENS = 2048" in src
+    # Configurable via LLM_MAX_TOKENS now (reasoning models such as Gemma 4 in
+    # LM Studio spend part of the budget thinking before they write), but it must
+    # never drop below the 2048 the truncation audit settled on as the minimum
+    # for the mandated answer format.
+    assert "_MAX_TOKENS = settings.LLM_MAX_TOKENS" in src
+    assert 'LLM_MAX_TOKENS", "2048"' in _src("app/config.py")
+
+    from app.agent.groq_backend import _MAX_TOKENS
+
+    assert _MAX_TOKENS >= 2048
+
+
+def test_lmstudio_tool_schemas_have_no_union_types():
+    """LM Studio's grammar engine 500s on {"type": ["number", "string"]}
+    ("NotImplemented: map: filter-mapping not implemented"), which killed EVERY
+    question before any tool ran - show_dashboard carries three such unions. The
+    collapse must strip them all for lmstudio and leave other providers alone."""
+    from app.agent import groq_backend
+
+    def union_types(node):
+        if isinstance(node, dict):
+            return sum(
+                (
+                    [v] if k == "type" and isinstance(v, list) else union_types(v)
+                    for k, v in node.items()
+                ),
+                [],
+            )
+        if isinstance(node, list):
+            return sum((union_types(x) for x in node), [])
+        return []
+
+    # The unsanitized specs really do contain unions (guards the test itself).
+    assert union_types(groq_backend._GROQ_TOOLS)
+
+    collapsed = groq_backend._collapse_union_types(groq_backend._GROQ_TOOLS)
+    assert union_types(collapsed) == []
+
+    # Collapsing must not lose tools or their parameters.
+    assert [t["function"]["name"] for t in collapsed] == [
+        t["function"]["name"] for t in groq_backend._GROQ_TOOLS
+    ]
+    # A property literally NAMED "type" (the chart kind) must survive untouched.
+    dash = next(t for t in collapsed if t["function"]["name"] == "show_dashboard")
+    sections = dash["function"]["parameters"]["properties"]["sections"]
+    assert sections["items"]["properties"]["type"]["type"] == "string"
 
 
 # ---------------------------------------------------------------------------
@@ -236,10 +290,13 @@ def test_pdf_chart_temp_files_are_unique():
 #     wise" can never again come back as a "Top 10 kapans" summary with no
 #     joined names.
 # ---------------------------------------------------------------------------
-from app.agent.groq_backend import (  # noqa: E402
+# These moved out of groq_backend into loop_policy: they are provider-agnostic
+# policy, and living in a provider file meant the other two backends imported
+# PRIVATE names across module boundaries to reach them.
+from app.agent.loop_policy import (  # noqa: E402
     REPORT_ASKED_RE,
-    _SUMMARY_INTENT_RE,
-    _all_sql_aggregated,
+    SUMMARY_INTENT_RE as _SUMMARY_INTENT_RE,
+    all_sql_aggregated as _all_sql_aggregated,
 )
 
 

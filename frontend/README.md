@@ -5,7 +5,7 @@ The web UI for the Aastha ERP AI chatbot. It calls the Python backend API
 
 ## Prerequisites
 - Node.js 18+ (you have v24)
-- The backend API running (see project root, `INTEGRATION.md`):
+- The backend API running (see project root, `docs/INTEGRATION.md`):
   ```powershell
   & C:\Glowstar_chatbot\venv\Scripts\python.exe -m uvicorn app.api.main:app --reload
   ```

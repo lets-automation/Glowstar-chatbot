@@ -9,23 +9,9 @@ available for best accuracy. The big schema block is prompt-cached.
 import anthropic
 
 from app.agent import attachments as attachments_mod
-from app.agent import tools, widget
+from app.agent import loop_policy as policy
+from app.agent import result_capture, tools, widget
 from app.agent._retry import call_with_retry
-# Shared grounding/nudge machinery (defined once in the groq backend, used by
-# gemini too) so ALL providers refuse to present unqueried data — the demo
-# provider must not be the only one missing the guard.
-from app.agent.groq_backend import (
-    DASHBOARD_ASKED_RE,
-    DASHBOARD_NUDGE,
-    REPORT_ASKED_RE,
-    REPORT_DETAIL_NUDGE,
-    _EXECUTE_NUDGE,
-    _all_sql_aggregated,
-    _MAX_EXECUTE_NUDGES,
-    _SUMMARY_INTENT_RE,
-    _has_data_visual,
-    _looks_like_unrun_sql,
-)
 from app.agent.postprocess import looks_like_data_table
 from app.config import settings
 from app.core.logging_util import log_interaction, log_provider_error
@@ -85,8 +71,12 @@ def _system_blocks(question: str) -> list[dict]:
     """
     return [
         {
+            # RULES + the data notes: the whole question-independent block, so
+            # one cache breakpoint covers all ~23k of it. This was tools.RULES
+            # alone (~7.7k) while the data notes rode along at the END of the
+            # schema block, un-cached and re-billed every round.
             "type": "text",
-            "text": tools.RULES,
+            "text": tools.static_prompt(),
             "cache_control": {"type": "ephemeral"},
         },
         {
@@ -133,10 +123,12 @@ def ask_anthropic(
     last_row_count = 0
     widgets: list[dict] = []  # visuals emitted via show_widget, shown to the user
     data_columns: list[str] = []  # columns/rows from the LAST successful run_sql,
-    data_rows: list[dict] = []    # captured so export uses the exact data shown
+    data_rows: list[dict] = []
+    data_sections: list[dict] = []  # every result, for a multi-sheet export
 
     execute_nudges = 0        # forced run-the-query rounds used (grounding guard)
     nudged_report_detail = False  # one corrective round if a "report" came back aggregated
+    nudged_entity_report = False  # one corrective round if a 'report of X' was just the WHO row
     nudged_dashboard = False  # one corrective round if a requested dashboard was skipped
     force_tool = False        # require a tool call on the NEXT request (set by the nudge)
     dashboard_built = False   # did show_dashboard actually render this turn?
@@ -175,6 +167,28 @@ def ask_anthropic(
             answer = "".join(
                 block.text for block in response.content if block.type == "text"
             )
+
+            # The model stopped WITHOUT writing anything. Returning here hands
+            # back a blank answer and skips the forced write-up below, which only
+            # runs when the rounds are exhausted. Same fault, same fix as the
+            # groq backend (see the employee-360 case there): with data, break to
+            # the write-up; with nothing yet, push it to actually run the query
+            # rather than end the turn having queried nothing - that produced
+            # "I don't have that information in the database" about an employee
+            # who plainly exists.
+            if not answer.strip():
+                if data_rows:
+                    break
+                if execute_nudges < policy.MAX_EXECUTE_NUDGES:
+                    execute_nudges += 1
+                    force_tool = True
+                    # NB: the assistant turn was already appended above, before
+                    # this branch - appending it again would duplicate the turn
+                    # and Claude rejects two assistant messages in a row.
+                    messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
+                    emit("Running the query…")
+                    continue
+                break
             # Grounding guard (parity with groq/gemini): a data table, chart/
             # dashboard, or written-out SQL with NO query behind it is invented.
             # Force an actual run_sql round instead of returning it.
@@ -182,16 +196,16 @@ def ask_anthropic(
                 not sql_used
                 and not file_grounded
                 and (
-                    _looks_like_unrun_sql(answer)
+                    policy.looks_like_unrun_sql(answer)
                     or looks_like_data_table(answer)
-                    or _has_data_visual(widgets)
+                    or policy.has_data_visual(widgets)
                 )
             )
-            if ungrounded_fabrication and execute_nudges < _MAX_EXECUTE_NUDGES:
+            if ungrounded_fabrication and execute_nudges < policy.MAX_EXECUTE_NUDGES:
                 execute_nudges += 1
                 force_tool = True
-                widgets = [w for w in widgets if not _has_data_visual([w])]
-                messages.append({"role": "user", "content": _EXECUTE_NUDGE})
+                widgets = [w for w in widgets if not policy.has_data_visual([w])]
+                messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
                 emit("Running the query…")
                 continue
             # Report-detail guard (client-flagged): "…report…" answered with a
@@ -199,14 +213,28 @@ def ask_anthropic(
             if (
                 not nudged_report_detail
                 and not file_grounded
-                and _all_sql_aggregated(sql_used)
-                and REPORT_ASKED_RE.search(question or "")
-                and not _SUMMARY_INTENT_RE.search(question or "")
+                and policy.all_sql_aggregated(sql_used)
+                and policy.REPORT_ASKED_RE.search(question or "")
+                and not policy.SUMMARY_INTENT_RE.search(question or "")
             ):
                 nudged_report_detail = True
                 force_tool = True
-                messages.append({"role": "user", "content": REPORT_DETAIL_NUDGE})
+                messages.append({"role": "user", "content": policy.REPORT_DETAIL_NUDGE})
                 emit("Building the detailed report…")
+                continue
+            # Thin entity report: "report of <entity>" answered with only the
+            # WHO row - section 1 of several (see the M4167 case in groq).
+            if (
+                not nudged_entity_report
+                and not file_grounded
+                and sql_used
+                and policy.thin_entity_report(question, data_sections)
+            ):
+                nudged_entity_report = True
+                force_tool = True
+                # the assistant turn was already appended before this branch
+                messages.append({"role": "user", "content": policy.ENTITY_REPORT_NUDGE})
+                emit("Building the full profile…")
                 continue
             # Dashboard guard (parity with groq/gemini): the question asked for
             # analytics/overview but no dashboard was built - one corrective round.
@@ -215,10 +243,10 @@ def ask_anthropic(
                 and not nudged_dashboard
                 and sql_used
                 and not file_grounded
-                and DASHBOARD_ASKED_RE.search(question or "")
+                and policy.DASHBOARD_ASKED_RE.search(question or "")
             ):
                 nudged_dashboard = True
-                messages.append({"role": "user", "content": DASHBOARD_NUDGE})
+                messages.append({"role": "user", "content": policy.DASHBOARD_NUDGE})
                 emit("Building your dashboard…")
                 continue
             # Honesty on output-length truncation: a max_tokens stop means the
@@ -240,6 +268,7 @@ def ask_anthropic(
                 "widgets": widgets,
                 "data_columns": data_columns,
                 "data_rows": data_rows,
+        "data_sections": data_sections,
                 "file_grounded": file_grounded,
             }
 
@@ -301,15 +330,13 @@ def ask_anthropic(
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
-                # LARGEST result wins for the export capture; a smaller
-                # aggregate/breakdown run afterwards must not clobber the full
-                # detail list (see groq_backend — the kapan-report download bug).
-                if (
-                    block.name == "run_sql"
-                    and rows_full
-                    and len(rows_full) > len(data_rows)
+                # Which result is "the answer"? See result_capture - one rule,
+                # shared by every backend, tested against both the bugs it fixes.
+                if block.name == "run_sql" and result_capture.better(
+                    cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
+                    result_capture.add_section(data_sections, cols_full, rows_full)
             tool_results.append(
                 {
                     "type": "tool_result",
@@ -323,13 +350,7 @@ def ask_anthropic(
     messages.append(
         {
             "role": "user",
-            "content": (
-                "Give your best final answer now in plain text, based on what you "
-                "found. If you could NOT find the requested data, tell the user "
-                "plainly that this information is not tracked in the system "
-                "(e.g. 'Sales are not recorded in this system'). Do NOT say you "
-                "couldn't complete the request."
-            ),
+            "content": policy.WRITE_UP_PROMPT,
         }
     )
     synth_ok = True
@@ -338,7 +359,11 @@ def ask_anthropic(
             model=model, max_tokens=_MAX_TOKENS, system=system, messages=messages, temperature=0
         )
         answer = "".join(b.text for b in final.content if b.type == "text").strip()
-    except Exception:
+    except Exception as exc:
+        # Log WHY the write-up failed. Without this the user sees only the
+        # "couldn't write the summary" fallback with no trace of the cause -
+        # the groq and gemini backends already log it here. Grep: SYNTH-FAIL
+        log_interaction(question, sql_used, last_row_count, error=f"SYNTH-FAIL {exc}")
         answer = ""
         synth_ok = False
 
@@ -347,9 +372,15 @@ def ask_anthropic(
         # Never claim "no data" while holding rows: when the write-up call fails
         # (e.g. provider quota) AFTER the query succeeded, say so honestly - the
         # UI then renders the captured rows as a table instead of a false denial.
+        # Three situations, three different truths. Saying "I don't have that
+        # information in the database" when NO query ever ran is a false denial -
+        # it tells the user their data is missing when in fact we never looked.
         "answer": answer or (
             "I fetched the data but couldn't write the summary just now - here it is."
-            if data_rows else "I don't have that information in the database."
+            if data_rows
+            else "I don't have that information in the database."
+            if sql_used  # we DID query and it genuinely came back empty
+            else "I couldn't complete that just now - please ask again."
         ),
         "sql_used": sql_used,
         "rows_returned": last_row_count,
@@ -357,5 +388,6 @@ def ask_anthropic(
         "ok": synth_ok,
         "data_columns": data_columns,
         "data_rows": data_rows,
+        "data_sections": data_sections,
         "file_grounded": file_grounded,
     }

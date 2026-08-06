@@ -12,6 +12,7 @@ Run from the project root with:
     python -m tests.test_api
 """
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.api.main import app
@@ -32,6 +33,7 @@ def test_chat_validation():
     assert response.status_code == 422
 
 
+@pytest.mark.live_llm
 def test_chat_behaviour():
     response = client.post("/chat", json={"question": "How many packets are in tblPacket?"})
 

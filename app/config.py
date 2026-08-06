@@ -51,6 +51,35 @@ class Settings:
     GEMINI_API_KEY_3: str = os.getenv("GEMINI_API_KEY_3", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+    # FALLBACK MODELS - the free tier's real escape hatch.
+    #
+    # The 429 names its own quota id: GenerateRequestsPerMinutePerProjectPerModel
+    # (limit 5/min, 20/day). It is scoped PER MODEL, so every model carries its
+    # own budget - but it is also per PROJECT, so extra API KEYS in the same
+    # project share one pool and rotating them buys nothing. Rotating MODELS
+    # does. Verified: gemini-2.5-flash answered in 1.9s while gemini-3-flash was
+    # still exhausted.
+    #
+    # One report question costs ~6 calls against a 5/min limit, so a single model
+    # cannot finish one. Three models make it comfortable.
+    # Ordered fastest-first (measured: 3.1-flash-lite 1.0s, 2.5-flash 1.9s,
+    # 3-flash-preview 19.5s). All three were confirmed to support tool calling -
+    # a model without it returns chat text and zero data.
+    GEMINI_FALLBACK_MODELS: str = os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-2.5-flash,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-2.0-flash",
+    )
+
+    def gemini_model_chain(self) -> list[str]:
+        """The configured model first, then the fallbacks, de-duplicated."""
+        chain, seen = [], set()
+        for m in [self.GEMINI_MODEL, *self.GEMINI_FALLBACK_MODELS.split(",")]:
+            m = m.strip()
+            if m and m not in seen:
+                seen.add(m)
+                chain.append(m)
+        return chain
+
     def gemini_keys(self) -> list[str]:
         """All configured Gemini keys, in priority order, de-duplicated."""
         raw = [self.GEMINI_API_KEY, *self.GEMINI_API_KEYS.split(","),
@@ -63,16 +92,35 @@ class Settings:
         return out
 
     # AgentCost (agentcost.tech) — OPTIONAL LLM cost tracking. When both values
-    # are set, main.py initializes the SDK, which patches the anthropic/openai
-    # client libraries and reports per-call metadata (model, token counts, cost,
-    # latency — NOT prompt content) to the AgentCost dashboard. Leave empty to
-    # disable entirely. NOTE: it does NOT patch the native groq SDK, so the
-    # groq provider path is not tracked (only anthropic, and ollama-via-openai).
+    # are set, main.py initializes the SDK, which patches the anthropic/openai/
+    # google-genai client libraries and reports per-call metadata (model, token
+    # counts, cost, latency — NOT prompt content) to the AgentCost dashboard.
+    # Leave empty to disable entirely. NOTE: it does NOT patch the native groq
+    # SDK, so LLM_PROVIDER=groq is untracked; anthropic, gemini, and the
+    # OpenAI-compatible providers (ollama/lmstudio/cerebras/nvidia) all are.
+    # A model absent from main.py's _AGENTCOST_PRICING records at $0.00.
     AGENTCOST_API_KEY: str = os.getenv("AGENTCOST_API_KEY", "")
     AGENTCOST_PROJECT_ID: str = os.getenv("AGENTCOST_PROJECT_ID", "")
     AGENTCOST_DEBUG: bool = os.getenv("AGENTCOST_DEBUG", "false").lower() in (
         "1", "true", "yes",
     )
+
+    # Cerebras (free tier, ~1M tokens/day — no daily REQUEST cap, unlike Gemini's
+    # ~20/day). OpenAI-compatible, so it routes through the Groq backend just
+    # like Ollama does. Set LLM_PROVIDER=cerebras to use it. This account serves
+    # gpt-oss-120b, zai-glm-4.7 and gemma-4-31b only (NO llama-3.3-70b).
+    CEREBRAS_API_KEY: str = os.getenv("CEREBRAS_API_KEY", "")
+    CEREBRAS_BASE_URL: str = os.getenv("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
+    CEREBRAS_MODEL: str = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+
+    # NVIDIA NIM (build.nvidia.com) — FREE with an NVIDIA Developer account, no
+    # card, ~40 req/min. The ONLY free remote tier verified to accept this app's
+    # full ~20k-token prompt (Groq caps at 12k TPM, GitHub Models at 8k in).
+    # OpenAI-compatible -> reuses this Groq backend. NOTE: many NIM models hang
+    # or refuse tool calls; openai/gpt-oss-20b is the verified-good one.
+    NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
+    NVIDIA_BASE_URL: str = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    NVIDIA_MODEL: str = os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
 
     # Ollama (LOCAL, offline testing). Runs a model on this machine via Ollama's
     # OpenAI-compatible endpoint — no API key, no internet, no daily quota. Set
@@ -80,6 +128,29 @@ class Settings:
     # the same tool-calling dialect). Run `ollama pull <model>` first.
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+
+    # LM Studio (LOCAL, offline testing). Same idea as Ollama — an
+    # OpenAI-compatible server, so it also routes through the Groq backend. Set
+    # LLM_PROVIDER=lmstudio to use it. In LM Studio: load the model, open the
+    # Developer/Server tab, Start Server, and copy the model id it shows into
+    # LMSTUDIO_MODEL. Two things the model MUST have, or this app cannot work:
+    #   * TOOL / function calling  — every answer here comes from run_sql;
+    #     a model without tool support returns chat text and zero data.
+    #   * a big context length     — the schema prompt is ~20k tokens with
+    #     SCHEMA_MAX_COLS=0, and LM Studio defaults new models to ~4k. Raise
+    #     the context slider to 32k+ or the prompt is silently truncated.
+    # If LM Studio runs on a DIFFERENT machine, point the URL at that machine's
+    # IP and enable "Serve on Local Network" in LM Studio's server settings.
+    LMSTUDIO_BASE_URL: str = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
+    LMSTUDIO_MODEL: str = os.getenv("LMSTUDIO_MODEL", "qwen2.5-7b-instruct")
+
+    # Output-token budget per model call (groq_backend). The 2048 default was
+    # tuned for the free tiers, where it fits both the mandated answer format and
+    # a tight tokens-per-minute budget. REASONING models (Gemma 4, gpt-oss) spend
+    # part of this budget thinking before they write, so the visible answer gets
+    # less than the number suggests — raise it for those. A local model has no
+    # per-minute quota, so there is no cost to a bigger budget there.
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2048"))
 
     # Max columns shown per table in the schema context.
     # TEMPORARY token-saving cap for the free tier. Set SCHEMA_MAX_COLS=0
