@@ -1,0 +1,78 @@
+# End-to-end test stack: EVERYTHING in containers, including the database.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --build
+#   python -m scripts.e2e_restore          # restore the .bak into the db container
+#   python -m scripts.e2e_check            # prove the whole chain works
+#   open http://localhost:8080
+#
+# WHY A SEPARATE FILE
+# -------------------
+# docker-compose.yml describes the CLIENT DEPLOYMENT: the backend talks to their
+# real SQL Server on the host (DB_SERVER=host.docker.internal) as the read-only
+# glowstar_ro login. That is correct for production and must not change just to
+# get a test rig, so this override layers the test wiring on top:
+#
+#   * starts the bundled `db` container (normally behind the "bundled-db" profile)
+#   * repoints the backend at it, so nothing depends on the host's SQL Server
+#   * mounts the backup folder READ-ONLY, so a 6 GB .bak is never copied and can
+#     never be modified by the container
+#
+# The host's own SQL Server Express is left completely alone.
+#
+# CONFIG (in .env, both optional):
+#   BACKUP_DIR   folder holding the .bak. Default ./db_backup. Point it at the
+#                real backup folder to avoid duplicating several GB, e.g.
+#                BACKUP_DIR=C:/Program Files/Microsoft SQL Server/MSSQL17.SQLEXPRESS/MSSQL/Backup
+#   DB_SA_PASSWORD, DB_RO_PASSWORD  as in .env.docker.example
+
+services:
+  db:
+    # Clear the "bundled-db" profile: in THIS stack the database is not optional.
+    # `!reset` is required - a plain `profiles: []` is MERGED with the base
+    # file's list (sequences append), so the profile survived and compose then
+    # rejected the whole project with "backend depends on undefined service db".
+    profiles: !reset []
+    volumes:
+      # Long syntax on purpose. The short "source:target:ro" form splits on ":",
+      # which mangles a Windows path ("C:/Program Files/...") and cannot express
+      # a source containing spaces. Merged by target path, so this replaces the
+      # ./db_backup mount from the base file rather than adding a second one.
+      - type: bind
+        source: ${BACKUP_DIR:-./db_backup}
+        target: /var/opt/mssql/backup
+        read_only: true
+      - type: volume
+        source: mssql_data
+        target: /var/opt/mssql
+    # `!override` REPLACES the base list. Without it compose MERGES the two, and
+    # the base file's plain "1433:1433" survives alongside this one - leaving the
+    # whole ERP database listening on 0.0.0.0 for anyone on the LAN. Verified in
+    # `docker compose config`: two published 1433 entries, only one of them bound
+    # to loopback. The base publishes wide on purpose (so a .bak can be restored
+    # from SSMS on another machine); a local test rig has no such need.
+    ports: !override
+      - "127.0.0.1:1433:1433"
+
+  backend:
+    environment:
+      # Beat .env AND the base file: `environment` wins over `env_file`, and this
+      # override wins over the base service's `environment`.
+      DB_SERVER: db
+      DB_NAME: ${DB_NAME:-AasthaErp_new}
+      DB_USER: glowstar_ro
+      DB_PASSWORD: ${DB_RO_PASSWORD}
+    depends_on:
+      db:
+        # Do not start answering questions before the database can be queried.
+        condition: service_healthy
+    ports:
+      # Loopback only, so the e2e checks can hit the API directly and read the
+      # SSE stream without going through nginx. Not published in the base file
+      # by design - see the comment there.
+      #
+      # Configurable because 8000 is a popular port and is frequently already
+      # taken by another project's stack on a developer machine (it was here -
+      # the container refused to start with "Bind for 127.0.0.1:8000 failed:
+      # port is already allocated"). Set E2E_API_PORT in .env to move it;
+      # scripts/e2e_check.py reads the same variable.
+      - "127.0.0.1:${E2E_API_PORT:-8000}:8000"

@@ -21,7 +21,12 @@ from app.core.logging_util import log_interaction, log_provider_error
 # SUGGESTIONS) routinely exceeds it, which cut answers off mid-table with no
 # warning. Tool-selection rounds rarely need this much, but a single generous
 # cap is simpler and Claude only bills tokens actually generated.
-_MAX_TOKENS = 4096
+#
+# Read from settings (which returns 4096 for anthropic) rather than hard-coded,
+# so LLM_MAX_TOKENS in .env can override this provider too — it previously could
+# not, which made the knob mean different things depending on the provider.
+def _max_tokens() -> int:
+    return settings.max_output_tokens("anthropic")
 
 
 def _user_content(question: str, file_context: dict | None):
@@ -133,14 +138,24 @@ def ask_anthropic(
     force_tool = False        # require a tool call on the NEXT request (set by the nudge)
     dashboard_built = False   # did show_dashboard actually render this turn?
 
-    for _ in range(tools.MAX_TOOL_ROUNDS):
+    # Two SEPARATE budgets (see tools.MAX_CORRECTION_ROUNDS). tool_rounds counts
+    # only rounds that actually ran tools; corrections counts nudges/retries.
+    # They used to share one counter, so pushing a stalled model back on track
+    # cost it the very rounds it needed to finish the job.
+    tool_rounds = 0
+    corrections = 0
+
+    while (
+        tool_rounds < tools.MAX_TOOL_ROUNDS
+        and tool_rounds + corrections < tools.MAX_TOTAL_ROUNDS
+    ):
         try:
             choice = {"type": "any"} if force_tool else {"type": "auto"}
             force_tool = False  # one-shot
             response = call_with_retry(
                 lambda: client.messages.create(
                     model=model,
-                    max_tokens=_MAX_TOKENS,
+                    max_tokens=_max_tokens(),
                     system=system,
                     tools=_ANTHROPIC_TOOLS,
                     tool_choice=choice,
@@ -186,6 +201,7 @@ def ask_anthropic(
                     # this branch - appending it again would duplicate the turn
                     # and Claude rejects two assistant messages in a row.
                     messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
+                    corrections += 1
                     emit("Running the query…")
                     continue
                 break
@@ -206,6 +222,7 @@ def ask_anthropic(
                 force_tool = True
                 widgets = [w for w in widgets if not policy.has_data_visual([w])]
                 messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
+                corrections += 1
                 emit("Running the query…")
                 continue
             # Report-detail guard (client-flagged): "…report…" answered with a
@@ -220,6 +237,7 @@ def ask_anthropic(
                 nudged_report_detail = True
                 force_tool = True
                 messages.append({"role": "user", "content": policy.REPORT_DETAIL_NUDGE})
+                corrections += 1
                 emit("Building the detailed report…")
                 continue
             # Thin entity report: "report of <entity>" answered with only the
@@ -234,6 +252,7 @@ def ask_anthropic(
                 force_tool = True
                 # the assistant turn was already appended before this branch
                 messages.append({"role": "user", "content": policy.ENTITY_REPORT_NUDGE})
+                corrections += 1
                 emit("Building the full profile…")
                 continue
             # Dashboard guard (parity with groq/gemini): the question asked for
@@ -247,6 +266,7 @@ def ask_anthropic(
             ):
                 nudged_dashboard = True
                 messages.append({"role": "user", "content": policy.DASHBOARD_NUDGE})
+                corrections += 1
                 emit("Building your dashboard…")
                 continue
             # Honesty on output-length truncation: a max_tokens stop means the
@@ -271,6 +291,10 @@ def ask_anthropic(
         "data_sections": data_sections,
                 "file_grounded": file_grounded,
             }
+
+        # This round is REAL WORK: the model asked for tools. Only these
+        # count against the query budget (see tools.MAX_CORRECTION_ROUNDS).
+        tool_rounds += 1
 
         tool_results = []
         for block in response.content:
@@ -356,7 +380,7 @@ def ask_anthropic(
     synth_ok = True
     try:
         final = client.messages.create(
-            model=model, max_tokens=_MAX_TOKENS, system=system, messages=messages, temperature=0
+            model=model, max_tokens=_max_tokens(), system=system, messages=messages, temperature=0
         )
         answer = "".join(b.text for b in final.content if b.type == "text").strip()
     except Exception as exc:

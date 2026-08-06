@@ -40,9 +40,10 @@ import re
 MAX_EXECUTE_NUDGES = 2
 
 # NOTE: the per-call output budget deliberately does NOT live here. It is a
-# per-provider number, not shared policy - Claude uses 4096 while the free-tier
-# providers use settings.LLM_MAX_TOKENS to stay inside a tokens-per-minute cap.
-# Hoisting it would have quietly given one provider another's budget.
+# per-provider number, not shared policy - see settings.max_output_tokens(),
+# which gives each provider its own real headroom (Groq 2048 for its tight 12k
+# TPM tier, Gemini/Cerebras 8192, the rest 4096). Hoisting it would have quietly
+# given one provider another's budget.
 
 # Shown to the model when it presents data (a table, figures, or written-out
 # SQL) without having called run_sql. Generalises the old "you wrote SQL" nudge

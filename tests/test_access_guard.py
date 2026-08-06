@@ -100,3 +100,40 @@ def test_rules_tell_the_model_it_has_no_pay_access():
     assert "RESTRICTED DATA - SALARY" in RULES
     assert "BONUS and INCENTIVE ARE" in RULES, "bonus/incentive must stay allowed"
     assert "NO ACCESS" in RULES
+
+
+# ---------------------------------------------------------------------------
+# BONUS / INCENTIVE ARE ALLOWED — even when phrased with pay vocabulary.
+#
+# Regression lock. _PAY_RE matches "earning|earnings|earned", and is_pay_question
+# used to return True on it IMMEDIATELY, consulting the bonus/incentive exemption
+# only in the separate "how much did X get" branch. So every one of these was
+# refused despite the client explicitly permitting bonus and incentive — and it
+# broke section 7 (BONUS + INCENTIVE) of the "report of <entity>" profile the
+# RULES mandate.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("q", [
+    "bonus earnings of employee M4117",
+    "total bonus earned by the Fency department",
+    "incentive earnings kapan wise",
+    "how much incentive did M2139 earn last month",
+    "top employees by bonus",
+    "which karigar earned the most incentive points",
+])
+def test_bonus_and_incentive_questions_are_not_refused(q):
+    assert is_pay_question(q) is False, f"bonus/incentive must be allowed: {q}"
+
+
+@pytest.mark.parametrize("q", [
+    # An UNAMBIGUOUS salary word stays refused even alongside bonus: the refusal
+    # message already points the user at the bonus figures they can have.
+    "salary and bonus of M4117",
+    "payroll and incentive report",
+    "pagar ane bonus batavo",
+    # ...and the ambiguous words still mean salary with no bonus context.
+    "total earnings of the Fency department",
+    "highest paid employees",
+    "how much did M4117 earn",
+])
+def test_salary_is_still_refused(q):
+    assert is_pay_question(q) is True, f"salary must stay restricted: {q}"

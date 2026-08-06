@@ -8,8 +8,6 @@ Used when LLM_PROVIDER=groq (the free-tier testing setup).
 import json
 import re
 
-from groq import Groq
-
 from app.agent import attachments as attachments_mod
 from app.agent import loop_policy as policy
 from app.agent import result_capture, tools, widget
@@ -92,14 +90,30 @@ def _tools_for_provider():
     return _GROQ_TOOLS
 
 
-# Providers that speak the OpenAI dialect and therefore reuse this whole
-# backend — only the base_url and key differ. They are reached with the real
-# OpenAI SDK, NOT the Groq client: the Groq SDK hardcodes Groq's "/openai/v1/…"
-# request path and would 404 against them. The OpenAI client honours base_url
-# and exposes the identical chat.completions.create surface used below.
+# Every provider this backend serves speaks the OpenAI dialect — only the
+# base_url and key differ. All of them are reached with the real OpenAI SDK,
+# which honours base_url and exposes the chat.completions.create surface used
+# below. (The native Groq SDK could not serve the others even if we wanted it
+# to: it hardcodes Groq's own "/openai/v1/…" request path and 404s elsewhere.)
 #   provider -> (base_url attr, api-key attr, key-name for the error message)
 # A blank key-name means no key is needed (local Ollama / LM Studio).
+#
+# GROQ IS IN THIS MAP TOO, and is reached through Groq's own OpenAI-compatible
+# endpoint (https://api.groq.com/openai/v1) rather than the native groq SDK.
+#
+# Why: cost tracking. AgentCost patches the openai / anthropic / google-genai
+# client libraries; NO version of it patches the native groq client, so every
+# Groq turn was invisible on the dashboard - the one provider that could never
+# be costed. Routing it through the OpenAI client fixes that and deletes a
+# special case at the same time.
+#
+# Verified live before switching (2026-08-06): identical tool-calling behaviour
+# through this path - the model returned run_sql with correct SQL, usage came
+# back as 566 in / 20 out, and AgentCost recorded and delivered the event. The
+# only surface this backend uses is chat.completions.create(tools=...), which
+# both clients implement the same way.
 _OPENAI_COMPATIBLE = {
+    "groq":     ("GROQ_BASE_URL",     "GROQ_API_KEY",      "GROQ_API_KEY"),
     "ollama":   ("OLLAMA_BASE_URL",   None,                ""),
     "lmstudio": ("LMSTUDIO_BASE_URL", None,                ""),
     "cerebras": ("CEREBRAS_BASE_URL", "CEREBRAS_API_KEY",  "CEREBRAS_API_KEY"),
@@ -108,19 +122,23 @@ _OPENAI_COMPATIBLE = {
 
 
 def _client():
+    """The OpenAI-dialect client for whichever provider is configured.
+
+    Every provider this backend serves now goes through the OpenAI SDK, so there
+    is no longer a native-groq fallback branch. An unknown provider still lands
+    here (agent.ask routes anything unrecognised to this backend), so it is
+    treated as Groq - which is what the old fallback did.
+    """
+    from openai import OpenAI
+
     provider = settings.LLM_PROVIDER.lower()
-    spec = _OPENAI_COMPATIBLE.get(provider)
-    if spec:
-        from openai import OpenAI
-
-        base_attr, key_attr, key_name = spec
-        key = getattr(settings, key_attr) if key_attr else provider
-        if key_name and not key:
-            raise RuntimeError(f"{key_name} is not set in .env.")
-        return OpenAI(api_key=key, base_url=getattr(settings, base_attr))
-    if not settings.GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not set in .env.")
-    return Groq(api_key=settings.GROQ_API_KEY)
+    base_attr, key_attr, key_name = _OPENAI_COMPATIBLE.get(
+        provider, _OPENAI_COMPATIBLE["groq"]
+    )
+    key = getattr(settings, key_attr) if key_attr else provider
+    if key_name and not key:
+        raise RuntimeError(f"{key_name} is not set in .env.")
+    return OpenAI(api_key=key, base_url=getattr(settings, base_attr))
 
 
 
@@ -133,30 +151,24 @@ def _client():
 
 
 
-# Output budget per model call. 1024 was too small for the mandated answer
-# format (intro + ~30-row preview table + conclusion + download pointer +
-# SUGGESTIONS) and cut listing answers off mid-table. 2048 fits it while
-# staying inside the free tier's tokens-per-minute budget. Overridable via
-# LLM_MAX_TOKENS because reasoning models (Gemma 4 in LM Studio) spend part of
-# this budget on hidden thinking, leaving too little for the answer itself.
-_MAX_TOKENS = settings.LLM_MAX_TOKENS
-
-# Shown to the model when it presents data (a table, figures, or written-out
-# SQL) without having called run_sql. Generalises the old "you wrote SQL" nudge
-# so it ALSO catches a fabricated Markdown table that contains no literal SELECT
-# — the exact failure that let "packet report for kapan AA" fall through to the
-# canned refusal.
-policy.EXECUTE_NUDGE = (
-    "You presented data (a table, figures, or a query) but you did NOT call "
-    "run_sql, so nothing you showed is real. You MUST call the run_sql tool "
-    "NOW to fetch the actual rows from the database, then answer ONLY from the "
-    "rows it returns. If you already wrote a SQL query, run that EXACT query "
-    "(do not rewrite or simplify it). Never put a data table, chart, or numbers "
-    "in your reply without running run_sql first. If the query genuinely "
-    "returns no rows, say so plainly."
-)
+# Output budget per model call — resolved PER PROVIDER at call time, because
+# this one backend serves groq, cerebras, nvidia, ollama and lmstudio, whose
+# real budgets differ by 4x. It was a single module-level constant baked from
+# LLM_MAX_TOKENS (2048, tuned for Groq's tight 12k TPM tier), so Cerebras and
+# NVIDIA were being held to Groq's limit for no reason — and 2048 cannot fit the
+# answer format the RULES mandate (a 30-row preview table alone is ~1.2-2k
+# tokens), which is a direct cause of answers truncating mid-table. See
+# settings.max_output_tokens(). LLM_MAX_TOKENS in .env still overrides.
+def _max_tokens() -> int:
+    return settings.max_output_tokens()
 
 
+# NOTE: this module used to REASSIGN policy.EXECUTE_NUDGE here at import time,
+# with a byte-identical copy of the string already defined in loop_policy.py.
+# Harmless in effect, but it was a provider module reaching in and mutating
+# shared policy for all three backends — exactly the coupling loop_policy.py was
+# extracted to remove, and a trap for anyone who later edited one copy. Removed;
+# policy.EXECUTE_NUDGE is used directly below.
 
 
 def ask_groq(
@@ -204,8 +216,18 @@ def ask_groq(
     dashboard_built = False    # did show_dashboard actually render this turn?
     retried_bad_tool_call = False  # one retry when Groq rejects a tool call's arguments
 
+    # Two SEPARATE budgets (see tools.MAX_CORRECTION_ROUNDS). tool_rounds counts
+    # only rounds that actually ran tools; corrections counts nudges/retries.
+    # They used to share one counter, so pushing a stalled model back on track
+    # cost it the very rounds it needed to finish the job.
+    tool_rounds = 0
+    corrections = 0
+
     emit("Analyzing your question…")
-    for _ in range(tools.MAX_TOOL_ROUNDS):
+    while (
+        tool_rounds < tools.MAX_TOOL_ROUNDS
+        and tool_rounds + corrections < tools.MAX_TOTAL_ROUNDS
+    ):
         try:
             choice = "required" if force_tool else "auto"
             force_tool = False  # one-shot
@@ -216,7 +238,7 @@ def ask_groq(
                     tools=_tools_for_provider(),
                     tool_choice=choice,
                     temperature=0,  # deterministic: same question -> same SQL, no drift
-                    max_tokens=_MAX_TOKENS,
+                    max_tokens=_max_tokens(),
                 )
             )
         except Exception as exc:
@@ -240,6 +262,7 @@ def ask_groq(
                         "tool call again with the same data."
                     ),
                 })
+                corrections += 1
                 emit("Retrying…")
                 continue
             log_interaction(question, sql_used, last_row_count, error=str(exc))
@@ -268,6 +291,12 @@ def ask_groq(
                 settings.LLM_PROVIDER, model,
                 RuntimeError("provider returned no choices"),
             )
+            # A dead round, not a query round. This is the only correction that
+            # can REPEAT (the nudges are one-shot), so it checks the budget
+            # itself; break falls through to the write-up, keeping the data.
+            corrections += 1
+            if corrections >= tools.MAX_CORRECTION_ROUNDS:
+                break
             continue
 
         msg = response.choices[0].message
@@ -298,6 +327,7 @@ def ask_groq(
                     execute_nudges += 1
                     force_tool = True
                     messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
+                    corrections += 1
                     emit("Running the query…")
                     continue
                 break
@@ -339,6 +369,7 @@ def ask_groq(
                 widgets = [w for w in widgets if not policy.has_data_visual([w])]
                 messages.append({"role": "assistant", "content": answer})
                 messages.append({"role": "user", "content": policy.EXECUTE_NUDGE})
+                corrections += 1
                 emit("Running the query…")
                 continue
             # Report-detail guard (client-flagged): "…report…" question answered
@@ -356,6 +387,7 @@ def ask_groq(
                 force_tool = True
                 messages.append({"role": "assistant", "content": answer})
                 messages.append({"role": "user", "content": policy.REPORT_DETAIL_NUDGE})
+                corrections += 1
                 emit("Building the detailed report…")
                 continue
             # Thin entity report: "report of <entity>" answered with only the
@@ -372,6 +404,7 @@ def ask_groq(
                 force_tool = True
                 messages.append({"role": "assistant", "content": answer})
                 messages.append({"role": "user", "content": policy.ENTITY_REPORT_NUDGE})
+                corrections += 1
                 emit("Building the full profile…")
                 continue
             # Dashboard guard: the question asked for analytics/overview/
@@ -389,6 +422,7 @@ def ask_groq(
                 nudged_dashboard = True
                 messages.append({"role": "assistant", "content": answer})
                 messages.append({"role": "user", "content": policy.DASHBOARD_NUDGE})
+                corrections += 1
                 emit("Building your dashboard…")
                 continue
             log_interaction(question, sql_used, last_row_count)
@@ -402,6 +436,10 @@ def ask_groq(
         "data_sections": data_sections,
                 "file_grounded": file_grounded,
             }
+
+        # This round is REAL WORK: the model asked for tools. Only these
+        # count against the query budget (see tools.MAX_CORRECTION_ROUNDS).
+        tool_rounds += 1
 
         # Record the assistant turn (with its tool calls).
         messages.append(
@@ -503,7 +541,7 @@ def ask_groq(
     synth_ok = True
     try:
         final = client.chat.completions.create(
-            model=model, messages=messages, temperature=0, max_tokens=_MAX_TOKENS
+            model=model, messages=messages, temperature=0, max_tokens=_max_tokens()
         )
         # Same empty-choices guard as the tool loop: a 200 with no choices must
         # not become an IndexError after every query has already run.

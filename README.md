@@ -81,3 +81,41 @@ the AasthaErp database. LLM provider is set in `.env`
 docker compose up -d --force-recreate backend
 docker compose exec backend python -c "from app.config import settings; print(settings.LLM_PROVIDER)"
 
+## End-to-end test stack (everything in containers)
+
+`docker-compose.yml` describes the CLIENT deployment: the backend talks to their
+real SQL Server on the host. For testing there is a second, fully self-contained
+stack that runs the database in a container too, so nothing depends on a
+particular machine's SQL Server setup.
+
+```powershell
+# 1. Tell it where the .bak lives (in .env). Bind-mounted READ-ONLY, so the
+#    ~6 GB backup is never copied and the container cannot modify it.
+#    BACKUP_DIR=C:/Program Files/Microsoft SQL Server/MSSQL17.SQLEXPRESS/MSSQL/Backup
+
+# 2. Start the database and restore the backup into it (~30-60s for 6.6 GB).
+docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d db
+python -m scripts.e2e_restore
+
+# 3. Bring up the rest and verify the whole chain.
+docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --build
+python -m scripts.e2e_check           # infrastructure only, no provider quota
+python -m scripts.e2e_check --ask     # ...plus one real question
+
+# http://localhost:8080
+```
+
+`scripts/e2e_restore.py` reads the backup's real logical file names with
+`RESTORE FILELISTONLY` rather than assuming them — this backup's files are
+called `JogiErp`/`JogiErp_log`, not `AasthaErp`, so the hardcoded snippet in
+`docker-compose.yml` fails. It also creates the read-only `glowstar_ro` login
+the backend uses and proves writes are rejected.
+
+Notes:
+- The db container publishes **loopback only** (`127.0.0.1:1433`), unlike the
+  base file which publishes wide so a `.bak` can be restored from SSMS elsewhere.
+- `.env`'s `DB_SERVER` is for code run on the HOST (pytest, `scripts/cold_test.py`);
+  the backend container gets `DB_SERVER=db` from the override.
+- Teardown: `docker compose -f docker-compose.yml -f docker-compose.e2e.yml down`
+  (add `-v` to also drop the restored database volume).
+

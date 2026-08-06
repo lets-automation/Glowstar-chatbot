@@ -144,3 +144,80 @@ def test_stream_returns_the_picker_without_calling_the_model(monkeypatch):
 ])
 def test_current_state_questions_never_ask_for_a_date(q):
     assert needs_date(q) is False, q
+
+
+# ---------------------------------------------------------------------------
+# PERIOD MEMORY across turns.
+#
+# Regression lock. needs_date() declared `history` and documented it as handling
+# follow-ups, but the body never read it and main.py never passed it. So the
+# picker re-appeared on EVERY follow-up: the user tapped "June 2026", then
+# "now the damage report" put the picker straight back on screen, and again for
+# the turn after that. The period they already chose is right there in the
+# conversation.
+# ---------------------------------------------------------------------------
+def _hist(*questions):
+    return [{"role": "user", "content": q} for q in questions]
+
+
+@pytest.mark.parametrize("q,history", [
+    ("give me the damage report", _hist("production for June 2026")),
+    ("now the damage report", _hist("stock report", "from 1 Jun to 30 Jun 2026")),
+    ("kapan wise production", _hist("show me last month's output")),
+    ("and the jangad report", _hist("GIA results for 2026-06-01 to 2026-06-30")),
+])
+def test_period_already_given_in_the_thread_suppresses_the_picker(q, history):
+    assert needs_date(q, history) is False, q
+
+
+@pytest.mark.parametrize("q,history", [
+    # No period anywhere -> still ask.
+    ("give me the damage report", _hist("hello", "what is a kapan")),
+    ("kapan wise production", None),
+    ("stock report", []),
+    # Too far back: the conversation has moved on, so asking again is right.
+    ("stock report", _hist("June 2026 report", "a", "b", "c", "d")),
+])
+def test_picker_still_appears_when_no_recent_period(q, history):
+    assert needs_date(q, history) is True, q
+
+
+def test_only_user_turns_count_as_the_period_source():
+    """An assistant message mentioning a month is not the user choosing one."""
+    history = [{"role": "assistant", "content": "In June 2026 there were 305 packets."}]
+    assert needs_date("give me the damage report", history) is True
+
+
+def test_api_passes_history_to_the_gate():
+    """main.py must actually hand the conversation to the gate - the whole bug
+    was that it never did."""
+    import inspect
+
+    import app.api.main as _main
+
+    src = inspect.getsource(_main)
+    assert src.count("date_gate.needs_date(request.question, convo_history)") == 2, (
+        "both /chat and /chat/stream must pass history to the date gate"
+    )
+
+
+def test_gates_survive_an_unreachable_redis(monkeypatch):
+    """The deterministic gates are supposed to need NO infrastructure - no LLM,
+    no DB, and no session store. Loading history moved ahead of the date gate so
+    the gate can see a period given earlier in the thread; that must not make a
+    Redis outage break the reply. Conversation memory is optional CONTEXT."""
+    from app.api import sessions
+
+    def _boom(*a, **k):
+        raise ConnectionError("Error 10061 connecting to localhost:6379")
+
+    monkeypatch.setattr(sessions, "get_history", _boom)
+    monkeypatch.setattr(sessions, "add_turn", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_ask_with_cost_tracking",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("the gate must not reach the model")))
+
+    r = client.post("/chat/stream",
+                    json={"question": "give me the damage report", "session_id": "redis-down"})
+    assert r.status_code == 200
+    assert '"ask_date": true' in r.text.replace("'", '"').lower()

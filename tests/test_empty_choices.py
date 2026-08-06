@@ -40,7 +40,27 @@ def test_the_backend_guards_empty_choices():
     src = inspect.getsource(groq_backend)
     assert "if not response.choices:" in src, \
         "the empty-choices guard is gone; an empty provider reply will crash the turn"
-    # It must not simply return: data gathered so far should survive and the
-    # end-of-loop write-up should still run.
-    guard = src.split("if not response.choices:", 1)[1][:400]
-    assert "continue" in guard, "an empty round must not abandon the turn"
+    # It must not simply RETURN: the data gathered so far should survive and the
+    # end-of-loop write-up should still run. Both `continue` (retry the round)
+    # and `break` (stop retrying, go straight to the write-up) satisfy that; a
+    # bare `return` from inside the loop does not, because it skips the write-up
+    # and hands back whatever partial state the turn happened to hold.
+    #
+    # The window is generous on purpose. It used to be 400 characters, which made
+    # the test fail when an explanatory COMMENT was added above the branch - it
+    # was measuring how much prose sits next to the code rather than what the
+    # code does.
+    import re
+
+    guard = src.split("if not response.choices:", 1)[1][:900]
+    assert "continue" in guard or "break" in guard, \
+        "an empty round must not abandon the turn"
+    # Everything up to whichever control-flow exit comes first.
+    exit_at = min(
+        (i for i in (guard.find("continue"), guard.find("break")) if i != -1),
+        default=len(guard),
+    )
+    # \breturn\b, not a substring search: the log line above this branch contains
+    # the words "provider returned no choices".
+    assert not re.search(r"\breturn\b", guard[:exit_at]), \
+        "an empty round must not return early and skip the write-up"

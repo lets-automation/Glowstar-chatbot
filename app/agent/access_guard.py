@@ -21,18 +21,35 @@ from __future__ import annotations
 
 import re
 
-# Words that make a question about what a PERSON IS PAID. Includes the Gujlish
-# the client's staff type ("pagar" = salary, "paisa"/"rupiya" in a pay context).
-_PAY_RE = re.compile(
+# UNAMBIGUOUS salary words. These mean the wage itself and nothing else, so they
+# are refused even when the question also mentions bonus - the refusal message
+# already points the user at the bonus/incentive figures they CAN have.
+_HARD_PAY_RE = re.compile(
     r"\b("
     r"salary|salaries|salaried|payroll|pay-?slip|payslip|wage|wages|"
     r"pagar|pagaar|talab|tankha|"                       # Gujarati/Hindi for salary
-    r"earning|earnings|earned|earner|earners|income|remuneration|compensation|ctc|"
-    r"take-?home|net\s*pay|gross\s*pay|paid\s+to|highest\s*paid|top\s*paid|best\s*paid|"
+    r"remuneration|compensation|ctc|take-?home|net\s*pay|gross\s*pay|"
     r"labour\s*(amount|pay|cost|charge)|labor\s*(amount|pay|cost|charge)|"
     r"finallabour|final\s*labour"
     r")\b",
     re.IGNORECASE,
+)
+
+# AMBIGUOUS pay words. On their own they mean salary ("total earnings of the
+# Fency department"), but paired with bonus or incentive they mean the ALLOWED
+# figure ("bonus earnings of M4117"). Splitting these out of the hard list is
+# what fixes the false refusals - see is_pay_question.
+_SOFT_PAY_RE = re.compile(
+    r"\b("
+    r"earning|earnings|earned|earner|earners|income|"
+    r"paid\s+to|highest\s*paid|top\s*paid|best\s*paid"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Kept as the union so anything importing it keeps its old meaning.
+_PAY_RE = re.compile(
+    f"(?:{_HARD_PAY_RE.pattern})|(?:{_SOFT_PAY_RE.pattern})", re.IGNORECASE
 )
 
 # BONUS and INCENTIVE are explicitly ALLOWED (client decision): they are the
@@ -60,14 +77,42 @@ def is_pay_question(question: str) -> bool:
     """
     True if the question asks for SALARY / wages / earnings (the wage itself).
 
-    Bonus and incentive are ALLOWED, so a question about them is let through even
-    though it uses "how much did X get" phrasing.
+    Bonus and incentive are ALLOWED (client decision), so a question about them
+    is let through even when it uses pay vocabulary.
+
+    ORDER MATTERS. The bonus/incentive exemption used to be checked ONLY in the
+    "how much did X get" branch, while _PAY_RE returned True immediately - and
+    _PAY_RE matches "earning|earnings|earned". So every one of these was refused
+    despite being explicitly permitted:
+
+        "bonus earnings of employee M4117"
+        "total bonus earned by the Fency department"
+        "incentive earnings kapan wise"
+
+    That also broke section 7 of the "report of <entity>" profile the RULES
+    mandate, which is BONUS + INCENTIVE. The exemption now applies to the whole
+    check, not one branch of it.
+
+    The exemption is safe because the actual wage columns are blocked
+    independently at execution (sql_selects_pay_data / FinalLabour +
+    LabourAmount), so letting a bonus question through cannot reach salary data
+    even if it is phrased with pay words.
     """
     q = question or ""
-    if _PAY_RE.search(q):
+
+    # An unambiguous salary word is restricted no matter what else is asked. A
+    # question about "salary and bonus" still gets the refusal, which names the
+    # bonus figures as available.
+    if _HARD_PAY_RE.search(q):
         return True
-    # "how much did X get" -> only restricted when it is NOT about bonus/incentive.
-    return bool(_PAY_PHRASE_RE.search(q)) and not _ALLOWED_PAY_TOPIC_RE.search(q)
+
+    # Otherwise, an explicit bonus/incentive topic makes the pay vocabulary mean
+    # the ALLOWED figure ("bonus earnings", "incentive earned"), not the wage.
+    if _ALLOWED_PAY_TOPIC_RE.search(q):
+        return False
+
+    # No bonus context: the ambiguous words mean salary.
+    return bool(_SOFT_PAY_RE.search(q) or _PAY_PHRASE_RE.search(q))
 
 
 def refusal_response(question: str = "") -> dict:

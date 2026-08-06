@@ -144,22 +144,51 @@ def test_no_backend_uses_1024_max_tokens():
 def test_anthropic_handles_max_tokens_stop():
     src = _src("app/agent/anthropic_backend.py")
     assert '== "max_tokens"' in src
-    assert "_MAX_TOKENS = 4096" in src
 
 
 def test_groq_handles_length_finish_reason():
-    src = _src("app/agent/groq_backend.py")
-    assert '== "length"' in src
-    # Configurable via LLM_MAX_TOKENS now (reasoning models such as Gemma 4 in
-    # LM Studio spend part of the budget thinking before they write), but it must
-    # never drop below the 2048 the truncation audit settled on as the minimum
-    # for the mandated answer format.
-    assert "_MAX_TOKENS = settings.LLM_MAX_TOKENS" in src
-    assert 'LLM_MAX_TOKENS", "2048"' in _src("app/config.py")
+    assert '== "length"' in _src("app/agent/groq_backend.py")
 
-    from app.agent.groq_backend import _MAX_TOKENS
 
-    assert _MAX_TOKENS >= 2048
+# The output budget is now resolved PER PROVIDER (settings.max_output_tokens),
+# because one backend serves groq/cerebras/nvidia/ollama/lmstudio and holding
+# them all to Groq's tight 12k-TPM number truncated answers on providers with
+# far more headroom.
+#
+# These two assertions carry the intent the old source-grep versions were
+# protecting, but behaviourally and across EVERY provider rather than for the one
+# whose constant happened to be named in the test:
+#   * no provider may drop below 2048 - the minimum the truncation audit settled
+#     on for the mandated answer format (intro + ~30-row table + conclusion +
+#     download pointer + SUGGESTIONS);
+#   * LLM_MAX_TOKENS in .env must still override, so a tightening provider limit
+#     can be pinned without a code change.
+_ALL_PROVIDERS = (
+    "groq", "gemini", "cerebras", "nvidia", "ollama", "lmstudio",
+    "anthropic", "claude",
+)
+
+
+@pytest.mark.parametrize("provider", _ALL_PROVIDERS)
+def test_no_provider_budget_below_the_2048_floor(provider):
+    from app.config import settings
+
+    assert settings.max_output_tokens(provider) >= 2048, (
+        f"{provider} would truncate the mandated answer format"
+    )
+
+
+def test_unknown_provider_still_gets_a_safe_budget():
+    from app.config import settings
+
+    assert settings.max_output_tokens("something-new") >= 2048
+
+
+def test_env_override_still_wins(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setenv("LLM_MAX_TOKENS", "3000")
+    assert Settings().max_output_tokens("groq") == 3000
 
 
 def test_lmstudio_tool_schemas_have_no_union_types():

@@ -1257,6 +1257,14 @@ TABLE_NOTES = {
         "status": "verify",
     },
     "tblPctChecker": {
+        # ALIASES: the words people use for this table. Scored at full NAME
+        # weight by the router (see router._name_keywords). Needed because the
+        # name tokenises to {pct, checker} and shares no word with any real
+        # question about it, so it lost every time to the tables actually called
+        # tblPacket*. Without this it was rank 43 of 87 on "employee wise GIA
+        # results" - a table the RULES explicitly send the model to.
+        "aliases": "maker polisher polished made make mfg manufacturer "
+                   "attribution employee worker karigar who gia certified",
         "note": (
             "Attribution: who MADE and who POLISHED each packet — PacketId, Kapan, "
             "PacketNo, MfgEmpId/MfgEmpCode (manufacturer) and PolishEmpId/PolishEmpCode "
@@ -1350,6 +1358,25 @@ TABLE_NOTES = {
             "tblEmpDetail.Emp_ID and filter on City."
         ),
         "status": "verify",
+    },
+    "tblDepartMent": {
+        "note": (
+            "THE department master — one row per department / factory stage, 92 rows "
+            "(note the odd casing: DepartMent). Columns: ID, Name, IsActive. This is the "
+            "lookup that turns a numeric department id into a NAME, so any 'department "
+            "wise / dept wise / which department' answer joins it: "
+            "tblPacket.DepartMentId = tblDepartMent.ID. (tblPointRateLabour and "
+            "tblEmployee instead carry the department as TEXT — DepartmentName / "
+            "DepartMentName — so those need no join.) The live WIP-by-department answer "
+            "is tblPacket: JOIN tblDepartMent d ON d.ID = p.DepartMentId WHERE "
+            "p.RunningProcess <> 'IN Stock' GROUP BY d.Name. "
+            "TRAP: IsActive is 1 on ALL 92 rows, so filtering on it narrows nothing — "
+            "never report it as 'active departments'; 62 departments actually have an "
+            "active employee. Department NAMES are inconsistently spaced ('MFG - 1' vs "
+            "'MFG-2', plus 'VL MFG -1 Checker'), so match with LIKE, and prefer the "
+            "exact spellings already supplied in the EXACT STORED VALUES block."
+        ),
+        "status": "confirmed",
     },
     "tblKapan": {
         "note": (

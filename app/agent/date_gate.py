@@ -92,18 +92,42 @@ def is_report_question(question: str) -> bool:
     return bool(_REPORT_RE.search(q) or _WISE_RE.search(q))
 
 
+# How many recent user turns can still supply the period. The picker sends the
+# range back as its own turn, and people then ask two or three follow-ups off it
+# ("now damage", "and kapan wise") before moving on. Beyond a few turns the
+# conversation has usually moved to a new topic, so asking again is right.
+_PERIOD_MEMORY_TURNS = 3
+
+
+def period_in_history(history: list[dict] | None) -> bool:
+    """True if a recent USER turn already pinned down a period."""
+    recent = [
+        m.get("content", "")
+        for m in (history or [])
+        if m.get("role") == "user"
+    ][-_PERIOD_MEMORY_TURNS:]
+    return any(mentions_period(text) for text in recent)
+
+
 def needs_date(question: str, history: list[dict] | None = None) -> bool:
     """
     Should we show the date picker instead of answering?
 
-    Only when the question reads like a report AND names no period. A follow-up
-    that already carries dates (what the picker sends back) passes straight
-    through, as does any non-report question.
+    Only when the question reads like a report AND no period is known - from the
+    question itself OR from the recent conversation.
+
+    `history` was declared and documented here from the start but never actually
+    read, and main.py never passed it. So the picker re-asked on every follow-up:
+    the user picked "June 2026", then "now the damage report" put the picker back
+    on screen, and again for the next follow-up. The period the user already
+    chose is right there in the conversation - use it.
     """
     q = (question or "").strip()
     if not q or len(q) < 3:
         return False
     if mentions_period(q) or asks_current_state(q):
+        return False
+    if period_in_history(history):
         return False
     return is_report_question(q)
 

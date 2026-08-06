@@ -11,6 +11,7 @@ for the AI agent. Everything here is READ-ONLY (it only queries the
 SQL Server system catalog).
 """
 
+import re
 from functools import lru_cache
 
 from sqlalchemy import text
@@ -33,6 +34,28 @@ def is_business_table(name: str) -> bool:
     if lower.startswith(_EXCLUDED_PREFIXES):
         return False
     return lower.startswith("tbl")
+
+
+# Backup/edit/demo/compare/GIA table variants: stale, partial, or FAKE data.
+# Filtered out of find_tables AND out of schema routing, so the agent can never
+# discover or be shown one.
+#
+# WHY IT LIVES HERE: this used to sit in app/agent/tools.py, which imports the
+# router - so the router could not reuse it without a circular import, and the
+# router had no trap filter at all. extractor is the lowest layer both already
+# depend on, so one definition now serves both. tools.py re-exports it for the
+# existing callers and their regression test.
+_TRAP_TABLE_RE = re.compile(
+    # ^tblTest/^temp catch the tblPlanMaster clones (tblTestKapanPricePlanMaster,
+    # tblTestGXKapanPricePlanMaster) and tempCross found in the 2026-07 DB refresh.
+    r"(^tblTest|^temp|(?:_BKP|_BAK|_Backup|Edit|_Compare|_Demo|_Update|_old|Temp|GIA)$)",
+    re.IGNORECASE,
+)
+
+
+def is_trap_table(name: str) -> bool:
+    """True for a backup/demo/edit/compare copy that holds stale or fake data."""
+    return bool(_TRAP_TABLE_RE.search(name or ""))
 
 
 @lru_cache(maxsize=1)
@@ -148,6 +171,13 @@ def clear_schema_cache() -> None:
     get_tables.cache_clear()
     _all_columns.cache_clear()
     get_foreign_keys.cache_clear()
+    # The router caches its own derived views of this data (candidate columns,
+    # row counts, keyword sets). Clearing only the reads here would leave it
+    # serving the OLD schema after a refresh. Imported late to keep the
+    # dependency arrow pointing one way (router -> extractor).
+    from app.schema import router
+
+    router.clear_cache()
 
 
 # Quick manual check: `python -m app.schema.extractor`

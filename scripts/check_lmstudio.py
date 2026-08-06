@@ -140,7 +140,7 @@ try:
         messages=[{"role": "system", "content": system}, {"role": "user", "content": q}],
         tools=groq_backend._tools_for_provider(),
         tool_choice="auto",
-        max_tokens=settings.LLM_MAX_TOKENS, temperature=0,
+        max_tokens=settings.max_output_tokens("lmstudio"), temperature=0,
     )
     ch = r.choices[0]
     calls = ch.message.tool_calls or []

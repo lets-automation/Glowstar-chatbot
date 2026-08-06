@@ -4,7 +4,14 @@
 !.env.docker.example
 
 # Local dev artifacts - irrelevant or huge inside a container.
+# NOTE the leading-dot variants: a plain "venv/" does NOT match ".venv/" or
+# ".auditvenv/", so those were being sent to the daemon AND copied into the
+# image by "COPY . ." - ~300 MB of Windows-only files that cannot run on the
+# Linux base image anyway.
 venv/
+.venv/
+.auditvenv/
+*venv/
 node_modules/
 frontend/dist/
 frontend/node_modules/

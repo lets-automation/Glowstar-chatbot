@@ -67,31 +67,90 @@ def test_todays_date_is_still_given_to_the_model():
 
 def test_the_static_block_is_worth_caching():
     # If this ever collapses, the split has silently stopped paying for itself.
-    assert len(tools.static_prompt()) // 4 > 15_000, "static block unexpectedly small"
+    # The bar used to be 15k tokens, when the static block also carried all 48
+    # data notes. Those are now ROUTED per question (see the note-routing tests
+    # below), so the byte-stable part is the rules plus the exact dimension
+    # spellings - smaller on purpose, and still well worth a cache breakpoint.
+    assert len(tools.static_prompt()) // 4 > 2_000, "static block unexpectedly small"
 
 
-def test_the_static_block_is_most_of_the_prompt():
+def test_most_of_the_prompt_is_relevant_to_the_question():
+    """
+    The INVERSE of what this file used to assert, deliberately.
+
+    The old test required the static block to be >70% of the prompt, which was
+    true and was the problem: 26,150 static tokens of a ~30,000-token prompt,
+    87% instructions and 13% schema, with ~16k of it data notes that were mostly
+    irrelevant to whatever was asked. A prompt that is mostly fixed boilerplate
+    is a prompt the model has to find the answer inside.
+
+    Caching is not given up to get here - see dynamic_schema_for(). Providers
+    cache per BLOCK, and one question costs several tool rounds against an
+    identical per-question block, which is where the saving actually comes from.
+    """
     q = QUESTIONS[0]
     total = len(tools.system_prompt_for(q))
-    assert len(tools.static_prompt()) / total > 0.7, \
-        "the per-question tail has grown - most of the prompt is no longer cacheable"
+    per_question = len(tools.dynamic_schema_for(q))
+    assert per_question / total > 0.4, (
+        "the prompt has drifted back to mostly-fixed boilerplate - the "
+        "question-specific half is what makes an answer correct"
+    )
 
 
 # --- the guidance must not have been LOST in the move -----------------------
-# The data notes were relocated out of build_schema_context and into
-# static_prompt(). If that wiring breaks, answers get quietly worse (wrong colour
-# codes, the 'Florecent' misspelling) with every test still green.
+# The data notes moved from build_schema_context -> static_prompt() -> back into
+# the per-question block. If that wiring breaks, answers get quietly worse (wrong
+# colour codes, the 'Florecent' misspelling) with every test still green.
 def test_the_data_notes_still_reach_the_model():
     prompt = tools.system_prompt_for("how many stones have strong fluorescence")
     assert "Florecent" in prompt, "data notes lost - the misspelled column is unexplained"
 
 
-def test_data_notes_are_in_the_cached_part_not_the_tail():
-    assert "Florecent" in tools.static_prompt()
+# --- the notes must be ROUTED, not injected wholesale -----------------------
+# REGRESSION LOCK for a silent bypass. app/schema/note_router.py exists to send
+# only the guidance a question needs; its docstring explains that 48 competing
+# notes is a known reliability killer. It was DEAD CODE in production:
+# static_prompt() called render_data_notes() with NO question, so every note went
+# out on every turn, and every call that passed a question lived in a test.
+#
+# Nothing failed when that happened - the answers just got worse - which is
+# exactly why it needs a test.
+def test_the_data_notes_are_routed_not_injected_wholesale():
+    from app.schema.glossary import render_data_notes
+
+    everything = render_data_notes()                      # no question = all of them
+    for q in QUESTIONS[:4]:
+        routed = tools.dynamic_schema_for(q)
+        assert len(routed) < len(everything), (
+            f"the per-question block is larger than the ENTIRE note set for {q!r} - "
+            "the notes are being injected unrouted again"
+        )
+
+
+def test_routing_actually_varies_the_notes_between_questions():
+    """Two questions about different things must not receive identical guidance."""
+    from app.schema.glossary import render_data_notes
+
+    a = render_data_notes("how many stones have strong fluorescence")
+    b = render_data_notes("how many packets are on jangad")
+    assert a != b, "note routing is not discriminating between questions"
 
 
 def test_rules_are_in_the_cached_part():
     assert tools.RULES in tools.static_prompt()
+
+
+def test_the_static_block_no_longer_carries_every_note():
+    """The static block must not quietly reacquire the full note set - that is
+    the regression this whole split exists to prevent. Checked by SIZE rather
+    than by a keyword: 'Florecent' also appears in the RULES prose, so a
+    substring check here passes even when the notes are gone (it did)."""
+    from app.schema.glossary import render_data_notes
+
+    assert len(tools.static_prompt()) < len(render_data_notes()), (
+        "static_prompt() is as large as the entire note set - the notes are "
+        "back in the byte-stable block and routing is bypassed again"
+    )
 
 
 # --- the preview must cover what the model is told to display ---------------

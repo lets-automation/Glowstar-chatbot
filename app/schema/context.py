@@ -56,6 +56,18 @@ KEY_TABLES = [
     "tblParty",            # job-work parties / sub-contractors ("clients")
     "tblSupplier",         # rough suppliers ("clients/suppliers")
     "tblBuyerName",        # buyers ("clients/customers")
+    # Added 2026-08-06 after measuring routing against the real 239-table schema.
+    # Both are named by the RULES as the answer to a whole CLASS of questions, yet
+    # neither was a key table - so the two questions below were the only ones in a
+    # 12-case check that still routed wrong:
+    "tblPctChecker",       # maker/polisher attribution. The RULES call this the
+                           # "CLASSIC TRAP" for employee-wise packet/GIA results
+                           # (MfgEmpId/PolishEmpId), but its name tokenises to
+                           # {pct, checker} - it shares NO word with how anyone
+                           # asks for it, so lexical routing can never find it.
+    "tblDepartMent",       # the department dimension. Every "department wise"
+                           # answer must join it for the name, and dimension_values()
+                           # in tools.py already reads it as a core dimension.
 ]
 
 

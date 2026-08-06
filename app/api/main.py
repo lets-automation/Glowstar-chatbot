@@ -36,14 +36,26 @@ from app.core.rate_limit import enforce_history_rate_limit, enforce_rate_limit
 from app.database.runner import run_select
 
 # --- AgentCost (optional cost tracking; agentcost.tech) ---
-# Must run BEFORE any LLM client is used: the SDK monkey-patches the anthropic/
-# openai/google-genai client libraries so every call reports model, token counts,
-# cost and latency (metadata only — no prompt or answer content) to the AgentCost
-# dashboard. Best-effort by design: this is a young third-party SDK, so a
-# failure here logs a warning and the chatbot runs WITHOUT tracking — it must
-# never take the API down. Covers anthropic, gemini, and the OpenAI-compatible
-# providers (ollama/lmstudio/cerebras/nvidia); the native groq SDK is NOT
-# patched, so LLM_PROVIDER=groq turns are still invisible to it.
+# Must run BEFORE any LLM client is CREATED: the SDK monkey-patches the
+# anthropic / openai / google-genai client libraries so every call reports model,
+# token counts, cost and latency (metadata only — no prompt or answer content) to
+# the AgentCost dashboard. Best-effort by design: this is a young third-party
+# SDK, so a failure here logs a warning and the chatbot runs WITHOUT tracking —
+# it must never take the API down.
+#
+# WHAT IS AND IS NOT COVERED (verify against the startup banner, which names the
+# interceptors that actually loaded — that banner is what exposed the bug below):
+#   anthropic  yes    gemini  yes (needs SDK >= 0.1.4)
+#   openai-compatible (ollama / lmstudio / cerebras / nvidia)  yes
+#   groq       NO     the native groq SDK is not patched. See _client() in
+#                     groq_backend.py — LLM_PROVIDER=groq is invisible here.
+#
+# 2026-08-06 BUG: tracking had never worked. The pin was agentcost==0.1.3, which
+# shipped only openai_interceptor.py and anthropic_interceptor.py — no Gemini
+# interceptor existed in that release — while LLM_PROVIDER=gemini sent every call
+# through google.genai. The comment here claimed gemini was covered; the startup
+# banner disagreed ("Tracking initialized (LangChain, OpenAI, Anthropic)") and the
+# banner was right. Fixed by requirements.txt agentcost==0.1.7.
 
 # Rates in dollars per 1K tokens for every model this app can select. These go
 # in via custom_pricing, which the SDK consults FIRST — ahead of its own model
@@ -57,10 +69,19 @@ from app.database.runner import run_select
 # Source: AgentCost's own /v1/pricing table, read 2026-08-04. Re-check when
 # switching models — a model missing here is recorded at $0.00, not refused.
 _AGENTCOST_PRICING = {
-    # Gemini (GEMINI_MODEL) — free tier bills $0, priced here at list rate
-    # so the dashboard shows what the traffic WOULD cost on a paid key.
+    # Gemini — the free tier bills $0; priced here at list rate so the dashboard
+    # shows what the traffic WOULD cost on a paid key.
+    #
+    # EVERY model in the rotation must be listed. gemini_backend rotates through
+    # settings.gemini_model_chain() (GEMINI_MODEL + GEMINI_FALLBACK_MODELS) when a
+    # per-model quota runs out, so a turn can be answered by any of them — and a
+    # model missing here records at $0.00 rather than being refused, which reads
+    # on the dashboard as "that traffic was free" instead of "we forgot to price
+    # it". Keep this in step with GEMINI_FALLBACK_MODELS in .env.
     "gemini-3-flash-preview": {"input": 0.0005, "output": 0.003},
     "gemini-2.5-flash": {"input": 0.0003, "output": 0.0025},
+    "gemini-3.1-flash-lite": {"input": 0.0001, "output": 0.0004},
+    "gemini-2.0-flash": {"input": 0.0001, "output": 0.0004},
     # Anthropic (ANTHROPIC_MODEL)
     "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
     # Groq (GROQ_MODEL) — listed for when the native SDK does get patched.
@@ -70,8 +91,12 @@ _AGENTCOST_PRICING = {
     "gpt-oss-120b": {"input": 0.00022, "output": 0.00059},
     "openai/gpt-oss-20b": {"input": 0.00005, "output": 0.0002},
     "kimi-k2.6": {"input": 0.00095, "output": 0.004},
-    # LM Studio / Ollama run locally: no per-token cost.
+    # LM Studio / Ollama run locally: no per-token cost. Listed so a local run
+    # records $0.00 DELIBERATELY rather than by falling through as unpriced.
     "google/gemma-4-12b-qat": {"input": 0.0, "output": 0.0},
+    "qwen/qwen3.6-35b-a3b": {"input": 0.0, "output": 0.0},
+    "qwen2.5-7b-instruct": {"input": 0.0, "output": 0.0},
+    "qwen2.5:7b": {"input": 0.0, "output": 0.0},
 }
 
 _agentcost_track_costs = None
@@ -121,6 +146,17 @@ async def _lifespan(_app: FastAPI):
     # real running config and the backend import is deferred to boot.
     _log_startup_banner()
     yield
+    # FLUSH COST EVENTS ON SHUTDOWN. The SDK batches (batch_size 10, flush every
+    # 5s), so whatever is still in the buffer when the process stops is lost —
+    # and a container restart or a `docker compose down` is exactly when that
+    # happens. Its own atexit hook is not reliable under a SIGTERM'd uvicorn, so
+    # drain it here, where the shutdown is graceful and ordered.
+    if _agentcost_track_costs is not None:
+        try:
+            _agentcost_track_costs.shutdown()
+            logger.info("AgentCost: flushed pending cost events on shutdown.")
+        except Exception as exc:  # noqa: BLE001 - never block shutdown
+            logger.warning("AgentCost: flush on shutdown failed: %s", exc)
 
 
 app = FastAPI(
@@ -308,7 +344,22 @@ def _load_history(session_id: str | None) -> list[dict]:
     """
     from app.api import sessions
 
-    hist = sessions.get_history(session_id)
+    # FAIL SOFT. Conversation memory is optional CONTEXT - without it a follow-up
+    # loses its earlier turns, which is a worse answer, not a failed request. But
+    # sessions.get_history() only guards against corrupt JSON, so an unreachable
+    # Redis raised straight out of here and 500'd the whole turn.
+    #
+    # That became more visible once this moved ahead of the date gate (so the
+    # gate can see a period the user gave earlier): a Redis outage started
+    # breaking even the gated replies, which are supposed to need no
+    # infrastructure at all. Caught here rather than in sessions.get_history so
+    # the storage layer keeps reporting real failures to its other callers.
+    try:
+        hist = sessions.get_history(session_id)
+    except Exception:
+        logger.warning("session history unavailable for %s - answering without "
+                       "follow-up context", session_id, exc_info=True)
+        return []
     if hist or not session_id or not history.enabled():
         return hist
     try:
@@ -368,7 +419,6 @@ def _ask_with_cost_tracking(
     ):
         return ask(question, **kwargs)
 
-0
 
 def _sweep_old(dir_path: str, max_age_seconds: float) -> None:
     """Best-effort deletion of files older than max_age in a directory, so
@@ -469,13 +519,18 @@ def chat(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
 
     # Report question with no period -> ask for the date range (UI date picker)
     # instead of answering over all history. Decided in code, before any LLM call.
-    if date_gate.needs_date(request.question):
+    #
+    # History is loaded FIRST so the gate can see a period the user already gave
+    # ("June 2026" two turns ago). Without it the picker re-appeared on every
+    # follow-up. The smalltalk and salary gates above still short-circuit before
+    # this, so a greeting never pays for a history read.
+    convo_history = _load_history(request.session_id)
+    if date_gate.needs_date(request.question, convo_history):
         return ChatResponse(**{
             k: v for k, v in date_gate.ask_date_response(request.question).items()
             if k in ChatResponse.model_fields
         })
 
-    convo_history = _load_history(request.session_id)
     try:
         result = _ask_with_cost_tracking(
             request.question,
@@ -558,7 +613,10 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
 
     # Report question with no period -> stream back the date-picker turn straight
     # away (no LLM call, no DB hit): the UI renders the period chooser.
-    if date_gate.needs_date(request.question):
+    # History first, so a period given earlier in the thread suppresses the
+    # picker on follow-ups (see the /chat endpoint above).
+    convo_history = _load_history(request.session_id)
+    if date_gate.needs_date(request.question, convo_history):
         payload = date_gate.ask_date_response(request.question)
 
         def _ask_date_stream():
@@ -567,7 +625,6 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
         return StreamingResponse(_ask_date_stream(), media_type="text/event-stream")
 
     events: "queue.Queue" = queue.Queue()
-    convo_history = _load_history(request.session_id)
 
     def on_event(msg: str):
         events.put({"type": "status", "message": msg})

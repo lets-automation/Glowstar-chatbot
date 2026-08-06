@@ -26,10 +26,33 @@ from app.schema.context import build_schema_context
 from app.schema.glossary import render_data_notes
 from app.schema.router import select_tables
 
-# Max tool-use rounds before we force a final answer. Higher now because the
-# agent may need a few steps to discover tables (find_tables -> get_columns ->
-# run_sql). Simple questions still use only 1-2 rounds.
-MAX_TOOL_ROUNDS = 8
+# Max rounds in which the agent actually RUNS TOOLS before we force a final
+# answer. Simple questions still use only 1-2.
+#
+# 10, not 8, because the RULES mandate a 7-section "report of <entity>" profile
+# (WHO / production / processes / issued / quality / damage / bonus) at one
+# query per section, plus usually a lookup to resolve the code the user typed.
+# At 8 that answer could not physically fit: the loop ran out and fell through
+# to the write-up call, which runs WITHOUT tools - so the unqueried sections
+# just vanished. That is the "thin report" the client reported.
+MAX_TOOL_ROUNDS = 10
+
+# CORRECTION rounds are budgeted SEPARATELY, and this is the point.
+#
+# Every nudge (grounding, report-detail, entity-report, dashboard, bad-tool-call
+# retry) used to `continue` inside the same `for _ in range(MAX_TOOL_ROUNDS)`
+# loop, so each correction silently consumed one of the query rounds. With five
+# triggers available, corrections could eat 5 of 8 rounds and leave 3 for real
+# work - so the guard that detects a thin entity report made a thin entity
+# report MORE likely, by spending the budget needed to fix it.
+#
+# Corrections now draw on their own budget. A stalled turn can be pushed back on
+# track without stealing from the work.
+MAX_CORRECTION_ROUNDS = 4
+
+# Absolute ceiling on model calls in one turn, corrections included. A backstop
+# against a pathological loop, not a budget anyone should hit.
+MAX_TOTAL_ROUNDS = MAX_TOOL_ROUNDS + MAX_CORRECTION_ROUNDS
 
 # Rules the model must always follow. The schema context is added separately.
 RULES = """You are a careful data analyst for a diamond-manufacturing ERP
@@ -102,10 +125,20 @@ RULES:
   data. NEVER invent a file path or claim a file was created.
 - Always call run_sql to get real numbers. Do not guess values.
 - If a query errors, read the error and fix your SQL, then try again.
-- EFFICIENCY (keep tool calls LOW): the schema below ALREADY lists the relevant
-  tables AND their columns. In MOST cases, write ONE run_sql query directly from
-  it. Do NOT call get_table_columns for a table already shown, and do NOT call
-  find_tables when the data is already in a shown table. Fewer steps = faster.
+- EFFICIENCY, AND WHEN IT DOES NOT APPLY. The schema below ALREADY lists the
+  relevant tables AND their columns, so for a SIMPLE question write ONE run_sql
+  query directly from it: do not call get_table_columns for a table already
+  shown, and do not re-query to discover a value the EXACT STORED VALUES block
+  already gives you.
+  This is about avoiding WASTED steps, never about answering with less than was
+  asked. It does NOT cap how many queries a rich answer may use. Explicitly:
+    * a "report of <entity>" is one query PER SECTION (see the 360 rule below) -
+      running one and stopping is the failure, not the efficient path;
+    * when something looks missing, SEARCHING for it (find_tables /
+      get_table_columns) is the required step, not an avoidable one - see the
+      UNKNOWN / NOT-TRACKED ladder;
+    * a summary line's totals come from their own COUNT/SUM query.
+  Spend steps on ANSWERING; save them only on re-discovering what you already have.
 - If a run_sql query succeeds and returns data, ANSWER from it - do NOT re-run
   variations of the same query.
 - UNKNOWN / NOT-TRACKED QUESTIONS - NEVER dead-end the user. Business people ask
@@ -124,10 +157,13 @@ RULES:
     4. Offer 1-2 follow-ups (via the SUGGESTIONS line) for what you CAN answer.
   A bare "I don't have that information" with nothing after it is a FAILED answer:
   always pair the honest limit with the closest real data.
-- FALLBACK only: the database has 239 tables. If what you need is genuinely NOT
-  in the shown schema (e.g. some employee/party/supplier detail not listed),
-  THEN use find_tables("keyword") to locate the table and get_table_columns to
-  read its columns, then query. NEVER guess table or column names.
+- THE SCHEMA BELOW IS A SELECTION, NOT THE WHOLE DATABASE: it holds the ~10
+  tables picked for this question out of 239. So "it is not in the schema below"
+  does NOT mean "we do not have it". If what you need is not shown (some
+  employee/party/supplier detail, a table for a topic nobody listed), use
+  find_tables("keyword") to locate it and get_table_columns to read its columns,
+  then query. That is the expected path, not a last resort. NEVER guess a table
+  or column name - look it up.
 - NEVER query BACKUP / EDIT / DEMO / COMPARE / GIA copies - they hold stale,
   partial, or FAKE data and will give WRONG answers. Always use the primary
   table, NOT a variant whose name ends in or contains: _BKP, _BAK, _Backup,
@@ -471,19 +507,47 @@ RULES = RULES + "\n" + COMPANY_CONTEXT
 
 def dynamic_schema_for(question: str) -> str:
     """
-    Schema text for THIS question only: the glossary lists every table, but
-    detailed columns are included only for the few tables the router picks as
-    relevant. This is the key token-saving step.
+    Everything in the prompt that depends on THIS question: today's date, the
+    data notes relevant to it, and the schema for the tables the router picked.
 
     Starts with TODAY'S DATE: without it the model labels grounded numbers with
     its training-era year (a validated live bug: a 2026 production overview was
     narrated as "2025" and compared against 2024 as "last year"). Placed here
     (not in RULES) so the cached rules block stays byte-stable; this block is
     per-question anyway and the date only changes at midnight.
+
+    THE DATA NOTES LIVE HERE, NOT IN THE STATIC BLOCK.
+    ---------------------------------------------------
+    app/schema/note_router.py exists to give the model the guidance THIS question
+    needs instead of all of it - its own docstring explains why: 48 competing
+    notes inside the prompt is a known reliability killer, and it showed up as
+    the same question answering well once and thinly the next time.
+
+    That module was DEAD CODE in production. static_prompt() called
+    render_data_notes() with NO question argument, so every note, join hint,
+    value code and Gujlish phrase was injected on every turn - and every call
+    that passed a question was in a test. It happened in the commit that made
+    the prefix cacheable: a byte-stable block cannot be per-question, so
+    routing was silently traded away for caching.
+
+    MEASURED on the real database, before this moved: 26,150 static tokens out
+    of a ~30,000-token prompt - 87% instructions, 13% schema, with ~16k of it
+    notes that are mostly irrelevant to any given question.
+
+    The caching argument does not actually require them to be static. Providers
+    that cache do it per BLOCK (anthropic_backend puts its own cache_control on
+    this one), and one question costs several tool rounds against an identical
+    block - which is where the saving comes from and is unaffected. What is lost
+    is only CROSS-question reuse of the notes; what is gained is ~10k fewer
+    tokens on every call, on every provider, plus the relevance the note router
+    was written for. Anthropic wins too: a cache WRITE bills at 1.25x, so
+    writing 6k of routed notes beats writing 16k of all of them.
     """
     from datetime import date
 
     today = date.today()
+    data_notes = render_data_notes(question)
+    relevant = select_tables(question)
     date_line = (
         f"TODAY'S DATE: {today:%d %b %Y}. The current year is {today.year}. "
         f"Use these for 'this year/month/last year' in BOTH your SQL and your "
@@ -492,8 +556,12 @@ def dynamic_schema_for(question: str) -> str:
         f"empty result for a date after the cutoff means stale data, never 'no "
         f"activity'.\n\n"
     )
-    relevant = select_tables(question)
-    return date_line + build_schema_context(relevant, question=question)
+    return (
+        date_line
+        + data_notes
+        + "\n\n"
+        + build_schema_context(relevant, question=question)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -568,8 +636,14 @@ def dimension_values() -> str:
 
 @lru_cache(maxsize=1)
 def static_prompt() -> str:
-    """The question-independent prompt head. Memoised so it is byte-stable."""
-    parts = [RULES, render_data_notes()]
+    """The question-independent prompt head. Memoised so it is byte-stable.
+
+    Holds ONLY what genuinely never varies: the rules, and the exact spellings of
+    the small dimensions. The data notes used to be here too - all 48 of them,
+    unrouted, ~16k tokens on every call - see dynamic_schema_for() for why they
+    moved and what it measured.
+    """
+    parts = [RULES]
     dims = dimension_values()
     if dims:
         parts.append(dims)
@@ -846,16 +920,16 @@ def tool_find_tables(tool_input: dict) -> tuple[str, str, int]:
 
 # Backup/edit/demo/compare/GIA table variants: stale, partial, or FAKE data.
 # Filtered out of find_tables so the agent only ever discovers primary tables.
-_TRAP_TABLE_RE = re.compile(
-    # ^tblTest/^temp catch the tblPlanMaster clones (tblTestKapanPricePlanMaster,
-    # tblTestGXKapanPricePlanMaster) and tempCross found in the 2026-07 DB refresh.
-    r"(^tblTest|^temp|(?:_BKP|_BAK|_Backup|Edit|_Compare|_Demo|_Update|_old|Temp|GIA)$)",
-    re.IGNORECASE,
-)
-
-
-def _is_trap_table(name: str) -> bool:
-    return bool(_TRAP_TABLE_RE.search(name))
+#
+# The definition MOVED to app/schema/extractor.py so the schema ROUTER can apply
+# the same filter to its candidate tables. It previously had none - and once the
+# router started scoring all ~239 tables instead of a curated 29, an unfiltered
+# candidate set would have started putting tblPacket_BKP and tblTimeAttendance_Demo
+# into the prompt. Importing it from here would have been circular (tools imports
+# the router), so extractor - which both already depend on - owns it now.
+# Re-exported under the old names for existing callers and their regression test.
+_TRAP_TABLE_RE = extractor._TRAP_TABLE_RE
+_is_trap_table = extractor.is_trap_table
 
 
 TOOL_HANDLERS = {

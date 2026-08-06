@@ -218,7 +218,13 @@ def _write_up(contents, system, model, api_key: str | None, on_event=None) -> tu
             final = _client(key).models.generate_content(
                 model=try_model,
                 contents=contents,
-                config=types.GenerateContentConfig(system_instruction=system, temperature=0),
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0,
+                    # The WRITE-UP call — this is the one that actually needs the
+                    # room, since it renders the ~30-row preview table.
+                    max_output_tokens=settings.max_output_tokens("gemini"),
+                ),
             )
             return (final.text or "").strip(), True
         except Exception as exc:  # noqa: BLE001 - decide by error kind
@@ -262,6 +268,12 @@ def _ask_gemini_once(
         system_instruction=system,
         tools=[_GEMINI_TOOL],
         temperature=0,
+        # Explicit output budget, like the other two backends. Gemini was the
+        # only one that set none, so it silently took whatever each rotated model
+        # defaulted to — which is not comparable across gemini-2.5-flash,
+        # 3.1-flash-lite and 3-flash-preview, and made "the answer got cut off"
+        # depend on which model the quota rotation happened to land on.
+        max_output_tokens=settings.max_output_tokens("gemini"),
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
     contents = _history_to_contents(history) + [
@@ -295,7 +307,17 @@ def _ask_gemini_once(
     pair_i = 0
     cur_model, cur_key = pairs[0]
 
-    for _ in range(tools.MAX_TOOL_ROUNDS):
+    # Two SEPARATE budgets (see tools.MAX_CORRECTION_ROUNDS). tool_rounds counts
+    # only rounds that actually ran tools; corrections counts nudges/retries.
+    # They used to share one counter, so pushing a stalled model back on track
+    # cost it the very rounds it needed to finish the job.
+    tool_rounds = 0
+    corrections = 0
+
+    while (
+        tool_rounds < tools.MAX_TOOL_ROUNDS
+        and tool_rounds + corrections < tools.MAX_TOTAL_ROUNDS
+    ):
         try:
             # Inner loop so a rotation does NOT consume one of the tool rounds -
             # a swap is a retry of the same step, not a step of its own.
@@ -360,6 +382,7 @@ def _ask_gemini_once(
                             parts=[types.Part.from_text(text=policy.EXECUTE_NUDGE)],
                         )
                     )
+                    corrections += 1
                     emit("Running the query…")
                     continue
                 break
@@ -389,6 +412,7 @@ def _ask_gemini_once(
                         parts=[types.Part.from_text(text=policy.EXECUTE_NUDGE)],
                     )
                 )
+                corrections += 1
                 emit("Running the query…")
                 continue
             # Report-detail guard (mirrors groq_backend; client-flagged bug):
@@ -410,6 +434,7 @@ def _ask_gemini_once(
                         parts=[types.Part.from_text(text=policy.REPORT_DETAIL_NUDGE)],
                     )
                 )
+                corrections += 1
                 emit("Building the detailed report…")
                 continue
             # Thin entity report: "report of <entity>" answered with only the
@@ -430,6 +455,7 @@ def _ask_gemini_once(
                         parts=[types.Part.from_text(text=policy.ENTITY_REPORT_NUDGE)],
                     )
                 )
+                corrections += 1
                 emit("Building the full profile…")
                 continue
             # Dashboard guard (mirrors groq_backend): the question asked for
@@ -451,6 +477,7 @@ def _ask_gemini_once(
                         parts=[types.Part.from_text(text=policy.DASHBOARD_NUDGE)],
                     )
                 )
+                corrections += 1
                 emit("Building your dashboard…")
                 continue
             log_interaction(question, sql_used, last_row_count)
@@ -464,6 +491,10 @@ def _ask_gemini_once(
         "data_sections": data_sections,
                 "file_grounded": file_grounded,
             }
+
+        # This round is REAL WORK: the model asked for tools. Only these count
+        # against the query budget (see tools.MAX_CORRECTION_ROUNDS).
+        tool_rounds += 1
 
         # Record the model's tool-call turn, then run each tool.
         contents.append(cand.content)

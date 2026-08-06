@@ -30,7 +30,12 @@ class Settings:
     # (Claude - switch to this when the Claude key arrives, for best results).
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "groq")
 
-    # Groq (free-tier testing).
+    # Groq (free-tier testing). Reached through Groq's OPENAI-COMPATIBLE endpoint
+    # rather than the native groq SDK — see _OPENAI_COMPATIBLE in groq_backend.py.
+    # The request/response surface used here (chat.completions.create with tools)
+    # is identical on both, and the OpenAI client is the one AgentCost patches, so
+    # this is the difference between Groq turns being costed and being invisible.
+    GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     # gpt-oss-20b: lighter + separate daily token budget than 120b.
     # TEMPORARY for free-tier. On Claude/paid, prefer gpt-oss-120b or Claude.
@@ -95,10 +100,23 @@ class Settings:
     # are set, main.py initializes the SDK, which patches the anthropic/openai/
     # google-genai client libraries and reports per-call metadata (model, token
     # counts, cost, latency — NOT prompt content) to the AgentCost dashboard.
-    # Leave empty to disable entirely. NOTE: it does NOT patch the native groq
-    # SDK, so LLM_PROVIDER=groq is untracked; anthropic, gemini, and the
-    # OpenAI-compatible providers (ollama/lmstudio/cerebras/nvidia) all are.
-    # A model absent from main.py's _AGENTCOST_PRICING records at $0.00.
+    # Leave empty to disable entirely.
+    #
+    # EVERY provider is now tracked. It patches by CLIENT LIBRARY, not by
+    # provider, so what matters is which library a provider is reached through:
+    #   anthropic            -> anthropic client   tracked
+    #   gemini               -> google-genai       tracked (needs SDK >= 0.1.4;
+    #                                              the old 0.1.3 pin had no
+    #                                              Gemini interceptor at all, so
+    #                                              nothing was ever recorded)
+    #   groq / cerebras / nvidia / ollama / lmstudio -> openai client   tracked
+    # Groq used to be the exception because it went through the native groq SDK,
+    # which AgentCost does not patch; it now uses Groq's OpenAI-compatible
+    # endpoint instead (GROQ_BASE_URL above).
+    #
+    # A model absent from main.py's _AGENTCOST_PRICING records at $0.00 rather
+    # than being refused — keep that table in step with the models in use,
+    # including every entry of GEMINI_FALLBACK_MODELS.
     AGENTCOST_API_KEY: str = os.getenv("AGENTCOST_API_KEY", "")
     AGENTCOST_PROJECT_ID: str = os.getenv("AGENTCOST_PROJECT_ID", "")
     AGENTCOST_DEBUG: bool = os.getenv("AGENTCOST_DEBUG", "false").lower() in (
@@ -144,18 +162,80 @@ class Settings:
     LMSTUDIO_BASE_URL: str = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
     LMSTUDIO_MODEL: str = os.getenv("LMSTUDIO_MODEL", "qwen2.5-7b-instruct")
 
-    # Output-token budget per model call (groq_backend). The 2048 default was
-    # tuned for the free tiers, where it fits both the mandated answer format and
-    # a tight tokens-per-minute budget. REASONING models (Gemma 4, gpt-oss) spend
-    # part of this budget thinking before they write, so the visible answer gets
-    # less than the number suggests — raise it for those. A local model has no
-    # per-minute quota, so there is no cost to a bigger budget there.
-    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+    # Output-token budget per model call.
+    #
+    # This used to be ONE number (2048) for every non-Anthropic provider, tuned
+    # for Groq's tight 12k tokens-per-minute free tier — so Gemini, Cerebras and
+    # NVIDIA, which have far more headroom, were throttled to Groq's limit for
+    # nothing. 2048 cannot hold the answer format the RULES mandate: a single
+    # 30-row x 12-column Markdown table is ~1,200-2,000 tokens on its own, and
+    # REASONING models (gpt-oss, Gemma) spend part of the same budget thinking
+    # before they write. That is a direct, measurable cause of the "thin answer"
+    # and mid-table truncation complaints — the backends even append a "shortened
+    # for length" note when it happens.
+    #
+    # So the budget now follows whichever provider is ACTIVE. This is not a model
+    # choice: the provider still rotates with quota exactly as before, each one
+    # simply gets its own real headroom instead of Groq's.
+    #
+    # LLM_MAX_TOKENS in .env still overrides everything, for pinning a value
+    # while debugging or when a provider tightens its limits.
+    _PROVIDER_MAX_TOKENS = {
+        "groq": 2048,       # 12k TPM free tier — the one genuinely tight budget
+        "gemini": 8192,     # large free per-minute budget
+        "cerebras": 8192,   # ~1M tokens/day, no per-request pressure
+        "nvidia": 4096,     # ~40 req/min, generous per request
+        "ollama": 4096,     # local: no quota at all
+        "lmstudio": 4096,   # local: no quota at all
+        "anthropic": 4096,
+        "claude": 4096,
+    }
+    # Floor for any provider: the minimum that fits the mandated answer format
+    # (intro + ~30-row preview table + conclusion + download pointer +
+    # SUGGESTIONS). An unknown or newly-added provider gets this, never less.
+    _MIN_OUTPUT_TOKENS = 2048
+
+    def max_output_tokens(self, provider: str | None = None) -> int:
+        """Per-call output budget for the active (or given) provider.
+
+        Reads LLM_MAX_TOKENS LIVE rather than at import. The rest of this class
+        must snapshot env into class attributes, but this is a method, and a
+        knob that only takes effect if it happened to be set before the module
+        was first imported is a knob that will surprise someone at 2am.
+        """
+        override = os.getenv("LLM_MAX_TOKENS", "").strip()
+        if override:
+            try:
+                return int(override)
+            except ValueError:
+                pass  # nonsense value -> fall through to the provider default
+        key = (provider or self.LLM_PROVIDER or "").lower()
+        return self._PROVIDER_MAX_TOKENS.get(key, self._MIN_OUTPUT_TOKENS)
+
+    # Back-compat: some call sites still read this as a plain attribute. It
+    # resolves for the provider configured at import time.
+    LLM_MAX_TOKENS: int = int(
+        os.getenv("LLM_MAX_TOKENS")
+        or _PROVIDER_MAX_TOKENS.get(os.getenv("LLM_PROVIDER", "groq").lower(), 2048)
+    )
 
     # Max columns shown per table in the schema context.
     # TEMPORARY token-saving cap for the free tier. Set SCHEMA_MAX_COLS=0
     # (no cap) once on Claude / paid tier for fuller, more accurate context.
     SCHEMA_MAX_COLS: int = int(os.getenv("SCHEMA_MAX_COLS", "30"))
+
+    # How many tables the router may put in the prompt for one question.
+    #
+    # Was hard-coded to 4 while the router could only ever choose from 29 of the
+    # ~239 business tables — so the single most common failure was the answer's
+    # table simply not being in the prompt. The router now scores every table
+    # (app/schema/router.py) and this is the width of what it may show.
+    #
+    # It is a QUALITY/COST dial, not a limit to be maxed: each table costs
+    # roughly 250-400 tokens, and padding the prompt with weak matches hurts
+    # small models. The router already returns fewer than this when the question
+    # doesn't warrant more. Lower it if a provider's per-minute budget is tight.
+    SCHEMA_MAX_TABLES: int = int(os.getenv("SCHEMA_MAX_TABLES", "10"))
 
     # --- Semantic search (Phase 7 - OPTIONAL; only if fuzzy search is needed) ---
     VOYAGE_API_KEY: str = os.getenv("VOYAGE_API_KEY", "")
