@@ -46,8 +46,7 @@ db_backup/*
 # `git add .` would have committed the whole folder - the same client
 # material that had to be purged from history on 2026-08-05. Found
 # 2026-09-03 while writing docs/HANDOFF.md.
-docs/
-*.md
+
 
 !README.md
 !frontend/README.md
