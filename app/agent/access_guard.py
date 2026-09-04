@@ -55,7 +55,52 @@ _PAY_RE = re.compile(
 # BONUS and INCENTIVE are explicitly ALLOWED (client decision): they are the
 # performance figures managers use, not the wage. A question about them must not
 # be caught by the generic "how much did X get" phrasing below.
-_ALLOWED_PAY_TOPIC_RE = re.compile(r"\b(bonus|bonuses|incentive|incentives)\b", re.IGNORECASE)
+#
+# DAMAGE/penalty money is allowed for the same reason and by the same client
+# rule - the damage report legitimately shows an amount deducted for a broken
+# stone. It is listed here because the money words below ("ketla paisa katya
+# karigar pase thi" - how much money was cut from the karigar) otherwise read
+# exactly like a wage question. Real case: cold-case DRS-2, whose ground truth
+# is a damage total of -11,536.82.
+_ALLOWED_PAY_TOPIC_RE = re.compile(
+    r"\b(bonus|bonuses|incentive|incentives|damage|damages|penalty|penalties|"
+    r"deduction|deductions|nuksan)\b",
+    re.IGNORECASE,
+)
+
+# --- bare money words, which mean salary ONLY when a PERSON is the subject ----
+#
+# "pay" and "paisa" cannot be added to the hard list: the same words carry the
+# job-work rate paid to an outside PARTY, which is ordinary business data the
+# assistant must answer. Cold-case JP-2 is exactly that - "Party ne galaxy na
+# ketla paisa apiye chhiye?" (how much money do we give the party for galaxy) -
+# and refusing it would be a regression, not a protection.
+#
+# So the wage is recognised by its SUBJECT, not by the money word alone:
+# money word + a person + no party/process context = salary.
+_BARE_MONEY_RE = re.compile(
+    r"\b(pay|paisa|paise|rupiya|rupaya|rupees|money|milta|mile|apiye)\b",
+    re.IGNORECASE,
+)
+
+# The wage belongs to a PERSON. An employee code (M4117, Y111) counts: it is how
+# the client's staff actually name someone.
+_PERSON_SUBJECT_RE = re.compile(
+    r"\b(employee|employees|worker|workers|karigar|karigars|kaarigar|staff|"
+    r"mansu|labourer|labourers|laborer|laborers|"
+    r"per\s+(?:person|head|employee|worker)|"
+    r"[MY]\s?\d{3,5})\b",
+    re.IGNORECASE,
+)
+
+# ...unless the money is going to an outside party for a process, which is a
+# RATE, not a wage. Checked even when a person word is also present, because
+# "how much do we pay the party for the polishing process" mentions both.
+_PARTY_SUBJECT_RE = re.compile(
+    r"\b(party|parties|firm|firms|vendor|vendors|supplier|suppliers|buyer|"
+    r"buyers|contractor|contractors|sub-?contractor|jangad|process|rate|rates)\b",
+    re.IGNORECASE,
+)
 
 # "how much does/did <someone> earn|make|get paid" — phrasing without a keyword above.
 _PAY_PHRASE_RE = re.compile(
@@ -106,10 +151,28 @@ def is_pay_question(question: str) -> bool:
     if _HARD_PAY_RE.search(q):
         return True
 
-    # Otherwise, an explicit bonus/incentive topic makes the pay vocabulary mean
-    # the ALLOWED figure ("bonus earnings", "incentive earned"), not the wage.
+    # Otherwise, an explicit bonus / incentive / damage topic makes the pay
+    # vocabulary mean the ALLOWED figure ("bonus earnings", "damage deduction"),
+    # not the wage.
     if _ALLOWED_PAY_TOPIC_RE.search(q):
         return False
+
+    # BARE MONEY WORDS + A PERSON = the wage, however it is phrased.
+    #
+    # This closes two gaps found on 2026-08-21 by writing adversarial probes:
+    # "what is the monthly pay of the Fency department workers" and "kitna paisa
+    # milta hai M4117 ko har mahine?" both reached the model, because bare "pay"
+    # and the Hinglish phrasing are in neither list above. They were caught only
+    # by the RULES - a prose guard - when a code guard was available.
+    #
+    # The party exclusion is what keeps this safe: the same money words carry
+    # the job-work RATE paid to an outside firm, which is ordinary data.
+    if (
+        _BARE_MONEY_RE.search(q)
+        and _PERSON_SUBJECT_RE.search(q)
+        and not _PARTY_SUBJECT_RE.search(q)
+    ):
+        return True
 
     # No bonus context: the ambiguous words mean salary.
     return bool(_SOFT_PAY_RE.search(q) or _PAY_PHRASE_RE.search(q))
@@ -150,6 +213,42 @@ _SALARY_COLUMNS_RE = re.compile(r"\b(FinalLabour|LabourAmount)\b", re.IGNORECASE
 def sql_selects_pay_data(sql: str) -> bool:
     """True if the SQL reads a SALARY column (the wage). Bonus/incentive are OK."""
     return bool(_SALARY_COLUMNS_RE.search(sql or ""))
+
+def redact_pay_columns(columns: list, rows: list) -> tuple[list, list, list]:
+    """Drop salary columns from a RESULT. Returns (columns, rows, dropped).
+
+    WHY THIS EXISTS ALONGSIDE sql_selects_pay_data().
+    -------------------------------------------------
+    That function reads the SQL TEXT, so it only ever sees column names the
+    query spells out. A star projection never spells them, and the guard
+    returned False for every one of these (verified 2026-08-25):
+        SELECT * FROM tblLabourResult
+        SELECT t.* FROM tblLabourResult t
+        SELECT SUM(v) FROM (SELECT t.*,1 v FROM tblPointRateLabour t) q
+    The first one really does come back carrying LabourAmount and FinalLabour
+    with live wage values (0.7, 0.64, 0.6) - straight into the model's preview,
+    the rendered table and the user's Excel download. The single instruction the
+    client gave about this data - behave as if you cannot see it - was defeated
+    by a query the model writes whenever it explores a table.
+
+    Text matching cannot close that: `*` is not a column name, and enumerating
+    every alias/CTE/subquery form is exactly the losing game. So this checks
+    what actually CAME BACK, where the columns are named no matter how they were
+    selected. The text check stays as the first line - it rejects the query
+    outright and tells the model why - and this is the backstop for everything
+    the text cannot see.
+
+    Never raises: a redaction that crashes the turn would be its own outage.
+    """
+    try:
+        dropped = [c for c in (columns or []) if _SALARY_COLUMNS_RE.search(str(c))]
+        if not dropped:
+            return columns, rows, []
+        keep = [c for c in columns if c not in dropped]
+        clean = [{c: r.get(c) for c in keep} for r in (rows or [])]
+        return keep, clean, dropped
+    except Exception:  # noqa: BLE001 - never let redaction break a turn
+        return columns, rows, []
 
 
 SQL_BLOCKED_MSG = (

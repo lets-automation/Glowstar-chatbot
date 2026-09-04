@@ -9,9 +9,11 @@ Turns the agent's raw answer into a richer, professional response:
 All of this is deterministic (no extra LLM calls -> no extra tokens).
 """
 
+import json
 import re
 from datetime import datetime
 
+from app.agent import facts
 from app.agent.widget import build_chart_html
 
 # Matches "FROM tblXxx" / "JOIN tblXxx" to discover which tables were read.
@@ -28,9 +30,75 @@ _UNGROUNDED_MSG = (
 )
 
 
+# "|:---|---:|---:|" - alignment/separator only, no data in it.
+_MD_SEPARATOR_ROW = re.compile(r"^\s*\|[\s:|-]*\|?\s*$")
+
+
 def looks_like_data_table(answer: str) -> bool:
-    """True if the answer contains a Markdown table (header + at least one row)."""
-    return len(_MD_TABLE_ROW.findall(answer or "")) >= 2
+    """True if the answer contains a Markdown table with ACTUAL ROWS in it.
+
+    Separator rows do not count. Since the model was told to stop rendering the
+    data table, it sometimes still emits the skeleton - a lone "|:---|---:|" line
+    under "Here's the breakdown by kapan:" - and counting those as a table made
+    ensure_data_shown suppress the real one, so the client got a heading, an
+    empty rule, and no data at all. Seen live on 2026-08-24.
+    """
+    rows = [r for r in _MD_TABLE_ROW.findall(answer or "")
+            if not _MD_SEPARATOR_ROW.match(r)]
+    return len(rows) >= 2
+
+
+# A FIGURE ASSERTED IN PROSE IS AS FABRICATED AS ONE IN A TABLE.
+#
+# The anti-fabrication guard below only fired on a Markdown table, so an answer
+# that stated its numbers in a sentence walked straight through.
+#
+# Caught live 2026-08-31 on Qwen3-30B-A3B, asked "how many oval diamonds do we
+# have in stock?":
+#     "Total oval diamonds in stock: 7,321 packets
+#      Total weight: 1,845.67 carats"
+# NO query ran at all (sql_used == []). 7,321 is not a coincidence - it is the
+# worked example inside the glossary's shape-normalisation note, measured on an
+# OLDER restore. The live answer is 7,591. The model read the number out of its
+# own prompt and presented it as data, and the weight was invented outright.
+#
+# The weaker test model queried the database and got it right, so this failure
+# gets MORE likely as the model gets better: a capable model trusts a confident
+# prompt over a tool call. That is why it has to be caught in code.
+#
+# Deliberately narrow - a comma-grouped number, or a number wearing a data unit.
+# A clarification ("nine people share this name"), a refusal, or a period
+# question carries no such figure, and any answer that DID run a query is
+# already grounded and never reaches this check.
+_FIGURE_RE = re.compile(
+    r"\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b"
+    r"|\b\d+(?:\.\d+)?\s*\**\s*(?:\w+\s+){0,2}(?:packets?|carats?|cts?|ct|pcs|pieces?|stones?|"
+    r"diamonds?|employees?|workers?|karigars?|kapans?|rows?|records?|nang)\b",
+    re.IGNORECASE,
+)
+
+
+def asserts_a_figure(answer: str) -> bool:
+    """True if the answer states a data quantity in prose."""
+    return bool(_FIGURE_RE.search(answer or ""))
+
+
+def strip_empty_tables(answer: str) -> str:
+    """Drop orphan separator lines left behind by a half-written table."""
+    lines = (answer or "").split("\n")
+    keep, n = [], len(lines)
+    for i, line in enumerate(lines):
+        if _MD_SEPARATOR_ROW.match(line) and line.strip():
+            prev = next((lines[j] for j in range(i - 1, -1, -1) if lines[j].strip()), "")
+            nxt = next((lines[j] for j in range(i + 1, n) if lines[j].strip()), "")
+            has_neighbour_row = any(
+                _MD_TABLE_ROW.match(x) and not _MD_SEPARATOR_ROW.match(x)
+                for x in (prev, nxt)
+            )
+            if not has_neighbour_row:
+                continue
+        keep.append(line)
+    return "\n".join(keep)
 
 
 def _is_id_col(name: str) -> bool:
@@ -178,6 +246,69 @@ def _first_label_and_value_cols(columns: list, rows: list) -> tuple[str, str] | 
     return label_col, value_col
 
 
+# show_chart's own payload shape, narrated instead of called (weak-model
+# failure mode: same family as loop_policy.looks_like_unrun_sql, but for
+# charts the fix is free instead of costing a corrective round-trip - the
+# JSON the model wrote IS the tool call, just never sent, so it can be
+# rendered directly.
+_CHART_TYPES = {"bar", "horizontal_bar", "line", "pie"}
+# A fenced ```json {...}``` block, OR a bare {...} sitting in the prose
+# (models don't always bother with the fence). Objects here are flat -
+# "labels"/"values" are arrays, not nested objects - so a no-inner-brace
+# match is enough to capture one without a full JSON parser.
+_FENCED_CHART_JSON_RE = re.compile(r"```(?:json)?\s*\n?(\{[^`]*?\})\s*```", re.DOTALL)
+_BARE_CHART_JSON_RE = re.compile(r"\{[^{}]*\"chart_type\"[^{}]*\}", re.DOTALL)
+
+
+def _narrated_chart_widget(blob: str) -> dict | None:
+    """Parse one candidate JSON blob; return a real chart widget or None."""
+    try:
+        payload = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("chart_type") not in _CHART_TYPES:
+        return None
+    if not isinstance(payload.get("labels"), list) or not isinstance(payload.get("values"), list):
+        return None
+    try:
+        code = build_chart_html(payload)
+    except Exception:
+        return None
+    return {"title": str(payload.get("title") or ""), "code": code, "kind": "chart"}
+
+
+def extract_narrated_charts(answer: str) -> tuple[str, list[dict]]:
+    """
+    Recover show_chart-shaped JSON the model printed as prose instead of
+    actually calling the tool, and cut the raw JSON out of the visible text.
+
+    Some models (seen on newly-added candidates during provider bakeoffs)
+    narrate the call the same way llama-4-scout used to narrate run_sql: they
+    write the exact tool payload as a fenced code block instead of invoking
+    show_chart, so the user sees a literal {"chart_type": "bar", ...} card
+    instead of a picture. The data in it is real (the model meant to draw
+    it), so recover it deterministically rather than just flagging it.
+    """
+    if not answer or "chart_type" not in answer:
+        return answer, []
+    widgets: list[dict] = []
+
+    def _sub(pattern: re.Pattern) -> None:
+        nonlocal answer
+        def repl(m: re.Match) -> str:
+            w = _narrated_chart_widget(m.group(1) if m.groups() else m.group(0))
+            if w is None:
+                return m.group(0)
+            widgets.append(w)
+            return ""
+        answer = pattern.sub(repl, answer)
+
+    _sub(_FENCED_CHART_JSON_RE)
+    _sub(_BARE_CHART_JSON_RE)
+    clean = re.sub(r"\n{3,}", "\n\n", answer).strip()
+    return clean, widgets
+
+
 def fallback_chart(question: str, result: dict) -> dict | None:
     """
     Deterministic backstop: build a chart server-side from the captured rows
@@ -268,12 +399,59 @@ def ensure_data_shown(answer: str, columns: list, rows: list, has_visual: bool) 
     return f"{lead}\n\n{table}"
 
 
+# Reasoning-mode models (Qwen3.x, DeepSeek-R1 and friends) emit their private
+# deliberation before the real answer. vLLM only strips it when the server was
+# started with a matching --reasoning-parser; without that flag the whole
+# monologue arrives as ordinary content and is shown to the user.
+#
+# Measured on the 2026-08-18 GPU bakeoff: 18 of 26 answers from Qwen3.5-9B
+# leaked reasoning, and one of them printed the ENTIRE SCOPE ruleset back to
+# the user verbatim - the system prompt, including which columns are blocked.
+# That is an IP leak, not a cosmetic defect.
+#
+# Stripping here rather than relying on the serving flag is deliberate: this
+# runs for EVERY backend and every provider, so a model swap or a forgotten
+# server flag cannot re-expose the prompt.
+#
+# It must also run BEFORE extract_suggestions/extract_clarify/extract_askdate.
+# A model reasoning about its own output writes things like "I should use the
+# ASKDATE: marker here" INSIDE the monologue; those extractors would match that
+# sentence instead of the real marker, which is why the date picker failed to
+# render even though the model emitted ASKDATE: correctly.
+_THINK_PAIR_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think\s*>", re.IGNORECASE)
+
+
+def strip_reasoning(answer: str) -> str:
+    """Remove chain-of-thought so it never reaches the user.
+
+    Handles both shapes seen in the wild: a well-formed <think>...</think> pair,
+    and the far more common one where the opening tag was consumed by the chat
+    template so the reply is bare monologue terminated by </think>.
+
+    NEVER returns empty for a non-empty input - if the whole reply was
+    reasoning, the original text is kept. A blank bubble is worse than a leak,
+    and postprocess already has a separate guard for genuinely empty replies.
+    """
+    if not answer or "think" not in answer.lower():
+        return answer
+    cleaned = _THINK_PAIR_RE.sub("", answer)
+    # Unpaired close tag: everything up to the LAST one is monologue.
+    matches = list(_THINK_CLOSE_RE.finditer(cleaned))
+    if matches:
+        cleaned = cleaned[matches[-1].end():]
+    cleaned = cleaned.strip()
+    return cleaned or answer
+
+
 def enrich(result: dict, now: datetime | None = None, question: str = "") -> dict:
     """
     Take the backend's raw {answer, sql_used, rows_returned} and return the
     full professional response.
     """
-    clean, suggestions = extract_suggestions(result.get("answer", ""))
+    # Strip chain-of-thought FIRST - see strip_reasoning(). The marker
+    # extractors below must never see the model's monologue.
+    clean, suggestions = extract_suggestions(strip_reasoning(result.get("answer", "")))
     # Clarify-buttons: a trailing 'CLARIFY: a | b | c' line becomes clickable
     # option buttons in the UI (so a non-dev user taps a choice instead of typing).
     clean, clarify_options = extract_clarify(clean)
@@ -309,6 +487,14 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
             )
             ok = False  # nothing real to show: the UI must not offer an export
 
+    # NARRATED CHART GUARD: recover show_chart JSON the model printed as text
+    # instead of calling the tool (see extract_narrated_charts) BEFORE the
+    # grounding check below, so an ungrounded narrated chart is still treated
+    # as a data visual and caught like any other fabricated one.
+    clean, _narrated = extract_narrated_charts(clean)
+    if _narrated:
+        result = dict(result, widgets=[*(result.get("widgets") or []), *_narrated])
+
     # ANTI-FABRICATION GUARD (deterministic backstop): if the answer presents a
     # data table but no run_sql actually returned rows, the data is invented.
     # Replace it with an honest message and strip export/widgets/data.
@@ -332,7 +518,8 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
         (w or {}).get("kind") in ("chart", "dashboard")
         for w in (result.get("widgets") or [])
     )
-    if not grounded and (looks_like_data_table(clean) or data_visual):
+    if not grounded and (looks_like_data_table(clean) or data_visual
+                         or asserts_a_figure(clean)):
         return {
             "answer": _UNGROUNDED_MSG,
             "suggestions": [],
@@ -407,6 +594,8 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
         _cm = count_guard.count_mismatch(
             clean, shown_rows, rows_returned, question, sql_used,
             file_grounded=bool(result.get("file_grounded")),
+            # Every query's rows, not just the captured winner - see count_guard.
+            sections=result.get("data_sections") or [],
         )
         if _cm:
             from app.core.logging_util import logger
@@ -422,6 +611,25 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
     # the SQL from here, so we WARN ABOVE the table - a banner under 50 rows is
     # never read - and offer a one-tap re-ask. Rows are left untouched: they are
     # real, and destroying a correct answer on a false positive is the worse bug.
+    # STATE THE SCOPE OF A NARROWED REPORT, whoever chose the filter.
+    #
+    # These answers are taken OUT of the chat and sent to the client to check
+    # against their own ERP, so an answer that cannot state its own scope cannot
+    # be verified by the person reading it. A live Fency report opened "Overall,
+    # 1,643 packets across 27 kapans" - correct for Fency, but the word "Fency"
+    # was nowhere in the prose. Runs before the period banner: a subset read as
+    # the whole company is the bigger misstatement.
+    if ok:
+        from app.agent import reports as _reports
+
+        _scope = _reports.scope_line(question, sql_used)
+        if _scope:
+            from app.core.logging_util import logger
+
+            logger.warning("UNDISCLOSED-SCOPE | %s | q=%r",
+                           _scope[:80], (question or "")[:100])
+            clean = _scope + "\n\n" + clean
+
     _period_flagged = False
     if ok:
         from app.agent import period_guard
@@ -445,7 +653,16 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
     if ok and not clarify_options and not _period_flagged:
         from app.agent import dimension_guard
 
-        _missing = dimension_guard.missing_dimensions(question, shown_columns, shown_rows)
+        # A MULTI-SECTION RECIPE ANSWERS THE BREAKDOWN IN A SECTION, NOT IN
+        # the top-level columns - those are only the widest single result. The
+        # lab-results recipe returns a "By employee" section of 15 rows, and
+        # asking "GIA results EMPLOYEE WISE" still offered "show it by
+        # employee" as a follow-up because the guard never saw it. Every
+        # section's columns count as shown.
+        _sec_cols = list(shown_columns or [])
+        for _sec in (result.get("data_sections") or []):
+            _sec_cols.extend(_sec.get("columns") or [])
+        _missing = dimension_guard.missing_dimensions(question, _sec_cols, shown_rows)
         if _missing:
             from app.core.logging_util import logger
 
@@ -470,12 +687,56 @@ def enrich(result: dict, now: datetime | None = None, question: str = "") -> dic
                            (question or "")[:100])
             clarify_options = [name_guard.followup_option(c) for c in _coded[:2]]
 
+    # A CARAT FIGURE THAT NO WEIGHT COLUMN PRODUCED.
+    # Seen live 2026-08-31: "OQ26 has 6,107.39 points ... and a total of
+    # 6,107.39 carats polished" - the same number twice, under two units. The
+    # points half was right; the carat half was that number re-labelled, where
+    # the true weight is 378.458. query_rules.weight_via_points_join had
+    # correctly refused the one query that computes both, and the model
+    # labelled what it had rather than running the second query.
+    #
+    # Warned ABOVE the answer rather than rewritten: the points figure is real
+    # and destroying a half-correct answer on a false positive is the worse
+    # bug - the same trade the period banner makes. (grep: UNSOURCED-CARAT)
+    if ok:
+        from app.agent import unit_guard
+
+        _bad_ct = unit_guard.unsourced_carat_claim(clean, shown_columns, shown_rows)
+        if _bad_ct:
+            from app.core.logging_util import logger
+
+            logger.warning("UNSOURCED-CARAT | %s stated as carats with no "
+                           "weight column | q=%r", _bad_ct, (question or "")[:100])
+            clean = unit_guard.caution(_bad_ct) + "\n\n" + clean
+            if not clarify_options:
+                clarify_options = [unit_guard.followup_option()]
+
+    # THE NUMBERS COME FROM THE DATA, NOT THE MODEL. The model is shown only a
+    # preview (MODEL_ROW_LIMIT rows), so any total it works out itself is
+    # addition over rows it never saw: the 2026-08-24 client demo announced
+    # "2,403 packets" for a result that totalled 3,227, and a second provider
+    # said 8,653. These facts are derived from the COMPLETE captured result.
+    _facts = facts.compute("\n".join(sql_used or []), shown_columns,
+                           shown_rows, truncated=bool(result.get("truncated")))
+
+    # Correct an explicit total the model stated anyway, BEFORE the table is
+    # appended - prose and table disagreeing is what the client actually saw.
+    clean, _fixed = facts.correct_total_claims(clean, _facts, question or "")
+    if _fixed:
+        from app.core.logging_util import logger
+
+        for _claimed, _actual in _fixed:
+            logger.warning("TOTAL-CORRECTED | model said %s, data says %s | q=%r",
+                           _claimed, _actual, (question or "")[:100])
+
+    clean = strip_empty_tables(clean)
     clean = ensure_data_shown(
         clean,
         shown_columns,
         shown_rows,
         has_visual=any((w or {}).get("kind") == "dashboard" for w in widgets),
     )
+    clean += facts.totals_line(_facts)
 
     return {
         "answer": clean,

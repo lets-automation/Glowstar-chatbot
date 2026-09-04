@@ -18,7 +18,11 @@ import pytest
 
 from app.agent import tools
 from app.agent.postprocess import fallback_chart
-from app.agent.widget import WIDGET_SYSTEM_PROMPT, build_dashboard_html
+from app.agent.widget import (
+    WIDGET_CORE_PROMPT,
+    WIDGET_DESIGN_PROMPT,
+    build_dashboard_html,
+)
 from app.core.sql_guard import DEFAULT_ROW_CAP, ensure_row_cap
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,7 +110,10 @@ def test_rules_explain_downloads_without_file_paths():
 
 
 def test_widget_prompt_no_longer_mentions_create_report():
-    assert "create_report" not in WIDGET_SYSTEM_PROMPT
+    # Both halves of the split prompt - the tool was removed, so neither the
+    # always-on core nor the gated design block may still offer it.
+    assert "create_report" not in WIDGET_CORE_PROMPT
+    assert "create_report" not in WIDGET_DESIGN_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -358,3 +365,72 @@ def test_report_detail_guard_wired_in_backend(backend):
     src = _src(backend)
     assert "nudged_report_detail" in src, f"{backend} lost the report-detail guard"
     assert "REPORT_DETAIL_NUDGE" in src
+
+
+# ---------------------------------------------------------------------------
+# 12. NARRATED CHART guard (client-flagged bug during a Qwen provider
+#     bakeoff, 2026-08-11): a weak model that skips the show_chart tool call
+#     and instead prints the tool's own JSON payload as prose must not show
+#     that raw JSON to the user - it gets recovered into a real chart widget.
+# ---------------------------------------------------------------------------
+from app.agent.postprocess import extract_narrated_charts  # noqa: E402
+
+
+def test_narrated_chart_json_recovered_as_widget():
+    answer = (
+        "Here you go.\n\n"
+        '```json\n{"chart_type": "bar", "title": "Packets - July 2026", '
+        '"labels": ["MFG - 1", "MFG-2"], "values": [317, 593], '
+        '"series_label": "Packets"}\n```\n\n'
+        "Totals: 910 packets."
+    )
+    clean, widgets = extract_narrated_charts(answer)
+    assert len(widgets) == 1
+    assert widgets[0]["kind"] == "chart"
+    assert "chart_type" not in clean
+    assert "Totals: 910 packets." in clean
+
+
+def test_narrated_chart_json_without_fence_still_recovered():
+    # Some models skip the ``` fence entirely and just print the bare object.
+    answer = (
+        'Comparison: {"chart_type": "pie", "title": "Share", '
+        '"labels": ["A", "B"], "values": [1, 2]} - see above.'
+    )
+    clean, widgets = extract_narrated_charts(answer)
+    assert len(widgets) == 1
+    assert "chart_type" not in clean
+
+
+def test_multiple_narrated_charts_all_recovered():
+    answer = (
+        '```json\n{"chart_type": "bar", "labels": ["a"], "values": [1]}\n```\n'
+        '```json\n{"chart_type": "line", "labels": ["b"], "values": [2]}\n```\n'
+    )
+    clean, widgets = extract_narrated_charts(answer)
+    assert len(widgets) == 2
+    assert "chart_type" not in clean
+
+
+def test_plain_answer_without_chart_json_is_untouched():
+    answer = "There were 910 packets finished in July 2026."
+    clean, widgets = extract_narrated_charts(answer)
+    assert clean == answer
+    assert widgets == []
+
+
+def test_narrated_chart_ungrounded_still_caught_by_fabrication_guard():
+    # No sql_used / data_rows at all - a narrated chart with no real query
+    # behind it must still be rejected as fabricated, same as an invented
+    # Markdown table would be.
+    from app.agent.postprocess import enrich
+
+    answer = (
+        '```json\n{"chart_type": "bar", "title": "Made up", '
+        '"labels": ["x"], "values": [1]}\n```\n'
+    )
+    out = enrich({"answer": answer, "sql_used": [], "rows_returned": 0, "ok": True,
+                   "data_columns": [], "data_rows": [], "widgets": []},
+                  question="show a chart")
+    assert out["ok"] is False
+    assert out["widgets"] == []

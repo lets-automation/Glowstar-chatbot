@@ -38,6 +38,11 @@ _FILE_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 # Keep token cost sane on the free tier.
 MAX_ROWS = 50           # sample rows per sheet shown to the model
 MAX_COLS = 40           # columns listed before we truncate
+MAX_CELL_CHARS = 200    # truncate any single text cell before rendering - a
+                        # free-text "Remarks"/"Notes" column can blow past the
+                        # row/column caps above even though they hold
+MAX_ATTACHMENTS = 5     # files analysed per message - MAX_ROWS/MAX_COLS bound
+                        # the cost of ONE file, this bounds N files in one turn
 MAX_PDF_CHARS = 12_000  # ~3k tokens of PDF text
 MAX_IMAGE_DIM = 1536    # downscale bigger images before base64
 READ_CAP = 5_000        # max rows READ into memory per sheet (DoS guard)
@@ -125,7 +130,12 @@ def _tabular_text(path: str, filename: str, kind: str) -> str:
         else:
             parts.append("Columns: " + ", ".join(cols))
 
-        head = df.head(MAX_ROWS)
+        head = df.head(MAX_ROWS).copy()
+        for col in head.select_dtypes(include=["object", "string"]).columns:
+            head[col] = head[col].apply(
+                lambda v: v if pd.isna(v) or len(str(v)) <= MAX_CELL_CHARS
+                else str(v)[:MAX_CELL_CHARS] + "...(truncated)"
+            )
         parts.append("Sample rows:")
         parts.append(head.to_string(index=False, max_cols=MAX_COLS))
         if df.shape[0] > MAX_ROWS:
@@ -193,7 +203,15 @@ def process_attachments(attachments: list[dict] | None) -> dict:
     notes: list[str] = []
     has_doc = False  # did any DOCUMENT (sheet/pdf/text) contribute real content?
 
-    for att in attachments or []:
+    attachments = attachments or []
+    if len(attachments) > MAX_ATTACHMENTS:
+        notes.append(
+            f"only the first {MAX_ATTACHMENTS} of {len(attachments)} files in this "
+            "message were analysed - send the rest in a follow-up question"
+        )
+        attachments = attachments[:MAX_ATTACHMENTS]
+
+    for att in attachments:
         file_id = att.get("file_id") or att.get("fileId")
         name = att.get("filename") or att.get("name") or file_id or "file"
         path = _resolve(file_id)

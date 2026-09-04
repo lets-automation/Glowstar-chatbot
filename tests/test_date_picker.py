@@ -147,14 +147,22 @@ def test_current_state_questions_never_ask_for_a_date(q):
 
 
 # ---------------------------------------------------------------------------
-# PERIOD MEMORY across turns.
+# PERIOD MEMORY across turns - ON (_PERIOD_MEMORY_TURNS = 2), WITH INJECTION.
 #
-# Regression lock. needs_date() declared `history` and documented it as handling
-# follow-ups, but the body never read it and main.py never passed it. So the
-# picker re-appeared on EVERY follow-up: the user tapped "June 2026", then
-# "now the damage report" put the picker straight back on screen, and again for
-# the turn after that. The period they already chose is right there in the
-# conversation.
+# History: the memory was switched OFF because it only SILENCED the picker and
+# then trusted the model to notice the period sitting in the conversation. The
+# model did not - measured twice on 2026-08-20, a follow-up widened to ALL
+# history and blew the context ("That request was too large"). The note left
+# here said the expectations should flip back only alongside the fix it
+# prescribed: INJECT the remembered period into the request.
+#
+# That fix now exists (date_gate.carried_period_directive, injected by
+# tools.system_prompt_for), so these expectations are flipped - and the tests
+# below assert BOTH halves. Suppressing the picker without the injection is the
+# regression that broke it before, so it is tested, not assumed.
+#
+# The other half of the trade was real too: in the 2026-08-21 client demo the
+# user said "may month" and the very next turn asked which month again.
 # ---------------------------------------------------------------------------
 def _hist(*questions):
     return [{"role": "user", "content": q} for q in questions]
@@ -166,8 +174,35 @@ def _hist(*questions):
     ("kapan wise production", _hist("show me last month's output")),
     ("and the jangad report", _hist("GIA results for 2026-06-01 to 2026-06-30")),
 ])
-def test_period_already_given_in_the_thread_suppresses_the_picker(q, history):
+def test_a_recent_period_suppresses_the_picker(q, history):
+    """A follow-up reuses the period the user already gave."""
     assert needs_date(q, history) is False, q
+
+
+@pytest.mark.parametrize("q,history", [
+    ("give me the damage report", _hist("production for June 2026")),
+    ("now the damage report", _hist("stock report", "from 1 Jun to 30 Jun 2026")),
+    ("and the jangad report", _hist("GIA results for 2026-06-01 to 2026-06-30")),
+])
+def test_and_that_period_is_injected_not_merely_remembered(q, history):
+    """THE safety condition. Silencing the picker without putting the period in
+    the request is what made the model query all of history."""
+    from app.agent import date_gate
+
+    with date_gate.carrying_period(history, q):
+        directive = date_gate.carried_period_directive()
+    assert "PERIOD CARRIED OVER" in directive, q
+    assert "Do NOT widen to all history" in directive, q
+
+
+@pytest.mark.parametrize("q", [
+    "give me the damage report for June 2026",
+    "kapan wise production from 1 Jul to 31 Jul 2026",
+])
+def test_a_period_in_the_question_itself_still_suppresses_the_picker(q):
+    """The gate only ever needed the period to be in THIS request - and that
+    path is unaffected by turning the cross-turn memory off."""
+    assert needs_date(q, _hist("something else entirely")) is False, q
 
 
 @pytest.mark.parametrize("q,history", [
@@ -221,3 +256,132 @@ def test_gates_survive_an_unreachable_redis(monkeypatch):
                     json={"question": "give me the damage report", "session_id": "redis-down"})
     assert r.status_code == 200
     assert '"ask_date": true' in r.text.replace("'", '"').lower()
+
+
+# ---------------------------------------------------------------------------
+# A NAMED KAPAN IS ITS OWN SCOPE
+# ---------------------------------------------------------------------------
+# Live 2026-09-03: "For kapan OR26, show packets where the MFG grade differs
+# from the GIA grade on cut or clarity" was met with the date picker. _REPORT_RE
+# matches the bare word "gia" and the question names no month, so the gate fired
+# BEFORE any LLM call and asked for a date range on a question that has no time
+# dimension. The bot then reported that as an inability to answer at all.
+#
+# A kapan is a parcel of rough, not a period; picking a month would narrow the
+# result to whichever plan rows happen to fall inside it.
+
+
+@pytest.mark.parametrize("q", [
+    "For kapan OR26, show packets where the MFG grade differs from the GIA "
+    "grade on cut or clarity",
+    "kapan QA26 ma ketla piece hata?",
+    "OQ26 kapan ma final point / final polish weight ketlu nikalyu?",
+    "from kapan NS26 list packets with an approved CLV plan but no PLS",
+    "kapan OS26 gia results",
+    "kapan IK summary",                       # bare two-letter kapan name
+])
+def test_a_named_kapan_never_asks_for_a_date(q):
+    assert needs_date(q, []) is False, q
+
+
+@pytest.mark.parametrize("q", [
+    # "kapan wise" is a report ACROSS kapans and genuinely needs a period.
+    "kapan wise production report",
+    "give me kapan-wise damage summary",
+    "give me kapan wise gia summary",
+])
+def test_kapan_wise_is_still_a_report_that_needs_a_period(q):
+    assert needs_date(q, []) is True, q
+
+
+def test_a_two_letter_word_before_the_noun_is_not_a_kapan_code():
+    """The reverse-order branch ("OQ26 kapan ma") must not fire on ordinary
+    English. Before the noun the code has to carry digits, or "give me
+    kapan-wise ..." matches on "me kapan" and suppresses the picker."""
+    from app.agent.date_gate import names_a_kapan
+
+    assert names_a_kapan("OQ26 kapan ma final polish weight") is True
+    for q in ("give me kapan wise report", "in kapan wise terms",
+              "of kapan wise damage"):
+        assert names_a_kapan(q) is False, q
+
+
+# ---------------------------------------------------------------------------
+# THE GATES vs THE VERIFIED CORPUS
+# ---------------------------------------------------------------------------
+# Nothing swept the cold-case corpus through the GATES until 2026-09-03, and
+# the OR26 kapan bug lived in exactly that blind spot: a gate can refuse a
+# question before any LLM call, and no test noticed.
+#
+# Sweeping it found SEVEN more cases whose ground-truth SQL contains no date
+# predicate at all - they are all-time counts, breakdowns, or proofs that a
+# column is not recorded - and every one of them is met with the date picker
+# instead of its answer.
+#
+# The list is asserted rather than fixed here because "should 'party wise
+# jangad' default to all time or ask for a period?" is a product decision, not
+# a bug with one right answer. What must not happen is the list growing
+# silently, or a case that works today quietly joining it.
+
+
+def _gate_blocked_cold_cases():
+    from scripts.cold_cases import COLD_CASES
+    from app.agent import access_guard, lab_gate
+
+    out = {}
+    for c in COLD_CASES:
+        q = c.get("question") or ""
+        if not q or not c.get("truthSql"):
+            continue
+        why = []
+        if needs_date(q, []):
+            why.append("date_picker")
+        if lab_gate.needs_lab(q, []):
+            why.append("lab_gate")
+        if access_guard.is_pay_question(q):
+            why.append("pay_guard")
+        if why:
+            out[c["id"]] = "+".join(why)
+    return out
+
+
+# Every one of these has a verified answer that needs no period. CT-04 is the
+# pay guard and is deliberate - it refuses before any LLM call, by design.
+KNOWN_GATE_BLOCKED = {
+    "JP-1": "date_picker",    # "total ketla jangad" - all-time count
+    "JP-3": "date_picker",    # party-wise breakdown, no period
+    "DRS-3": "date_picker",   # repair reasons, no period
+    "EDA-3": "date_picker",   # employee rating ranking, no period
+    "CT-02": "date_picker",   # proves tblJunk.Grede is never recorded
+    "CT-08": "date_picker",   # proves no yield column exists (metadata probe)
+    "CT-09": "date_picker",   # kapan-level boil/chapka loss, no period
+    "CT-04": "pay_guard",     # deliberate - refused before any LLM call
+}
+
+
+def test_no_new_cold_case_is_intercepted_by_a_gate():
+    """SHRINK THIS LIST, NEVER GROW IT.
+
+    A gate that fires on a question with a verified date-free answer costs
+    the user that answer and hands them a picker instead.
+    """
+    blocked = _gate_blocked_cold_cases()
+    new = {k: v for k, v in blocked.items() if k not in KNOWN_GATE_BLOCKED}
+    assert not new, f"a gate started intercepting these: {new}"
+
+
+def test_the_known_list_has_not_silently_changed_reason():
+    blocked = _gate_blocked_cold_cases()
+    for cid, why in KNOWN_GATE_BLOCKED.items():
+        if cid in blocked:
+            assert blocked[cid] == why, (
+                f"{cid} is now blocked by {blocked[cid]}, was {why}")
+
+
+def test_a_fixed_case_must_be_removed_from_the_list():
+    """The other direction: if a fix unblocks one, the list must shrink so the
+    count stays honest."""
+    blocked = _gate_blocked_cold_cases()
+    stale = [k for k in KNOWN_GATE_BLOCKED if k not in blocked]
+    assert not stale, (
+        f"these are no longer blocked - delete them from KNOWN_GATE_BLOCKED: {stale}")

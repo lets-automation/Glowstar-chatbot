@@ -20,7 +20,9 @@ questions work automatically.
 """
 from __future__ import annotations
 
+import math
 import re
+from functools import lru_cache
 
 # Notes that must survive routing: they prevent WRONG ANSWERS on any topic, not
 # just their own. Matched as substrings against the start of a note.
@@ -35,6 +37,15 @@ _ALWAYS_ON = (
     "KNOWN-EMPTY TABLES",     # don't query dead tables
     "SALARY / PAYROLL",       # restricted data — must never be forgotten
     "Some columns are misspelled",   # Florecent etc. — breaks any query
+    # Added 2026-08-20. Both of these describe columns that DO NOT EXIST where a
+    # model expects them, so getting them wrong is an invalid-column error and an
+    # empty report - not a slightly-worse answer. They were losing the top-10
+    # ranking cut to merely-relevant notes: a live "report of department MFG - 1"
+    # wrote WHERE DepartmentName=... against tblPlanMaster nine times because
+    # this guidance never reached the prompt. Correctness traps must not compete
+    # for a slot.
+    "SUBSTITUTE THESE COLUMNS",   # IsApproved not IsVerified; kapan-level hold
+    "DEPARTMENT IS NOT A COLUMN", # dept resolves via tblEmployee.EmpId only
 )
 
 _STOP = {
@@ -52,30 +63,83 @@ def _tokens(text: str) -> set[str]:
 
 
 def _is_always_on(note: str) -> bool:
+    # UPPER-CASE BOTH SIDES. The head is upper-cased, so a marker that is not
+    # itself all-caps can never match it. Every marker was ALL-CAPS except
+    # "Some columns are misspelled", so that one note - the one that says an
+    # expected column may be stored misspelled (Florecent/Florocent) - was
+    # silently NOT always-on. It reached the prompt only when the question
+    # already contained a matching word, i.e. it scored in topically; measured
+    # 2026-08-25 as absent from all 59 questions of the audit corpus.
     head = note[:60].upper()
-    return any(k in head for k in _ALWAYS_ON)
+    return any(k.upper() in head for k in _ALWAYS_ON)
 
 
-def score_note(note: str, q_tokens: set[str]) -> int:
+@lru_cache(maxsize=8)
+def _doc_freq(notes: tuple[str, ...]) -> dict[str, int]:
+    """How many notes each token appears in. Cached per note corpus."""
+    df: dict[str, int] = {}
+    for note in notes:
+        for tok in _tokens(note):
+            df[tok] = df.get(tok, 0) + 1
+    return df
+
+
+def _idf(notes: tuple[str, ...]) -> dict[str, float]:
+    """Inverse document frequency: how much evidence one shared token is worth."""
+    df = _doc_freq(notes)
+    total = len(notes) or 1
+    return {tok: math.log(total / n) for tok, n in df.items() if n}
+
+
+def score_note(note: str, q_tokens: set[str], idf: dict[str, float] | None = None) -> float:
     """
     How relevant is this note to the question?
 
-    Rare, meaningful words carry the signal (a note mentioning 'jangad' when the
-    user said 'jangad'), so we simply count shared terms — table names like
-    tblJangadPackets tokenise into the same words, which is why an exact-keyword
-    approach works well here without embeddings.
+    RARE WORDS CARRY THE SIGNAL, AND THEY HAVE TO BE WEIGHTED THAT WAY.
+    ------------------------------------------------------------------
+    This used to be a flat `len(q_tokens & _tokens(note))` — every shared word
+    worth one point. That is the same mistake the TABLE router already fixed
+    with _WEAK_COLUMN_TOKENS: across 53 notes, a common word matches nearly
+    everything and buries the note that actually answers the question.
+
+    Measured on "damage report kapan wise for this year" before this change:
+      damage  appears in  2 of 53 notes   (the whole signal)
+      kapan   appears in 10 of 53
+      year    appears in  5 of 53
+    All three scored 1. Nine notes tied at 1, the top-10 cut fell to source
+    order, and "DAMAGE IS POINTS, NOT RUPEES — tblPlanReport.Amount = Points x
+    Rate" — the ONE note that says a damage amount is not rupees — did not make
+    the prompt. The 548-token stock-report note did.
+
+    Weighting by log(N/df) makes 'damage' worth about twice 'kapan' and breaks
+    the ties that were being resolved by luck. `idf` is optional so the plain
+    count remains available (and so any caller passing two arguments still works).
     """
-    return len(q_tokens & _tokens(note))
+    shared = q_tokens & _tokens(note)
+    if idf is None:
+        return float(len(shared))
+    return sum(idf.get(tok, 1.0) for tok in shared)
+
+
+# Drop a note scoring far below the best match rather than padding the list to
+# max_notes with noise. Mirrors _RELATIVE_FLOOR in app/schema/router.py, which
+# exists for the same reason and against the same failure: long, mostly
+# irrelevant context is a known reliability killer on small models.
+_RELATIVE_FLOOR = 0.35
+# ...but never starve a weak-signal question completely.
+_MIN_NOTES = 4
 
 
 def select_notes(
     notes: list[str],
     question: str,
-    # min_score MUST stay 1: a note often shares only one distinctive token with
-    # the question ("damage" -> the damage note). Raising it to 2 silently dropped
-    # the damage and stock-report guidance (caught by test_note_router).
+    # min_score MUST stay >0: a note often shares only one distinctive token with
+    # the question ("damage" -> the damage note). Requiring two silently dropped
+    # the damage and stock-report guidance (caught by test_note_router). With IDF
+    # weighting a single RARE token clears this comfortably while a single common
+    # one no longer does - which is the point.
     max_notes: int = 10,
-    min_score: int = 1,
+    min_score: float = 0.75,
 ) -> list[str]:
     """
     Return the always-on notes plus the best-matching ones for `question`.
@@ -85,19 +149,40 @@ def select_notes(
     """
     q = _tokens(question)
     if not q:
-        return list(notes)
+        # NOTHING RECOGNISABLE IN THE QUESTION. This used to `return list(notes)`
+        # - every note, unrouted - and it fires on ordinary phrasing, because
+        # _tokens() drops stop-words and any word of two characters or fewer:
+        # "give me the report", "show all data", "how many" and "ok give report"
+        # all reduce to an empty set. Measured 2026-08-21: those questions were
+        # shipping 17,652 tokens of notes against ~7,000 for a specific one, so
+        # the vaguest questions - where the model most needs focus - got the
+        # LEAST focused prompt, a 46% larger overall prompt, and 48 competing
+        # rules. Returning everything is not the conservative choice here; it is
+        # the least conservative one. A question with no recognisable content is
+        # evidence for no topical note, so send the safety notes and let the
+        # model ask or explore.
+        # JOIN_HINTS carry no always-on markers, so this returns [] for them -
+        # deliberately. A question with no recognisable word cannot be helped by
+        # a join hint, and the hints are 3,151 tokens. render_data_notes() skips
+        # an empty section, and the model still has the rules and the schema.
+        return [n for n in notes if _is_always_on(n)]
 
+    idf = _idf(tuple(notes))
     keep: list[str] = []
-    scored: list[tuple[int, int]] = []          # (score, original index)
+    scored: list[tuple[float, int]] = []        # (score, original index)
     for i, note in enumerate(notes):
         if _is_always_on(note):
             keep.append(note)
         else:
-            s = score_note(note, q)
+            s = score_note(note, q, idf)
             if s >= min_score:
                 scored.append((s, i))
 
     scored.sort(key=lambda t: (-t[0], t[1]))
+    if scored:
+        cutoff = scored[0][0] * _RELATIVE_FLOOR
+        strong = [t for t in scored if t[0] >= cutoff]
+        scored = strong if len(strong) >= _MIN_NOTES else scored[:_MIN_NOTES]
     chosen = {i for _, i in scored[:max_notes]}
     picked = [n for i, n in enumerate(notes) if i in chosen]
 
@@ -115,10 +200,21 @@ def select_mapping(
     question: str,
     max_items: int = 12,
 ) -> dict[str, str]:
-    """Same idea for key->meaning maps (VALUE_CODES, GUJLISH_TERMS)."""
+    """Same idea for key->meaning maps (VALUE_CODES, GUJLISH_TERMS).
+
+    NOTE the two different empty cases, which are NOT the same thing:
+      * question is None/"" -> no routing was requested at all (tests, offline
+        inspection, render_data_notes() with no argument). Return everything.
+      * question has no recognisable tokens ("show all data") -> routing WAS
+        requested and found nothing. Return nothing, for the same reason
+        select_notes() does: a value code cannot help a question with no
+        content, and the two maps are 1,656 tokens.
+    """
+    if not (question or "").strip():
+        return dict(mapping)
     q = _tokens(question)
     if not q:
-        return dict(mapping)
+        return {}
     scored = []
     for k, v in mapping.items():
         s = len(q & _tokens(f"{k} {v}"))

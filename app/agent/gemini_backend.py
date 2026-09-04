@@ -19,8 +19,9 @@ from google.genai import types
 
 from app.agent import attachments as attachments_mod
 from app.agent import loop_policy as policy
-from app.agent import result_capture, tools, widget
+from app.agent import context_budget, result_capture, tools, widget
 from app.config import settings
+from app.core import cost_trace
 from app.core.logging_util import log_interaction, log_provider_error
 
 
@@ -145,6 +146,49 @@ def _user_parts(question: str, file_context: dict | None) -> list:
     return parts
 
 
+
+def _compact_contents(contents: list) -> None:
+    """Shrink old tool results in place so a long report cannot overflow.
+
+    THE FAILURE THIS PREVENTS. This backend had no compaction at all - the
+    policy lived inside groq_backend, so the PRODUCTION provider was the one
+    without it. A report question runs 9-11 rounds and every function_response
+    stayed in full, so the context only ever grew. Gemini 2.5 Flash has a 1M
+    window to absorb that, which is why it has not surfaced as a failure; it is
+    also why it would surface immediately on a self-hosted model.
+
+    Gemini dialect: a tool result is a Part carrying a function_response, and
+    several can share one Content. Every function_call must keep a matching
+    function_response, so a part's TEXT may shrink but no part may be removed.
+    The system prompt is not in `contents` at all (it goes in
+    config.system_instruction), so everything here is genuinely conversation.
+
+    Policy - budget, ordering, what is worth trimming - is shared with the other
+    backends in app/agent/context_budget.py.
+    """
+    slots: list[tuple] = []      # (content_index, part_index, name, text)
+    other_chars = 0
+    for ci, content in enumerate(contents):
+        for pi, part in enumerate(getattr(content, "parts", None) or []):
+            fr = getattr(part, "function_response", None)
+            if fr is not None:
+                payload = fr.response or {}
+                text = payload.get("result") if isinstance(payload, dict) else None
+                if isinstance(text, str):
+                    slots.append((ci, pi, fr.name, text))
+                    continue
+            other_chars += len(str(getattr(part, "text", "") or ""))
+
+    trims = context_budget.plan_trims([t for *_, t in slots], other_chars)
+    for k, note in trims.items():
+        ci, pi, name, _ = slots[k]
+        parts = list(contents[ci].parts)
+        parts[pi] = types.Part.from_function_response(
+            name=name, response={"result": note}
+        )
+        contents[ci] = types.Content(role=contents[ci].role, parts=parts)
+
+
 def ask_gemini(
     question: str,
     model: str,
@@ -213,27 +257,32 @@ def _write_up(contents, system, model, api_key: str | None, on_event=None) -> tu
     tried = [(model, api_key)] if api_key else []
     tried += [pair for pair in _attempts(model) if pair != (model, api_key)]
 
-    for idx, (try_model, key) in enumerate(tried):
-        try:
-            final = _client(key).models.generate_content(
-                model=try_model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0,
-                    # The WRITE-UP call — this is the one that actually needs the
-                    # room, since it renders the ~30-row preview table.
-                    max_output_tokens=settings.max_output_tokens("gemini"),
-                ),
-            )
-            return (final.text or "").strip(), True
-        except Exception as exc:  # noqa: BLE001 - decide by error kind
-            log_provider_error("gemini", try_model, exc)
-            if not _is_quota_error(exc):
-                return "", False        # a real bug: another model won't help
-            _EXHAUSTED_KEYS.add((try_model, key))
-            if idx + 1 < len(tried) and on_event:
-                on_event("Switching to a backup connection…")
+    # One span for the whole rotation, same reasoning as the tool loop: every
+    # attempt here is the SAME step retried on a different key, and rolling them
+    # up is what shows how much a quota-thrashing write-up really costs. On a
+    # free tier this is routinely several calls for one answer.
+    with cost_trace.step("write-up"):
+        for idx, (try_model, key) in enumerate(tried):
+            try:
+                final = _client(key).models.generate_content(
+                    model=try_model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        temperature=0,
+                        # The WRITE-UP call — this is the one that actually needs
+                        # the room, since it renders the ~30-row preview table.
+                        max_output_tokens=settings.max_output_tokens("gemini"),
+                    ),
+                )
+                return (final.text or "").strip(), True
+            except Exception as exc:  # noqa: BLE001 - decide by error kind
+                log_provider_error("gemini", try_model, exc)
+                if not _is_quota_error(exc):
+                    return "", False    # a real bug: another model won't help
+                _EXHAUSTED_KEYS.add((try_model, key))
+                if idx + 1 < len(tried) and on_event:
+                    on_event("Switching to a backup connection…")
     return "", False
 
 
@@ -259,10 +308,15 @@ def _ask_gemini_once(
     # block goes in front of the per-question schema. The widget prompt used to
     # trail system_prompt_for(), which put 2k of never-changing text behind a
     # per-question boundary where it could never be cached.
+    # The design half of the widget prompt is ~1k tokens that only show_widget
+    # ever reads, so it is appended at the very END, and only for questions that
+    # ask for a custom visual - never in front of the schema, where switching it
+    # on and off would un-cache everything behind it.
     system = (
-        widget.WIDGET_SYSTEM_PROMPT
+        widget.WIDGET_CORE_PROMPT
         + "\n\n"
         + tools.system_prompt_for(routing)
+        + widget.visual_prompt_for(routing)
     )
     config = types.GenerateContentConfig(
         system_instruction=system,
@@ -321,21 +375,30 @@ def _ask_gemini_once(
         try:
             # Inner loop so a rotation does NOT consume one of the tool rounds -
             # a swap is a retry of the same step, not a step of its own.
-            while True:
-                try:
-                    resp = client.models.generate_content(
-                        model=cur_model, contents=contents, config=config
-                    )
-                    break
-                except Exception as exc:  # noqa: PERF203
-                    if not (_is_quota_error(exc) and pair_i + 1 < len(pairs)):
-                        raise
-                    _EXHAUSTED_KEYS.add((cur_model, cur_key))
-                    log_provider_error("gemini", cur_model, exc)
-                    pair_i += 1
-                    cur_model, cur_key = pairs[pair_i]
-                    client = _client(cur_key)
-                    emit("Switching to a backup connection…")
+            #
+            # The cost span wraps the WHOLE rotation for exactly that reason: a
+            # round that burned three keys before one answered is one planning
+            # step that cost three calls, and that is the shape worth seeing.
+            # Repeats are numbered by the SDK's step_index, not by the name.
+            # Before every provider call, not just at the end: the overflow
+            # happens ON a call, so trimming afterwards would be too late.
+            _compact_contents(contents)
+            with cost_trace.step("plan"):
+                while True:
+                    try:
+                        resp = client.models.generate_content(
+                            model=cur_model, contents=contents, config=config
+                        )
+                        break
+                    except Exception as exc:  # noqa: PERF203
+                        if not (_is_quota_error(exc) and pair_i + 1 < len(pairs)):
+                            raise
+                        _EXHAUSTED_KEYS.add((cur_model, cur_key))
+                        log_provider_error("gemini", cur_model, exc)
+                        pair_i += 1
+                        cur_model, cur_key = pairs[pair_i]
+                        client = _client(cur_key)
+                        emit("Switching to a backup connection…")
         except Exception as exc:
             # Every model/key is spent. Raise only while nothing useful exists,
             # so ask_gemini can report it; mid-answer we keep the partial result
@@ -545,17 +608,35 @@ def _ask_gemini_once(
                 continue
 
             emit(tools.friendly_status(name))
-            result_text, sql, row_count, cols_full, rows_full = tools.run_tool(name, args)
+            result_text, sql, row_count, cols_full, rows_full, tool_sections = tools.run_tool(name, args)
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
                 # Which result is "the answer"? See result_capture - one rule,
                 # shared by every backend, tested against both the bugs it fixes.
-                if name == "run_sql" and result_capture.better(
+                # Any tool that returned rows, not just run_sql: a report recipe
+                # (department_report) also produces the rows behind the answer,
+                # and gating on the tool NAME left data_rows empty for it - so
+                # the UI's "offer a download" condition never fired and a
+                # perfectly good 8-section report came with no Excel at all.
+                if cols_full and rows_full and result_capture.better(
                     cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
-                    result_capture.add_section(data_sections, cols_full, rows_full)
+                    # Only when the tool did NOT return named sections. A recipe
+                    # returns its own titled ones just below, and adding this
+                    # untitled copy first made the titled version look like a
+                    # duplicate - so the workbook's first sheet lost its name
+                    # ("Code-Worker" instead of "Workforce").
+                    if not tool_sections:
+                        result_capture.add_section(data_sections, cols_full, rows_full)
+            # A report recipe returns SEVERAL named results from one call. Each
+            # becomes its own titled sheet, so the workbook carries the whole
+            # report rather than only its widest table.
+            for sec in tool_sections:
+                result_capture.add_section(
+                    data_sections, sec["columns"], sec["rows"], title=sec.get("title")
+                )
             responses.append(
                 types.Part.from_function_response(name=name, response={"result": result_text})
             )

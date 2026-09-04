@@ -38,11 +38,7 @@ pandas==3.0.3              # Excel/CSV parsing + summary stats
 pypdf==6.14.2             # PDF text extraction
 pillow==12.2.0            # image downscaling before vision
 
-# LLM cost tracking (optional; agentcost.tech - active only when
-# AGENTCOST_API_KEY + AGENTCOST_PROJECT_ID are set in .env). Young third-party
-# SDK that monkey-patches the LLM client libraries: keep it PINNED and re-test
-# before any bump.
-#
+
 # 0.1.3 -> 0.1.7 (2026-08-06). 0.1.3 shipped ONLY openai_interceptor.py and
 # anthropic_interceptor.py - there was no Gemini interceptor in it at all. With
 # LLM_PROVIDER=gemini (the current setting) every call goes through
@@ -50,7 +46,17 @@ pillow==12.2.0            # image downscaling before vision
 # loud - "Tracking initialized (LangChain, OpenAI, Anthropic)" - and the
 # dashboard stayed empty. 0.1.7 adds gemini_interceptor.py, which patches
 # google.genai.models.Models.generate_content(_stream) and their async twins.
-agentcost==0.1.7
+#
+# 0.1.7 -> 0.2.0 (2026-08-12). Adds trace.py: workflow()/step()/tool() context
+# managers that stamp every event with trace_id + step_name + step_index, so the
+# dashboard can show what ONE question cost broken down by round instead of a
+# flat list of calls. We use them - see app/core/cost_trace.py. Additive only:
+# init/agent/metadata/shutdown are unchanged, and every event field it adds is
+# extra. Two other fixes come along: interceptor events now funnel through one
+# _record_event (so the trace stamp cannot be forgotten per-interceptor), and
+# every user-actionable warning is ALSO logged to the "agentcost" logger -
+# warnings.warn alone was invisible under uvicorn.
+agentcost==0.2.0
 
 # Phase 7 - semantic search (optional; needs Voyage + Pinecone keys)
 voyageai==0.4.1

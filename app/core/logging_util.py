@@ -16,6 +16,7 @@ This makes both ACCURACY and OPERATIONAL problems debuggable:
 
 import logging
 import os
+import re
 from collections import namedtuple
 from logging.handlers import RotatingFileHandler
 
@@ -56,8 +57,15 @@ def log_interaction(
         logger.info("   SQL: %s", sql)
     if error:
         logger.error("   ERROR: %s", error)
-    else:
-        logger.info("   rows_returned: %s", rows_returned)
+        return
+    logger.info("   rows_returned: %s", rows_returned)
+    # A turn that ran NO query and returned NO rows still logged "ok", so a
+    # silent no-query answer left no trace at all - seen live 2026-08-25 08:43,
+    # where "kapan wise gia results for june month" logged ok/0 rows with no SQL
+    # and the same question a minute later returned 37. Flag it: the answer was
+    # not grounded in a query, whatever it said.
+    if not sql_used and not rows_returned:
+        logger.warning("   NO-QUERY TURN | nothing was executed for this question")
 
 
 # --------------------------------------------------------------------------- #
@@ -117,11 +125,42 @@ _ERROR_RULES = [
 ]
 
 
+# AN HTML BODY MEANS A GATEWAY ANSWERED, NOT THE API.
+#
+# A self-hosted endpoint behind a proxy (RunPod, ngrok, a load balancer) returns
+# an HTML error PAGE when the service behind it is down or still loading. That
+# page is prose and markup, and matching provider needles against it is
+# meaningless - worse, it is actively misleading.
+#
+# Measured live 2026-09-03. The RunPod pod stopped responding and returned its
+# "Waiting for service to respond" page. The page contains the digits "401"
+# inside an SVG path coordinate, the bare substring "401" is an `auth` needle,
+# and `auth` is ordered BEFORE `connection` - so a dead pod was reported as
+# "check LLM_PROVIDER, the model id, and the API key in .env". The config was
+# perfect. That sends whoever is on call to the wrong file entirely.
+_HTML_RE = re.compile(r"<!doctype html|<html[\s>]", re.IGNORECASE)
+
+# A BARE THREE-DIGIT NEEDLE MATCHES ANY THREE DIGITS ANYWHERE.
+# Status codes are only evidence when they read like a status - "401",
+# "status: 429", "HTTP 503" - not when they fall out of a coordinate, an id or
+# a timestamp. Everything non-numeric stays a plain substring match.
+_STATUS_CONTEXT = r"(?:status|code|http|error|response)\D{0,12}"
+
+
+def _needle_hit(needle: str, text: str) -> bool:
+    if not needle.isdigit():
+        return needle in text
+    return re.search(rf"(?:{_STATUS_CONTEXT}{needle}|\b{needle}\b\s*[:-]|"
+                     rf"^\s*{needle}\b)", text, re.MULTILINE) is not None
+
+
 def classify_provider_error(exc) -> ProviderError:
     """Map a raw provider exception to a (category, user_message)."""
     text = str(exc).lower()
+    if _HTML_RE.search(text):
+        return ProviderError("unreachable", _MSG_UNREACHABLE)
     for category, needles, message in _ERROR_RULES:
-        if any(n in text for n in needles):
+        if any(_needle_hit(n, text) for n in needles):
             return ProviderError(category, message)
     return ProviderError("unknown", _MSG_GENERIC)
 
@@ -142,6 +181,15 @@ def log_provider_error(provider: str, model: str, exc: Exception) -> ProviderErr
         logger.error(
             "   -> CONFIG problem: check LLM_PROVIDER, the model id, and the API "
             "key in .env (the model may have been renamed/retired by the provider)."
+        )
+    elif pe.category in ("unreachable", "connection"):
+        # Point at the ENDPOINT, not at .env. A self-hosted pod that has
+        # stopped, crashed or is still loading its weights looks exactly like
+        # this, and the config is usually fine.
+        logger.error(
+            "   -> ENDPOINT problem: the provider host answered but the model "
+            "service behind it did not. Check the pod/server is running and "
+            "has finished loading, then retry - .env is probably fine."
         )
     return pe
 
@@ -201,6 +249,25 @@ _NO_DATA_MARKERS = (
 )
 
 
+# Turns that FAILED rather than honestly declined. These never reached the
+# UNANSWERED backlog, because the old capture required rows_returned == 0 AND a
+# "we don't hold that" phrase - a context overflow or a provider error matches
+# neither, so the questions most worth turning into a recipe were the ones the
+# backlog could not see. Measured on 2026-08-20: every "That request was too
+# large" on a department report was invisible here.
+_FAILURE_MARKERS = (
+    "too large for the current ai model",
+    "trouble answering",
+    "busy right now",
+    "usage limit",
+    "couldn't reach",
+    "could not reach",
+    "misconfigured",
+    "couldn't write the summary",
+    "could not write the summary",
+)
+
+
 def log_unanswered(question: str, answer: str, rows_returned: int) -> bool:
     """
     Record a question the assistant could NOT answer from the data.
@@ -212,13 +279,18 @@ def log_unanswered(question: str, answer: str, rows_returned: int) -> bool:
 
     Returns True when the turn was logged as unanswered.
     """
-    if rows_returned:
-        return False
     low = (answer or "").lower()
-    if not any(m in low for m in _NO_DATA_MARKERS):
-        return False
+    # A FAILURE is worth capturing even when rows came back: "I fetched the data
+    # but couldn't write the summary" holds rows and is still a broken turn.
+    failed = any(m in low for m in _FAILURE_MARKERS)
+    if not failed:
+        if rows_returned:
+            return False
+        if not any(m in low for m in _NO_DATA_MARKERS):
+            return False
     logger.warning(
-        "UNANSWERED | q=%r | reply=%r",
+        "UNANSWERED | %s | q=%r | reply=%r",
+        "FAILED" if failed else "no-data",
         (question or "").replace("\n", " ").strip()[:160],
         (answer or "").replace("\n", " ").strip()[:160],
     )

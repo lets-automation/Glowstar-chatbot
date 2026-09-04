@@ -9,11 +9,13 @@ import json
 import re
 
 from app.agent import attachments as attachments_mod
+from app.agent import context_budget
 from app.agent import loop_policy as policy
 from app.agent import result_capture, tools, widget
 from app.agent._retry import call_with_retry
-from app.agent.postprocess import looks_like_data_table
+from app.agent.postprocess import asserts_a_figure, looks_like_data_table
 from app.config import settings
+from app.core import cost_trace
 from app.core.logging_util import log_interaction, log_provider_error
 
 
@@ -118,6 +120,8 @@ _OPENAI_COMPATIBLE = {
     "lmstudio": ("LMSTUDIO_BASE_URL", None,                ""),
     "cerebras": ("CEREBRAS_BASE_URL", "CEREBRAS_API_KEY",  "CEREBRAS_API_KEY"),
     "nvidia":   ("NVIDIA_BASE_URL",   "NVIDIA_API_KEY",    "NVIDIA_API_KEY"),
+    "openrouter": ("OPENROUTER_BASE_URL", "OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
+    "kimi":     ("KIMI_BASE_URL",     "KIMI_API_KEY",      "KIMI_API_KEY"),
 }
 
 
@@ -163,6 +167,75 @@ def _max_tokens() -> int:
     return settings.max_output_tokens()
 
 
+# Compaction POLICY now lives in app/agent/context_budget.py so that every
+# backend gets it - it used to live here, which meant it protected Groq and left
+# gemini_backend (the production provider) and anthropic_backend with none.
+#
+# Re-exported under the original names: this module's callers and
+# tests/test_context_compaction.py both import them from here.
+_CHARS_PER_TOKEN = context_budget.CHARS_PER_TOKEN
+_COMPACT_ABOVE_TOKENS = context_budget.COMPACT_ABOVE_TOKENS
+_KEEP_FULL_TOOL_RESULTS = context_budget.KEEP_FULL_TOOL_RESULTS
+_trimmed_note = context_budget.trimmed_note
+
+
+def _compact_history(messages: list[dict]) -> None:
+    """Shrink old tool results in place so a long report cannot overflow.
+
+    OpenAI dialect: tool results are `role: tool` messages, and every
+    tool_call_id must keep a matching reply - so content may shrink, but a
+    message may never be removed. The policy (budget, ordering, what is worth
+    trimming) is shared - see app/agent/context_budget.py.
+
+    MEASURE THE CONVERSATION, NOT THE SYSTEM PROMPT. messages[0] is the system
+    prompt at ~20k tokens; counting it meant the threshold was passed before the
+    user's question was appended and compaction ran on every round from the
+    first. It is fixed overhead that sits ALONGSIDE the conversation.
+    """
+    tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    tool_texts = [str(messages[i].get("content") or "") for i in tool_idx]
+    other_chars = sum(
+        len(str(m.get("content") or ""))
+        for m in messages
+        if m.get("role") not in ("system", "tool")
+    )
+    for k, note in context_budget.plan_trims(tool_texts, other_chars).items():
+        messages[tool_idx[k]]["content"] = note
+
+
+def _extra_body() -> dict:
+    """Provider-specific request extras.
+
+    Qwen3.x is a REASONING model: it deliberates before answering and pays for
+    that deliberation out of the SAME max_tokens budget. Measured on
+    Qwen3.5-9B via vLLM (2026-08-20): one trivial prompt burned 300 completion
+    tokens thinking and never produced an answer, versus 30 tokens answering
+    correctly with thinking disabled. On a department report the write-up round
+    ran out mid-thought, so the user got raw monologue and a dumped table
+    instead of a report.
+
+    Qwen's chat template understands enable_thinking=False and vLLM forwards
+    chat_template_kwargs to it. Gated behind LLM_DISABLE_THINKING because other
+    providers reject unknown request fields outright - a 400 on every call is a
+    worse failure than a verbose answer.
+
+    DEFAULT IT OFF. Disabling thinking looked like a clean win (fast, no
+    truncation) and was measured to be a REGRESSION on anything multi-step: the
+    same MFG-1 department report then summarised its own 9-row preview sample as
+    the totals - it reported 9 packets where the database holds 381 - and
+    dropped the damage, bonus and incentive sections entirely. Thinking is what
+    plans a multi-section report.
+
+    The real fix for truncation is BUDGET, not silence: thinking ON with
+    LLM_MAX_TOKENS=16384 produced the correct 381/405 figures, all sections, and
+    the same ~34s. Only set LLM_DISABLE_THINKING=true for a provider whose
+    context genuinely cannot fit reasoning plus the answer.
+    """
+    if settings.LLM_DISABLE_THINKING:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {}
+
+
 # NOTE: this module used to REASSIGN policy.EXECUTE_NUDGE here at import time,
 # with a byte-identical copy of the string already defined in loop_policy.py.
 # Harmless in effect, but it was a provider module reaching in and mutating
@@ -193,9 +266,14 @@ def ask_groq(
     messages = [
         {
             "role": "system",
-            "content": widget.WIDGET_SYSTEM_PROMPT
+            # Core visual rules in front (byte-stable, so any prefix cache
+            # covers them); the show_widget design system only when this question
+            # actually asks for a custom visual, and then DEAD LAST - behind the
+            # per-question schema, never in front of it.
+            "content": widget.WIDGET_CORE_PROMPT
             + "\n\n"
-            + tools.system_prompt_for(routing_text),
+            + tools.system_prompt_for(routing_text)
+            + widget.visual_prompt_for(routing_text),
         },
         *history,
         {"role": "user", "content": _user_content(question, file_context)},
@@ -213,6 +291,17 @@ def ask_groq(
     nudged_entity_report = False  # one corrective round if a 'report of X' was just the WHO row
     nudged_dashboard = False   # have we already asked it to build the requested dashboard?
     force_tool = False         # require a tool call on the NEXT request (set by the nudge)
+    # THE OUTPUT RESERVATION IS PART OF THE CONTEXT BUDGET, so it has to be able
+    # to give ground. Measured live 2026-08-31 on Qwen3-30B-A3B (65,536 ctx):
+    # a Gujlish department report reached 49,153 input tokens and the request
+    # asked for 16,384 output - 65,537 total, ONE token over, and the whole turn
+    # died with "That request was too large". Compaction had already run; the
+    # two newest tool results are exempt by design (KEEP_FULL_TOOL_RESULTS) and
+    # they were 829-row x 13-column dumps. Halving the reservation would have
+    # fitted the same conversation with 8k to spare.
+    output_cap = _max_tokens()
+    output_squeezes = 0
+    writeup_sent = False       # the answer-formatting rules go out WITH the data
     dashboard_built = False    # did show_dashboard actually render this turn?
     retried_bad_tool_call = False  # one retry when Groq rejects a tool call's arguments
 
@@ -228,19 +317,30 @@ def ask_groq(
         tool_rounds < tools.MAX_TOOL_ROUNDS
         and tool_rounds + corrections < tools.MAX_TOTAL_ROUNDS
     ):
+        # Before every provider call, not just at the end: the overflow happens
+        # ON a call, so trimming afterwards would be too late.
+        _compact_history(messages)
         try:
             choice = "required" if force_tool else "auto"
             force_tool = False  # one-shot
-            response = call_with_retry(
-                lambda: client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=_tools_for_provider(),
-                    tool_choice=choice,
-                    temperature=0,  # deterministic: same question -> same SQL, no drift
-                    max_tokens=_max_tokens(),
+            # One "plan" span per round of the loop. Every round is named the
+            # same on purpose - the SDK numbers them with step_index, so the
+            # dashboard shows five separate planning rounds rather than one
+            # merged blob, which is what tells a genuinely multi-query question
+            # apart from a model that stalled and had to be nudged. The span
+            # covers call_with_retry, so a retried round shows its retries too.
+            with cost_trace.step("plan"):
+                response = call_with_retry(
+                    lambda: client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        tools=_tools_for_provider(),
+                        tool_choice=choice,
+                        temperature=0,  # deterministic: same question -> same SQL, no drift
+                        max_tokens=output_cap,
+                        extra_body=_extra_body(),
+                    )
                 )
-            )
         except Exception as exc:
             # Don't crash. Give a clear message depending on the cause.
             err = str(exc).lower()
@@ -265,6 +365,25 @@ def ask_groq(
                 corrections += 1
                 emit("Retrying…")
                 continue
+            # A CONTEXT OVERFLOW IS RECOVERABLE - give back output room.
+            # The reservation is ours to shrink; the conversation is not. Two
+            # halvings take 16,384 -> 4,096 and buy 12k of input, which covers
+            # the wide-result reports that overflow. If it still does not fit,
+            # fall through to the normal provider-error path.
+            if ("maximum context length" in err or "context_length_exceeded" in err
+                    or "reduce the length" in err) and output_squeezes < 2:
+                output_squeezes += 1
+                output_cap = max(2048, output_cap // 2)
+                from app.core.logging_util import logger
+
+                logger.warning(
+                    "CONTEXT-SQUEEZE | output budget -> %s (attempt %s) | q=%r",
+                    output_cap, output_squeezes, (question or "")[:80])
+                _compact_history(messages)
+                corrections += 1
+                emit("Trimming the working set…")
+                continue
+
             log_interaction(question, sql_used, last_row_count, error=str(exc))
             # Classify + log the real cause (dead model / auth / rate-limit /
             # connection) and return the message that points at the RIGHT fix,
@@ -359,6 +478,20 @@ def ask_groq(
                     policy.looks_like_unrun_sql(answer)
                     or looks_like_data_table(answer)
                     or policy.has_data_visual(widgets)
+                    # A FIGURE IN PROSE IS AS UNGROUNDED AS ONE IN A TABLE.
+                    # Measured 2026-08-31 on Qwen3-30B-A3B via vLLM: given the
+                    # real 19,577-token system prompt it returned finish=stop
+                    # with NO tool call on every question, and wrote sentences
+                    # like "Total packets currently on jangad: 140,276" and
+                    # "7,321 packets" - the latter lifted straight out of the
+                    # glossary's own worked example, where the live answer is
+                    # 7,591. Bisected: the same model tool-calls correctly with
+                    # the schema block, the notes block, or a short prompt, and
+                    # with tool_choice="required" even at full length - so the
+                    # cure is to FORCE the round, which is what this branch
+                    # does. Neither of those answers is a Markdown table, so
+                    # every trigger above missed them and the turn was lost.
+                    or asserts_a_figure(answer)
                 )
             )
             if ungrounded_fabrication and execute_nudges < policy.MAX_EXECUTE_NUDGES:
@@ -511,7 +644,7 @@ def ask_groq(
                 continue
 
             emit(tools.friendly_status(tc.function.name))
-            result_text, sql, row_count, cols_full, rows_full = tools.run_tool(tc.function.name, args)
+            result_text, sql, row_count, cols_full, rows_full, tool_sections = tools.run_tool(tc.function.name, args)
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
@@ -521,14 +654,42 @@ def ask_groq(
                 # one rule, shared by every backend, tested against both the bugs
                 # it fixes (a lookup shown as the report; a summary clobbering a
                 # detail listing).
-                if tc.function.name == "run_sql" and result_capture.better(
+                # Any tool that returned rows, not just run_sql: a report recipe
+                # (department_report) also produces the rows behind the answer,
+                # and gating on the tool NAME left data_rows empty for it - so
+                # the UI's "offer a download" condition never fired and a
+                # perfectly good 8-section report came with no Excel at all.
+                if cols_full and rows_full and result_capture.better(
                     cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
-                    result_capture.add_section(data_sections, cols_full, rows_full)
+                    # Only when the tool did NOT return named sections. A recipe
+                    # returns its own titled ones just below, and adding this
+                    # untitled copy first made the titled version look like a
+                    # duplicate - so the workbook's first sheet lost its name
+                    # ("Code-Worker" instead of "Workforce").
+                    if not tool_sections:
+                        result_capture.add_section(data_sections, cols_full, rows_full)
+            # A report recipe returns SEVERAL named results from one call. Each
+            # becomes its own titled sheet, so the workbook carries the whole
+            # report rather than only its widest table.
+            for sec in tool_sections:
+                result_capture.add_section(
+                    data_sections, sec["columns"], sec["rows"], title=sec.get("title")
+                )
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result_text}
             )
+
+        # THE WRITE-UP RULES ARRIVE NOW, WITH THE FIRST REAL RESULT.
+        # Held out of the system prompt because they suppress tool calling
+        # outright - see tools._split_writeup for the measurements. Sent once,
+        # only when a tool has actually returned something, so the model has
+        # them in hand before it composes anything and never while it is still
+        # deciding whether to fetch.
+        if not writeup_sent and sql_used:
+            writeup_sent = True
+            messages.append({"role": "user", "content": tools.WRITEUP_RULES})
 
     # Hit the step limit -> force a final plain-text answer from what we have,
     # WITHOUT tools (so it can't loop further).
@@ -540,9 +701,15 @@ def ask_groq(
     )
     synth_ok = True
     try:
-        final = client.chat.completions.create(
-            model=model, messages=messages, temperature=0, max_tokens=_max_tokens()
-        )
+        # The write-up is its own step: it is the single most expensive call of
+        # the turn (it renders the row preview) and the one most likely to be
+        # refused on a per-minute cap, so it is worth costing separately from
+        # the planning rounds rather than averaged in with them.
+        with cost_trace.step("write-up"):
+            final = client.chat.completions.create(
+                model=model, messages=messages, temperature=0,
+                max_tokens=_max_tokens(), extra_body=_extra_body(),
+            )
         # Same empty-choices guard as the tool loop: a 200 with no choices must
         # not become an IndexError after every query has already run.
         answer = (

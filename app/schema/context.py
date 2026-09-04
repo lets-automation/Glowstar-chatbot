@@ -107,15 +107,81 @@ def _cap_columns(cols: list[dict], max_cols: int) -> list[dict]:
     return [cols[i] for i in sorted(ranked)]
 
 
+# CURATED JOIN MAP - THE DATABASE BARELY DECLARES ITS OWN RELATIONSHIPS.
+#
+# Measured 2026-08-31: 264 base tables, 51 foreign keys, and only FOUR of those
+# touch the six busiest tables. tblFinalPacket, tblPointRateLabour,
+# tblJangadPackets, tblPctChecker and tblPacketPoint declare NONE, so the
+# "links:" line for them was empty and the model had to guess its joins from
+# column names - names the schema spells inconsistently (PacketId vs Packet_ID,
+# EmpId vs Emp_ID vs UserID vs MfgEmpId, KapanId vs Kapan_ID).
+#
+# THE PERCENTAGE IS THE POINT, not decoration. Each entry was verified by
+# measuring how many child rows actually find a parent, and a link that does
+# not reach 100% is an INNER JOIN that silently drops the difference. That is
+# not hypothetical here: tblPacketPoint reaches only 61.5% of packets, and a
+# live answer summed a kapan's weight through exactly that join and reported
+# 197.661 carats against a true 378.458 (see query_rules.weight_via_points_join).
+#
+# Verified figures, 2026-08-31. Re-measure after a database refresh with
+# scripts/verify_links.py; a stale percentage here is worse than none.
+LOGICAL_LINKS: dict[str, list[tuple]] = {
+    "tblFinalPacket": [
+        ("PacketId", "tblPacket", "ID", 86.3),
+        ("UserID", "tblEmployee", "ID", 100.0),
+    ],
+    "tblPointRateLabour": [
+        ("Packet_ID", "tblPacket", "ID", 99.4),
+        ("Emp_ID", "tblEmployee", "ID", 97.6),
+        ("Kapan_ID", "tblKapan", "ID", 99.4),
+        ("Department_ID", "tblDepartMent", "ID", 100.0),
+    ],
+    "tblPlanMaster": [
+        ("EmpId", "tblEmployee", "ID", 97.7),
+        ("KapanId", "tblKapan", "ID", 100.0),
+    ],
+    "tblJangadPackets": [("PacketId", "tblPacket", "ID", 99.8)],
+    "tblPctChecker": [
+        ("PacketId", "tblPacket", "ID", 99.3),
+        ("MfgEmpId", "tblEmployee", "ID", 85.0),
+        ("PolishEmpId", "tblEmployee", "ID", 100.0),
+    ],
+    "tblPacketPoint": [("Packet_ID", "tblPacket", "ID", 61.5)],
+    "tblPlanReport": [("EmpID", "tblEmployee", "ID", 96.7)],
+    "tblPacket": [("DepartMentId", "tblDepartMent", "ID", 100.0)],
+    "tblPacketHistory": [("EmpId", "tblEmployee", "ID", 99.0)],
+}
+
+# Below this, an INNER JOIN loses enough rows to change the answer, so the link
+# is emitted with the warning attached. 99% is deliberately strict: the damage
+# total moved from -11,536.82 to -10,827.26 on a join that matched 87.7%.
+_INNER_JOIN_SAFE_PCT = 99.0
+
+
 def _relationships_for(table: str, foreign_keys: list[dict]) -> list[str]:
-    """Return human-readable FK lines involving this table."""
+    """Human-readable join lines for this table: declared FKs, then curated ones.
+
+    The curated entries carry their measured match rate, and anything under
+    _INNER_JOIN_SAFE_PCT says so in words - the model cannot see that an inner
+    join is lossy from the column names alone, which is the whole failure this
+    map exists to prevent.
+    """
     lines = []
+    seen = set()
     for fk in foreign_keys:
         if fk["parent_table"] == table:
+            seen.add(fk["parent_column"].lower())
             lines.append(
                 f"{table}.{fk['parent_column']} -> "
                 f"{fk['ref_table']}.{fk['ref_column']}"
             )
+    for col, ref_table, ref_col, pct in LOGICAL_LINKS.get(table, ()):
+        if col.lower() in seen:
+            continue          # the database already declared this one
+        line = f"{table}.{col} -> {ref_table}.{ref_col}"
+        if pct < _INNER_JOIN_SAFE_PCT:
+            line += f" ({pct:.0f}% match - LEFT JOIN or lose the rest)"
+        lines.append(line)
     return lines
 
 

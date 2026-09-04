@@ -14,6 +14,7 @@ from app.agent import result_capture, tools, widget
 from app.agent._retry import call_with_retry
 from app.agent.postprocess import looks_like_data_table
 from app.config import settings
+from app.core import cost_trace
 from app.core.logging_util import log_interaction, log_provider_error
 
 # Output budget per model call. 1024 was too small: the mandated answer format
@@ -85,14 +86,25 @@ def _system_blocks(question: str) -> list[dict]:
             "cache_control": {"type": "ephemeral"},
         },
         {
-            # Design-system rules for the show_widget tool. Stable prefix -> cached.
+            # Which visual tool to use, when to draw NOTHING at all, and the few
+            # rules whose absence breaks a widget outright. Byte-stable -> cached.
+            # The ~1k-token design system that used to ride along here now sits
+            # at the END of the block below, and only when the question needs it
+            # (widget.needs_design_rules): it applies to show_widget alone, and
+            # show_chart / show_dashboard render from our own templates.
             "type": "text",
-            "text": widget.WIDGET_SYSTEM_PROMPT,
+            "text": widget.WIDGET_CORE_PROMPT,
             "cache_control": {"type": "ephemeral"},
         },
         {
             "type": "text",
-            "text": "DATABASE SCHEMA AND GLOSSARY:\n\n" + tools.dynamic_schema_for(question),
+            # The design block goes DEAD LAST, and inside THIS block rather than
+            # a fourth one: it is per-question, so it has to sit behind the final
+            # cache breakpoint (in front of the schema it would flip the cache key
+            # of ~20k tokens), and Anthropic allows only 4 breakpoints in total.
+            "text": "DATABASE SCHEMA AND GLOSSARY:\n\n"
+            + tools.dynamic_schema_for(question)
+            + widget.visual_prompt_for(question),
             # Cached too: the schema block is the LARGEST prompt part (~20k+
             # tokens with SCHEMA_MAX_COLS=0) and is identical across the 2-4
             # tool rounds of one question - without this it was re-billed at
@@ -152,17 +164,21 @@ def ask_anthropic(
         try:
             choice = {"type": "any"} if force_tool else {"type": "auto"}
             force_tool = False  # one-shot
-            response = call_with_retry(
-                lambda: client.messages.create(
-                    model=model,
-                    max_tokens=_max_tokens(),
-                    system=system,
-                    tools=_ANTHROPIC_TOOLS,
-                    tool_choice=choice,
-                    messages=messages,
-                    temperature=0,
+            # One "plan" span per round; the SDK numbers repeats with
+            # step_index. Same naming as the other two backends on purpose, so
+            # the dashboard can compare the shape of a turn across providers.
+            with cost_trace.step("plan"):
+                response = call_with_retry(
+                    lambda: client.messages.create(
+                        model=model,
+                        max_tokens=_max_tokens(),
+                        system=system,
+                        tools=_ANTHROPIC_TOOLS,
+                        tool_choice=choice,
+                        messages=messages,
+                        temperature=0,
+                    )
                 )
-            )
         except Exception as exc:
             log_interaction(question, sql_used, last_row_count, error=str(exc))
             # Classify + log the real cause and return the message that points
@@ -350,17 +366,35 @@ def ask_anthropic(
                 )
                 continue
             emit(tools.friendly_status(block.name))
-            result_text, sql, row_count, cols_full, rows_full = tools.run_tool(block.name, block.input)
+            result_text, sql, row_count, cols_full, rows_full, tool_sections = tools.run_tool(block.name, block.input)
             if sql:
                 sql_used.append(sql)
                 last_row_count = row_count
                 # Which result is "the answer"? See result_capture - one rule,
                 # shared by every backend, tested against both the bugs it fixes.
-                if block.name == "run_sql" and result_capture.better(
+                # Any tool that returned rows, not just run_sql: a report recipe
+                # (department_report) also produces the rows behind the answer,
+                # and gating on the tool NAME left data_rows empty for it - so
+                # the UI's "offer a download" condition never fired and a
+                # perfectly good 8-section report came with no Excel at all.
+                if cols_full and rows_full and result_capture.better(
                     cols_full, rows_full, data_columns, data_rows
                 ):
                     data_columns, data_rows = cols_full, rows_full
-                    result_capture.add_section(data_sections, cols_full, rows_full)
+                    # Only when the tool did NOT return named sections. A recipe
+                    # returns its own titled ones just below, and adding this
+                    # untitled copy first made the titled version look like a
+                    # duplicate - so the workbook's first sheet lost its name
+                    # ("Code-Worker" instead of "Workforce").
+                    if not tool_sections:
+                        result_capture.add_section(data_sections, cols_full, rows_full)
+            # A report recipe returns SEVERAL named results from one call. Each
+            # becomes its own titled sheet, so the workbook carries the whole
+            # report rather than only its widest table.
+            for sec in tool_sections:
+                result_capture.add_section(
+                    data_sections, sec["columns"], sec["rows"], title=sec.get("title")
+                )
             tool_results.append(
                 {
                     "type": "tool_result",
@@ -379,9 +413,13 @@ def ask_anthropic(
     )
     synth_ok = True
     try:
-        final = client.messages.create(
-            model=model, max_tokens=_max_tokens(), system=system, messages=messages, temperature=0
-        )
+        # Costed separately from the planning rounds: this is the call that
+        # renders the row preview, so it is the expensive one, and the one whose
+        # failure leaves the user with a table and no answer.
+        with cost_trace.step("write-up"):
+            final = client.messages.create(
+                model=model, max_tokens=_max_tokens(), system=system, messages=messages, temperature=0
+            )
         answer = "".join(b.text for b in final.content if b.type == "text").strip()
     except Exception as exc:
         # Log WHY the write-up failed. Without this the user sees only the

@@ -20,6 +20,13 @@
 #        docker compose exec backend python -m scripts.manage_users create \
 #          <username> <password> "<Display Name>"
 
+# Pinned so the project identity doesn't depend on which literal path string
+# the shell resolves to invoking this file (C:\Glowstar-chatbot vs
+# C:\Glowstar_chatbot are the same folder on Windows but were tracked as two
+# different config-file identities under the same project name, causing
+# `docker compose up` to rebuild instead of reusing the existing image).
+name: glowstar_chatbot
+
 services:
   # OPTIONAL self-contained database. NOT started by default — the backend
   # connects to your real SQL Server (see the backend service). Start this only
@@ -132,7 +139,7 @@ services:
       # the database's real hostname/IP. To use the bundled db container instead,
       # set DB_SERVER: db, DB_USER: sa, DB_PASSWORD: ${DB_SA_PASSWORD}.
       DB_SERVER: host.docker.internal
-      # 2026-07-27 client backup (restored 2026-07-29); old 25-Jun snapshot kept as AasthaErp.
+      # 2026-08-21 client backup (restored 2026-08-24); prior 27-Jul snapshot kept as AasthaErp_0727.
       DB_NAME: AasthaErp_new
       DB_USER: glowstar_ro
       DB_PASSWORD: ${DB_RO_PASSWORD}
@@ -143,7 +150,15 @@ services:
       # Local-model testing (set LLM_PROVIDER=ollama in .env): Ollama runs on the
       # HOST, so the container must reach it via host.docker.internal, NOT the
       # container's own localhost. Ignored unless LLM_PROVIDER=ollama.
-      OLLAMA_BASE_URL: http://host.docker.internal:11434/v1
+      #
+      # SUBSTITUTED, NOT HARD-CODED. `environment:` beats `env_file:` on the
+      # same key (see the DB_SERVER note above), so a hard-coded value here
+      # silently overrode .env - point OLLAMA_BASE_URL at a REMOTE endpoint (a
+      # rented vLLM box, e.g. https://<pod>-8000.proxy.runpod.net/v1) and the
+      # container still dialled host.docker.internal and failed to connect,
+      # with nothing to say why. The default keeps local Ollama working
+      # unchanged; setting the key in .env now wins.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
     # Make host.docker.internal resolve on Linux too (it's automatic on Docker
     # Desktop for Windows/Mac, but this keeps the file portable).
     extra_hosts:

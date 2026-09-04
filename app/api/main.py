@@ -25,12 +25,12 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
-from app.agent import access_guard, date_gate, smalltalk_gate
+from app.agent import access_guard, date_gate, lab_gate, smalltalk_gate
 from app.artifacts.charts import to_chart
 from app.artifacts.excel import to_excel, to_excel_sections
-from app.artifacts.pdf import to_pdf
+from app.artifacts.pdf import to_pdf, to_pdf_sections
 from app.config import settings
-from app.core import auth, history
+from app.core import auth, cost_trace, history
 from app.core.logging_util import log_startup, logger
 from app.core.rate_limit import enforce_history_rate_limit, enforce_rate_limit
 from app.database.runner import run_select
@@ -47,8 +47,9 @@ from app.database.runner import run_select
 # interceptors that actually loaded — that banner is what exposed the bug below):
 #   anthropic  yes    gemini  yes (needs SDK >= 0.1.4)
 #   openai-compatible (ollama / lmstudio / cerebras / nvidia)  yes
-#   groq       NO     the native groq SDK is not patched. See _client() in
-#                     groq_backend.py — LLM_PROVIDER=groq is invisible here.
+#   groq       yes    NOT via the native groq SDK, which no version of AgentCost
+#                     patches — groq_backend.py routes it through Groq's
+#                     OpenAI-compatible endpoint precisely so it is covered.
 #
 # 2026-08-06 BUG: tracking had never worked. The pin was agentcost==0.1.3, which
 # shipped only openai_interceptor.py and anthropic_interceptor.py — no Gemini
@@ -56,6 +57,12 @@ from app.database.runner import run_select
 # through google.genai. The comment here claimed gemini was covered; the startup
 # banner disagreed ("Tracking initialized (LangChain, OpenAI, Anthropic)") and the
 # banner was right. Fixed by requirements.txt agentcost==0.1.7.
+#
+# SHAPE OF A TURN (SDK >= 0.2.0): init() only says what each call cost. The
+# workflow()/step() spans that say which ROUND of which question it belonged to
+# are opened in app/agent/agent.py and the backends, through the fail-safe
+# wrapper in app/core/cost_trace.py — armed by the enable() call below, so
+# nothing traces until init() has actually succeeded.
 
 # Rates in dollars per 1K tokens for every model this app can select. These go
 # in via custom_pricing, which the SDK consults FIRST — ahead of its own model
@@ -84,7 +91,7 @@ _AGENTCOST_PRICING = {
     "gemini-2.0-flash": {"input": 0.0001, "output": 0.0004},
     # Anthropic (ANTHROPIC_MODEL)
     "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
-    # Groq (GROQ_MODEL) — listed for when the native SDK does get patched.
+    # Groq (GROQ_MODEL) — tracked through the OpenAI-compatible endpoint.
     "llama-3.3-70b-versatile": {"input": 0.00059, "output": 0.00079},
     "meta-llama/llama-4-scout-17b-16e-instruct": {"input": 0.00018, "output": 0.00059},
     # Cerebras / NVIDIA (OpenAI-compatible, tracked via the openai lib)
@@ -114,6 +121,10 @@ if settings.AGENTCOST_API_KEY and settings.AGENTCOST_PROJECT_ID:
             "AgentCost tracking enabled (project %s).", settings.AGENTCOST_PROJECT_ID
         )
         _agentcost_track_costs = track_costs
+        # Arm the trace spans ONLY now. cost_trace is a no-op until this runs,
+        # which is what keeps a half-initialised SDK from raising out of a
+        # context manager wrapped around every provider call.
+        cost_trace.enable(track_costs)
     except Exception as exc:  # noqa: BLE001 - degrade to untracked, never crash
         logger.warning("AgentCost init failed - running WITHOUT cost tracking: %s", exc)
 
@@ -140,11 +151,49 @@ def _log_startup_banner() -> None:
     log_startup(provider, model, key_present=bool(key))
 
 
+def _warm_schema_cache() -> None:
+    """Read the table/row-count catalog ONCE at boot, so question #1 routes the
+    same way as question #2.
+
+    THE BUG THIS FIXES. router._row_counts() deliberately never triggers a
+    database read of its own - it piggybacks on extractor.get_tables()'s cache,
+    because dialling a down database on every question cost a full connection
+    timeout per attempt. The consequence was that on the FIRST question after a
+    restart the counts are simply absent, and two routing filters that depend on
+    them are silently inert: empty tables are not excluded, and the per-family
+    cap does not apply.
+
+    Measured 2026-08-21 on "how many employees do we have":
+      first question : tblEmployee, tblEmpDetail, tblEmpNativeAddress,
+                       tblPctChecker, tblEmpConnDept(0 rows), tblEmpEduInfo(0),
+                       tblEmpFamilyInfo(0), tblEmpGIABonus, tblEmpGpsLabourDetail,
+                       tblEmpGrade
+      later questions: ...tblPacketIssue, tblPlanMaster, tblPartyEmps,
+                       tblPointRateLabour, tblLabourResult
+    Four of ten slots went to tables holding no rows at all - on the one question
+    a demo is most likely to be judged by.
+
+    Best-effort: a database that is still starting must not stop the API booting.
+    The catalog is read lazily on first use either way; this only moves WHEN.
+    """
+    try:
+        from app.schema import extractor
+
+        tables = extractor.get_tables()
+        logger.info("Schema cache warmed: %d business tables.", len(tables))
+    except Exception as exc:  # noqa: BLE001 - never block startup
+        logger.warning(
+            "Could not warm the schema cache at boot (%s). The first question "
+            "will route without row counts.", exc,
+        )
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     # Runs once at serve time (not on mere import), so the banner reflects the
     # real running config and the backend import is deferred to boot.
     _log_startup_banner()
+    _warm_schema_cache()
     yield
     # FLUSH COST EVENTS ON SHUTDOWN. The SDK batches (batch_size 10, flush every
     # 5s), so whatever is still in the buffer when the process stops is lost —
@@ -235,6 +284,13 @@ class ChatResponse(BaseModel):
     # Exact rows behind the answer, so the UI can export a stable snapshot.
     data_columns: list[str] = []
     data_rows: list[dict] = []
+    # ONE SHEET PER SECTION. A full report runs several queries - production,
+    # damage, bonus, incentive - and each is its own titled section. This field
+    # was produced by postprocess and read by the frontend, but was NOT declared
+    # here, so FastAPI silently dropped it from every /chat response: the
+    # workbook carried the single widest table and the rest of the report was
+    # missing from the download.
+    data_sections: list[dict] = []
 
 
 class ExportRowsRequest(BaseModel):
@@ -398,6 +454,11 @@ def _ask_with_cost_tracking(
     those events the same safe request identifiers.  The context is entered in
     the worker itself, which is important for /chat/stream because ContextVars
     do not automatically cross a manually-created thread.
+
+    WHO this turn was for is tagged here; WHAT SHAPE it had (one trace, one span
+    per provider round) is tagged inside ask() via app/core/cost_trace.py, so
+    the CLI and the e2e script get the breakdown too.  Same reason for the same
+    thread caveat: the trace is a ContextVar as well.
     """
     from app.agent.agent import ask
 
@@ -510,6 +571,17 @@ def chat(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
             if k in ChatResponse.model_fields
         })
 
+    # "GIVE ME THE SQL, I'LL RUN IT MYSELF" -> scoped refusal, no LLM call.
+    # The SCOPE rule and the never-mention-SQL rule both cover this and both were
+    # ignored live (cold test ADV-03, 2026-08-26): the answer named tblPacket and
+    # described the query it had run. Decided here, where it cannot be talked
+    # out of it.
+    if smalltalk_gate.asks_for_sql(request.question):
+        return ChatResponse(**{
+            k: v for k, v in smalltalk_gate.sql_refusal_response().items()
+            if k in ChatResponse.model_fields
+        })
+
     # RESTRICTED: salary/pay is off limits (client policy) - refuse before the LLM.
     if access_guard.is_pay_question(request.question):
         return ChatResponse(**{
@@ -528,6 +600,17 @@ def chat(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
     if date_gate.needs_date(request.question, convo_history):
         return ChatResponse(**{
             k: v for k, v in date_gate.ask_date_response(request.question).items()
+            if k in ChatResponse.model_fields
+        })
+
+    # Pending question that has not said WHICH lab -> ask, don't assume. The
+    # client's rule is that pending counts all three (GIA/HRD/IGI) by default,
+    # and "GIA pending" has repeatedly been read as "the lab is GIA" with the
+    # other two silently dropped. Same code-first shape as the date gate above,
+    # and it stands down once the choice is in the question or the history.
+    if lab_gate.needs_lab(request.question, convo_history):
+        return ChatResponse(**{
+            k: v for k, v in lab_gate.ask_lab_response(request.question).items()
             if k in ChatResponse.model_fields
         })
 
@@ -564,6 +647,7 @@ def chat(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
         widgets=result.get("widgets", []),
         data_columns=result.get("data_columns", []),
         data_rows=result.get("data_rows", []),
+        data_sections=result.get("data_sections", []),
     )
 
 
@@ -602,6 +686,15 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
 
         return StreamingResponse(_smalltalk_stream(), media_type="text/event-stream")
 
+    # Same SQL-request gate as the non-streaming endpoint above.
+    if smalltalk_gate.asks_for_sql(request.question):
+        _sqlref = smalltalk_gate.sql_refusal_response()
+
+        def _sqlref_stream():
+            yield f"data: {json.dumps({'type': 'result', 'data': _sqlref})}\n\n"
+
+        return StreamingResponse(_sqlref_stream(), media_type="text/event-stream")
+
     # RESTRICTED: salary/pay is off limits (client policy) - refuse before the LLM.
     if access_guard.is_pay_question(request.question):
         _refusal = access_guard.refusal_response(request.question)
@@ -623,6 +716,15 @@ def chat_stream(request: ChatRequest, user: dict = Depends(enforce_rate_limit)):
             yield f"data: {json.dumps({'type': 'result', 'data': payload})}\n\n"
 
         return StreamingResponse(_ask_date_stream(), media_type="text/event-stream")
+
+    # Which lab? - the streaming half of the same gate (see /chat above).
+    if lab_gate.needs_lab(request.question, convo_history):
+        lab_payload = lab_gate.ask_lab_response(request.question)
+
+        def _ask_lab_stream():
+            yield f"data: {json.dumps({'type': 'result', 'data': lab_payload})}\n\n"
+
+        return StreamingResponse(_ask_lab_stream(), media_type="text/event-stream")
 
     events: "queue.Queue" = queue.Queue()
 
@@ -684,31 +786,46 @@ def export_rows(req: ExportRowsRequest, user: dict = Depends(enforce_rate_limit)
     # Wrap file generation so dirty/unusual data (control chars, non-Latin text,
     # very wide tables) returns a clean 422 instead of an unhandled 500.
     try:
+        # Sections are prepared FIRST, because both Excel and PDF need them. The
+        # PDF branch used to return before this ran, so a client downloading a
+        # PDF of an 8-section department report got only the widest single table
+        # - the worker roster, with the production, damage and bonus figures
+        # they had just seen on screen silently absent.
+        clean_sections = []
+        for sec in req.sections:
+            s_rows = sec.get("rows") or []
+            if not s_rows:
+                continue
+            s_cols, s_rows = sanitize_export(
+                sec.get("columns") or list(s_rows[0].keys()), s_rows
+            )
+            # Carry the TITLE through. Dropping it here undid the naming done
+            # upstream, so sheets fell back to being named after their first two
+            # columns ("Code-Worker" rather than "Workforce").
+            clean_sections.append(
+                {"columns": s_cols, "rows": s_rows, "title": sec.get("title")}
+            )
+
         if req.format == "pdf":
-            path = to_pdf(columns, rows, f"export-{uid}.pdf", title=req.title)
+            if len(clean_sections) > 1:
+                path = to_pdf_sections(
+                    clean_sections, f"export-{uid}.pdf", title=req.title
+                )
+            else:
+                path = to_pdf(columns, rows, f"export-{uid}.pdf", title=req.title)
             return _download(path, "application/pdf", "export.pdf")
 
         if req.format == "chart":
+            # Chart stays single-result: one image of several unrelated result
+            # sets is meaningless.
             x_col = req.x_col or columns[0]
             y_col = req.y_col or columns[-1]
             path = to_chart(rows, x_col, y_col, f"export-{uid}.png", title=req.title)
             return _download(path, "image/png", "export.png")
 
-        # Multi-section report -> one sheet per section. PDF/chart stay
-        # single-result: a chart of several unrelated result sets is meaningless.
-        if len(req.sections) > 1:
-            clean_sections = []
-            for sec in req.sections:
-                s_rows = sec.get("rows") or []
-                if not s_rows:
-                    continue
-                s_cols, s_rows = sanitize_export(
-                    sec.get("columns") or list(s_rows[0].keys()), s_rows
-                )
-                clean_sections.append({"columns": s_cols, "rows": s_rows})
-            if len(clean_sections) > 1:
-                path = to_excel_sections(clean_sections, f"export-{uid}.xlsx")
-                return _download(path, _EXCEL_MEDIA, "export.xlsx")
+        if len(clean_sections) > 1:
+            path = to_excel_sections(clean_sections, f"export-{uid}.xlsx")
+            return _download(path, _EXCEL_MEDIA, "export.xlsx")
 
         path = to_excel(columns, rows, f"export-{uid}.xlsx")
         return _download(path, _EXCEL_MEDIA, "export.xlsx")

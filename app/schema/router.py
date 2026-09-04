@@ -53,6 +53,18 @@ _STOP = {
     # do WE have", "who are OUR clients") and would spuriously match any note
     # containing them - so ignore them.
     "we", "our", "us", "my", "your",
+    # GENERIC REPORT VOCABULARY - the single worst source of noise here, and it
+    # was missing while note_router._STOP had it. "report" is the most common
+    # word in the client's questions AND appears in the name of eight tables,
+    # every one of them a report-BUILDER config table with no business data:
+    # tblCharacterReport, tblFavouriteReport, tblReportGroup, tblReportItem,
+    # tblReportRate, tblUserReports... Measured 2026-08-21: "stock report" and
+    # "jangad report for June 2026" each spent FIVE of their ten table slots on
+    # those, pushing tblEmployee, tblPacket and tblDepartMent out of the prompt.
+    # That is why a department report kept writing WHERE DepartmentName against
+    # tblPlanMaster: the table holding the column was never shown.
+    "report", "reports", "summary", "summaries", "detail", "details",
+    "info", "information", "wise", "overall", "total", "totals",
 }
 
 # Map a few synonyms to the word used in the schema/glossary.
@@ -417,12 +429,33 @@ def score_tables(question: str) -> dict[str, float]:
         # `None` = row counts unavailable (no DB). Demote a table we KNOW is
         # empty, but never one we simply couldn't measure.
         rows = rows_by_table.get(table)
+
+        # AN EMPTY TABLE CANNOT ANSWER ANYTHING, so it should not occupy one of
+        # the ten slots. 63 of the 239 business tables have zero rows (measured
+        # 2026-08-21), and a x0.4 demotion was not enough: when a whole
+        # name-family scores identically the empties ride in with the rest, so
+        # "jangad report for June 2026" was putting tblJangadDetail (0 rows) and
+        # tblJangadMaster (0 rows) into the prompt.
+        #
+        # The exception is deliberate and is why this is not a blanket drop: the
+        # RULES require tblPacketSell to be NAMED when someone asks about sales
+        # ("sales are recorded there, but there is no data yet" beats "not
+        # tracked"). A table the question names by its own words is still shown.
+        if rows == 0 and not (q_words & _name_keywords(table)):
+            continue
+
         score += _size_bonus(rows)
         if rows == 0:
             score *= _EMPTY_TABLE_FACTOR
 
         scores[table] = score
     return scores
+
+
+def _family(table: str) -> str:
+    """The first meaningful word of a table name - tblJangadRate -> 'jangad'."""
+    parts = _split_name(table)
+    return parts[0] if parts else table.lower()
 
 
 def select_tables(question: str, k: int | None = None) -> list[str]:
@@ -450,4 +483,59 @@ def select_tables(question: str, k: int | None = None) -> list[str]:
 
     # Below the floor we still keep a few, so a vaguely-worded question gets
     # some context instead of one table and a guess.
-    return (strong if len(strong) >= _MIN_TABLES else ranked[:_MIN_TABLES])[:k]
+    picked = strong if len(strong) >= _MIN_TABLES else ranked[:_MIN_TABLES]
+    return _cap_families(picked, k, _row_counts())
+
+
+# One matching keyword can hand EVERY slot to a single name-family, and the tail
+# of a family is almost always config rather than data. Measured on "jangad
+# report for June 2026" once the stopword noise was removed: nine tblJangad*
+# tables, of which tblJangadTag has 2 rows, tblJangadRate 8 and
+# tblJangadTransType none - while tblPacket, tblKapan and tblParty, which are
+# needed to name the packets and the parties holding them, were pushed out.
+#
+# Three per family leaves room for the master plus its two most relevant
+# siblings, and forces the remaining slots to a DIFFERENT family - which is
+# where the join partner a real query needs actually lives.
+_MAX_PER_FAMILY = 3
+
+# ...but the cap counts SMALL siblings only. This is the whole distinction: the
+# tail of a name-family is config (tblJangadTag 2 rows, tblJangadRate 8,
+# tblJangadBranch 54), while a large sibling is a genuine fact table that a real
+# query needs - tblPacketDetail has 174,623 rows and IS the answer to "the
+# certificate PDF for this stone". Capping by name alone dropped it, which is a
+# worse bug than the flooding the cap exists to prevent.
+#
+# An UNKNOWN row count (no database yet on the first question of a boot, or the
+# routing tests, which mock the candidate set) never counts against the cap
+# either: capping on information we do not have would be arbitrary.
+_FAMILY_CAP_ROWS = 10_000
+
+
+def _cap_families(ranked: list[str], k: int, rows_by_table: dict) -> list[str]:
+    """Take the best k, but allow at most _MAX_PER_FAMILY SMALL tables per family.
+
+    Two passes, so nothing is lost when there is simply nothing else to show: a
+    question that genuinely only matches one family still fills its slots from
+    it rather than returning three tables and a guess.
+    """
+    out: list[str] = []
+    small_seen: dict[str, int] = {}
+    overflow: list[str] = []
+    for table in ranked:
+        rows = rows_by_table.get(table)
+        is_small = rows is not None and rows < _FAMILY_CAP_ROWS
+        fam = _family(table)
+        if is_small and small_seen.get(fam, 0) >= _MAX_PER_FAMILY:
+            overflow.append(table)
+            continue
+        if is_small:
+            small_seen[fam] = small_seen.get(fam, 0) + 1
+        out.append(table)
+        if len(out) >= k:
+            return out
+    for table in overflow:            # nothing else to offer - refill in order
+        if len(out) >= k:
+            break
+        out.append(table)
+    return out

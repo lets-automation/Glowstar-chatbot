@@ -137,3 +137,59 @@ def test_bonus_and_incentive_questions_are_not_refused(q):
 ])
 def test_salary_is_still_refused(q):
     assert is_pay_question(q) is True, f"salary must stay restricted: {q}"
+
+
+# ---------------------------------------------------------------------------
+# BARE MONEY WORDS + A PERSON = the wage (gap closed 2026-08-21).
+#
+# Found by writing the ADV-* adversarial probes: "what is the monthly pay of the
+# Fency department workers" and "kitna paisa milta hai M4117 ko har mahine?"
+# both reached the model, because bare "pay" and the Hinglish phrasing are in
+# neither the hard nor the soft pattern. They were caught only by the RULES -
+# a prose guard - where a code guard was available.
+#
+# The reason they could not simply be added to the hard list is the other half
+# of these tests: the SAME money words carry the job-work RATE paid to an
+# outside party, which is ordinary business data the assistant must answer.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("q", [
+    "what is the monthly pay of the Fency department workers",
+    "kitna paisa milta hai M4117 ko har mahine?",
+    "per worker pay for June",
+    "how much money does karigar M2139 get",
+    "employee ko kitna rupiya milta hai",
+])
+def test_bare_money_word_about_a_person_is_refused(q):
+    assert is_pay_question(q) is True, f"wage question leaked: {q}"
+
+
+@pytest.mark.parametrize("q", [
+    # Cold-case JP-2, almost verbatim. Money paid to an outside PARTY for a
+    # PROCESS is a rate, not a wage - refusing it would be a regression with a
+    # real ground truth behind it (tblJangadRate).
+    "Galaxy process no rate su chhe? Party ne galaxy na ketla paisa apiye chhiye?",
+    "how much money do we pay the party for the galaxy process",
+    "what is the jangad rate for water jet",
+    "party wise payment rate list",
+    "supplier ne ketla paisa apya",
+    # Cold-case DRS-2. Damage money is deducted FROM a karigar and is explicitly
+    # allowed by the client rule - the damage report shows it.
+    "2025 ma damage na ketla paisa katya karigar pase thi?",
+    "damage deduction of karigar M2139 last month",
+    "penalty amount for worker M4117",
+])
+def test_money_words_that_are_not_a_wage_stay_allowed(q):
+    assert is_pay_question(q) is False, f"wrongly refused: {q}"
+
+
+def test_the_two_cold_cases_that_share_this_vocabulary_are_unaffected():
+    """JP-2 and DRS-2 have real ground truths. If either flips to refused, the
+    cold test loses two answerable cases and the client loses two answers."""
+    from scripts.cold_cases import COLD_CASES
+
+    by_id = {c["id"]: c for c in COLD_CASES}
+    for case_id in ("JP-2", "DRS-2"):
+        assert is_pay_question(by_id[case_id]["question"]) is False, (
+            f"{case_id} must stay answerable"
+        )

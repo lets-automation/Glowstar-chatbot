@@ -136,9 +136,40 @@ class Settings:
     # full ~20k-token prompt (Groq caps at 12k TPM, GitHub Models at 8k in).
     # OpenAI-compatible -> reuses this Groq backend. NOTE: many NIM models hang
     # or refuse tool calls; openai/gpt-oss-20b is the verified-good one.
+    # Kimi / Moonshot - OpenAI-dialect endpoint, so it reuses the Groq backend
+    # like Cerebras and NVIDIA do. It was listed in .env and in
+    # scripts/provider_probe.py but never wired here, so LLM_PROVIDER=kimi fell
+    # through to the Groq branch, used the (403) Groq key and reported "The AI
+    # service is misconfigured" - with a perfectly valid Kimi key sitting unused.
+    KIMI_API_KEY: str = os.getenv("KIMI_API_KEY", "")
+    KIMI_BASE_URL: str = os.getenv("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
+    KIMI_MODEL: str = os.getenv("KIMI_MODEL", "kimi-k2.6")
+
     NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
     NVIDIA_BASE_URL: str = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
     NVIDIA_MODEL: str = os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
+
+    # OpenRouter — routes to many open-weight models behind one OpenAI-compatible
+    # endpoint, so it reuses the Groq backend like Cerebras/NVIDIA do. Set
+    # LLM_PROVIDER=openrouter to use it. Used here to trial Qwen3-30B-A3B (the
+    # model shortlisted for self-hosting) against the real agent BEFORE renting a
+    # GPU.
+    #
+    # NOT the ":free" slug — verified dead 2026-08-08: OpenRouter now 404s it with
+    # "This model is unavailable for free. The paid version is available now".
+    # The paid slug is cheap (~$0.13/M in, ~$0.52/M out, measured off a live call)
+    # and this is a short evaluation, not a deployment path.
+    #
+    # Qwen3-30B-A3B is a REASONING model: a live probe spent 123 of 129 completion
+    # tokens thinking before answering "Reply with exactly: OK". Same trap as
+    # Gemma 4 QAT — keep the output budget generous or answers truncate before
+    # the model finishes reasoning, and expect output-token cost above the
+    # visible answer length.
+    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+    OPENROUTER_BASE_URL: str = os.getenv(
+        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+    )
+    OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-30b-a3b")
 
     # Ollama (LOCAL, offline testing). Runs a model on this machine via Ollama's
     # OpenAI-compatible endpoint — no API key, no internet, no daily quota. Set
@@ -180,11 +211,44 @@ class Settings:
     #
     # LLM_MAX_TOKENS in .env still overrides everything, for pinning a value
     # while debugging or when a provider tightens its limits.
+    # Reasoning ("thinking") models spend output tokens deliberating BEFORE they
+    # answer, and that deliberation is paid for out of the same max_tokens
+    # budget. Measured on Qwen3.5-9B served by vLLM on 2026-08-20: the same
+    # trivial prompt used 300 completion tokens with thinking on (and never
+    # reached an answer - the reply was pure monologue, truncated at the cap)
+    # versus 30 tokens with it off, answering correctly. On a real report the
+    # write-up round exhausted its budget mid-thought and the user got raw
+    # reasoning plus a dumped table instead of a report.
+    #
+    # Qwen's chat template accepts enable_thinking=False; vLLM forwards
+    # chat_template_kwargs straight to it. Set LLM_DISABLE_THINKING=true in .env
+    # when serving a Qwen thinking model. It is OFF by default because other
+    # providers reject unknown request fields, and a hard 400 on every call is a
+    # worse failure than verbose answers.
+    LLM_DISABLE_THINKING: bool = os.getenv(
+        "LLM_DISABLE_THINKING", "false"
+    ).strip().lower() in ("1", "true", "yes")
+
     _PROVIDER_MAX_TOKENS = {
         "groq": 2048,       # 12k TPM free tier — the one genuinely tight budget
         "gemini": 8192,     # large free per-minute budget
         "cerebras": 8192,   # ~1M tokens/day, no per-request pressure
-        "nvidia": 4096,     # ~40 req/min, generous per request
+        # 8192, not 4096. NVIDIA serves gpt-oss-20b, a REASONING model: a live
+        # probe on 2026-08-20 showed it returns its analysis in separate
+        # `reasoning`/`reasoning_content` fields on tool rounds, but on the final
+        # write-up round that analysis is produced BEFORE the answer and is paid
+        # for out of the same output budget. At 4096 the reasoning consumed the
+        # allowance and the reply was truncated mid-thought - the user saw
+        # "Let me provide a clear answer in Gujarati..." followed by a bare table
+        # and no prose. The budget has to cover reasoning + the mandated ~30-row
+        # preview table. A cap is not a charge: unused tokens cost nothing.
+        "nvidia": 8192,     # ~40 req/min, generous per request
+        # Qwen3-30B-A3B reasons before it writes — a live probe burned 253
+        # reasoning tokens just to emit one run_sql call, and 20 tokens produced
+        # an EMPTY reply with zero tool calls. That budget has to cover reasoning
+        # + the mandated ~30-row preview table, so it gets the roomy tier. This
+        # is a cap, not a charge: unused tokens cost nothing.
+        "openrouter": 8192,
         "ollama": 4096,     # local: no quota at all
         "lmstudio": 4096,   # local: no quota at all
         "anthropic": 4096,

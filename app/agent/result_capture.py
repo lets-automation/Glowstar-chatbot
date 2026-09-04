@@ -39,7 +39,9 @@ def is_lookup(columns: list[str]) -> bool:
     return len(columns or []) <= 1
 
 
-def add_section(sections: list[dict], columns: list[str], rows: list) -> None:
+def add_section(
+    sections: list[dict], columns: list[str], rows: list, title: str | None = None
+) -> None:
     """
     Record one query result as an exportable SECTION.
 
@@ -52,13 +54,22 @@ def add_section(sections: list[dict], columns: list[str], rows: list) -> None:
     Every non-empty, non-lookup result is kept so the workbook can carry one
     sheet per section. Exact duplicates are dropped - models re-run the same
     query after a nudge, and a duplicated sheet reads as a mistake.
+
+    `title` names the sheet. It is optional because a section discovered from an
+    ad-hoc run_sql has no name to give - there the workbook falls back to naming
+    the sheet after its columns. A section produced by a known report recipe
+    (department_report) DOES know what it is, and "Damage" reads considerably
+    better on a tab than "KapanName-PacketNo".
     """
     if not rows or is_lookup(columns):
         return
     for existing in sections:
         if existing["columns"] == columns and len(existing["rows"]) == len(rows):
             return
-    sections.append({"columns": list(columns), "rows": rows})
+    section = {"columns": list(columns), "rows": rows}
+    if title:
+        section["title"] = title
+    sections.append(section)
 
 
 def better(new_cols: list[str], new_rows: list, cur_cols: list[str], cur_rows: list) -> bool:

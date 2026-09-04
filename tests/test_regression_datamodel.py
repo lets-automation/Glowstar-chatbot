@@ -161,10 +161,24 @@ def test_clarify_ambiguous_employee_role_guidance():
     # worker the client meant. Fix: teach the 3 employee roles + tell the model to
     # ASK or DECLARE which role, and never default to the upload clerk.
     assert _note_has("tblFinalPacket.UserID", "upload", "UPLOAD", "clerk")
-    assert any(
-        "Fency" in n and "employee-wise" in n.lower()
-        for n in _ALL_NOTES
-    ), "GIA employee-wise ambiguity (3 roles + Fency) must be documented"
+    # 2026-08-18: the mega-note holding this was split into four so note_router
+    # can select each independently (the EmpName rule applies to every employee
+    # question, not just GIA-shaped ones). Co-location inside one string is no
+    # longer the property that matters — what matters is that a real Fency
+    # employee-wise question still RECEIVES both halves. Asserting the routing is
+    # strictly stronger than the substring check it replaces: it also fails if the
+    # router silently stops selecting one of them.
+    from app.schema.note_router import select_notes
+
+    selected = "\n".join(
+        select_notes(list(DATA_NOTES), "GIA results of Fency department employees")
+    )
+    assert "LATEST MFG-stage row worker" in selected, (
+        "the maker rule (latest MFG worker, not the upload clerk) must be routed in"
+    )
+    assert "MOST OF ITS ROSTER IS INDIVIDUAL PEOPLE" in selected, (
+        "the Fency not-wholesale-vendors correction must be routed in"
+    )
 
 
 def test_count_distinct_guidance_present():

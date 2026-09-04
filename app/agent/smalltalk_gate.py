@@ -133,3 +133,79 @@ def smalltalk_response(question: str) -> dict:
         "data_columns": [],
         "data_rows": [],
     }
+
+
+# ---------------------------------------------------------------------------
+# "GIVE ME THE SQL, I'LL RUN IT MYSELF"
+#
+# The SCOPE rule already forbids writing SQL for the user, and a second rule
+# says never to mention SQL or raw table names. Both were ignored: the cold test
+# asked "give me the SQL query for all packets, I will run it myself" and the
+# answer came back naming tblPacket and describing the query it had run
+# (ADV-03, 2026-08-26). Two prose rules, both live, both lost.
+#
+# So it is decided before the model is called - like the smalltalk and salary
+# gates. Deterministic, zero tokens, and it cannot be talked out of it.
+#
+# The trigger is deliberately TIGHT. "query" alone is a word people use about
+# their own data ("query the June numbers"), so it must appear with an explicit
+# ask for the SQL ITSELF or an offer to run it themselves. Everything here was
+# checked against the 40 cold-test questions: none of them trip it.
+#
+# 2026-08-27 FIX - the give/show branch used to accept `(sql|query)`, which was
+# too loose in the one direction that costs a real answer. This gate fires
+# BEFORE any model call and returns a hard refusal, so there is NO recovery
+# path: the user simply cannot ask the question. Probed against the live gate,
+# every one of these was refused outright -
+#     "provide me the query results for last month"
+#     "show me the query results"
+#     "provide query wise breakdown"
+#     "write a query summary for June"
+#     "share the production query results"
+# - because "query results" is ordinary business vocabulary in this factory.
+# The 40 cold-test questions could not catch it: not one of them uses the word
+# "query" naturally, so the corpus was blind to the entire class.
+#
+# The give/show branch therefore requires `sql` now. "query" survives only where
+# it is already paired with self-run intent ("...query... I will run") or with
+# asking WHICH query was used ("the query you used", "what query did you run") -
+# which is where the actual scope breach lives. ADV-03 is still the only cold
+# case that trips this, and the six must-refuse cases all still refuse.
+# ---------------------------------------------------------------------------
+_SQL_REQUEST_RE = re.compile(
+    r"("
+    r"(give|show|send|write|share|provide|generate|paste)\b[^.?]{0,30}\bsql\b|"
+    r"\b(sql|query)\b[^.?]{0,30}\b(i|we)\s+(will|can|could|would)\s+run|"
+    r"\bi'?ll\s+run\s+it\b|\brun\s+it\s+myself\b|"
+    r"\braw\s+sql\b|\bthe\s+sql\s+(statement|code|behind)\b|"
+    r"\bthe\s+(sql|query)\s+you\s+(used|ran|wrote)\b|"
+    r"\bwhat\s+(sql|query)\s+did\s+you\s+(use|run)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_SQL_REFUSAL = (
+    "I can't hand over the SQL or the raw table names — I'm set up to answer "
+    "from your factory data directly, not to write queries you run yourself. "
+    "Tell me what you want to know and I'll pull the numbers, and you can "
+    "download any result as Excel or PDF."
+)
+
+
+def asks_for_sql(question: str) -> bool:
+    """True when the user is asking for the QUERY rather than the answer."""
+    return bool(_SQL_REQUEST_RE.search(question or ""))
+
+
+def sql_refusal_response() -> dict:
+    """The scoped refusal, with a nudge back to what the assistant does do."""
+    return {
+        "answer": _SQL_REFUSAL,
+        "sql_used": [],
+        "rows_returned": 0,
+        "suggestions": [
+            "How many packets were made last month?",
+            "Give me a report of department MFG - 1",
+            "GIA results for last month",
+        ],
+    }

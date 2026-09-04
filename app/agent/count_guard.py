@@ -92,6 +92,7 @@ def count_mismatch(
     question: str = "",
     sql_used: list[str] | None = None,
     file_grounded: bool = False,
+    sections: list | None = None,
 ) -> tuple[int, str] | None:
     """
     Return (claimed_count, noun) when the prose states a row count the data cannot
@@ -113,6 +114,28 @@ def count_mismatch(
 
     prose = _prose_only(answer)
     supported = _supported_values(rows, rows_returned)
+
+    # EVERY QUERY IN THE TURN, NOT JUST THE CAPTURED WINNER.
+    #
+    # `rows` is the one result result_capture picked as "the answer". A report
+    # question runs 8-11 queries and the prose legitimately quotes figures from
+    # all of them, so a number that came from any OTHER query looked unsupported.
+    #
+    # Measured over 95 logged COUNT-MISMATCH hits (2026-08-26): 81 of them - 85% -
+    # were on a result holding exactly ONE row. A 1-row result is an aggregate,
+    # so the row CONTAINS the count; comparing "4,007 packets" against "1 row"
+    # is meaningless, and the answer was right. Those are false positives caused
+    # purely by this blindness, and they are why the guard could never be
+    # escalated from log-only: it would have "corrected" correct answers.
+    #
+    # Widening the supported set can only make the guard fire LESS. It cannot
+    # invent a new false positive, so this is safe in the strict sense - the
+    # worst case is that a genuinely wrong count stays unflagged, which is
+    # exactly today's behaviour.
+    for sec in (sections or []):
+        sec_rows = (sec or {}).get("rows") if isinstance(sec, dict) else None
+        if sec_rows:
+            supported |= _supported_values(sec_rows, len(sec_rows))
     q_digits = set(re.findall(r"\d[\d,]*", question or ""))
 
     for rx in _CLAIM_RES:

@@ -136,8 +136,86 @@ def test_routing_actually_varies_the_notes_between_questions():
     assert a != b, "note routing is not discriminating between questions"
 
 
-def test_rules_are_in_the_cached_part():
-    assert tools.RULES in tools.static_prompt()
+def test_the_always_on_rules_are_in_the_cached_part():
+    """The always-on rules must stay byte-stable and cached.
+
+    This used to assert the WHOLE of RULES. Since 2026-08-31 the report and
+    chart bullets are routed instead (tools._split_rules): they say nothing to
+    someone asking for a single number, and a long dense instruction block was
+    measured stopping Qwen3-30B-A3B from calling tools at all. The invariant
+    that matters is unchanged - what is sent on EVERY question must be cached.
+    """
+    assert tools._RULES_ALWAYS in tools.static_prompt()
+
+
+def test_the_routed_rules_are_not_in_the_cached_part():
+    """...and the routed half must NOT creep back into it, or the split is
+    undone and every trivial question pays for the report rules again."""
+    assert tools._RULES_REPORT
+    assert tools._RULES_REPORT not in tools.static_prompt()
+
+
+def test_a_report_question_still_receives_every_rule():
+    """THE SAFETY BAR FOR THE SPLIT. Nothing was deleted.
+
+    Every bullet must still REACH the model. Two of them no longer travel in
+    the system prompt:
+      * the report/chart bullets are routed in per question (_split_rules);
+      * the answer-formatting block is held back and sent with the first tool
+        result (_split_writeup), because in the system prompt it stops the
+        model calling tools at all.
+    So the union is what must be complete, not the system prompt alone.
+    """
+    import re
+
+    q = "give me report of department MFG - 1 for July 2026"
+    reachable = tools.system_prompt_for(q) + "\n" + tools.WRITEUP_RULES
+    bullets = [b.strip() for b in re.split("(?m)^(?=- [A-Z])", tools.RULES)
+               if b.strip()]
+    # Checked at BOTH ENDS rather than as one substring. Exactly one bullet is
+    # legitimately delivered in two pieces - the "broad questions" bullet had
+    # the answer-formatting block riding inside it, and that block now travels
+    # with the tool result - so a whole-bullet match would fail on a split that
+    # loses nothing. Head AND tail still catches a rule that was dropped or
+    # truncated, which is what this test is for.
+    def _reaches(bullet: str) -> bool:
+        head = " ".join(bullet[:60].split())
+        tail = " ".join(bullet[-60:].split())
+        flat = " ".join(reachable.split())
+        return head in flat and tail in flat
+
+    missing = [b[:60] for b in bullets if not _reaches(b)]
+    assert not missing, f"report question lost {len(missing)} rules: {missing[:3]}"
+
+
+def test_the_writeup_rules_are_not_in_the_system_prompt():
+    """They must NOT ride in the prompt. Measured 2026-08-31: this block alone
+    (340 tok) stopped Qwen3-30B-A3B calling any tool, while the data notes
+    padded to the size of the whole rules block did not - so it is the content,
+    not the length."""
+    assert tools.WRITEUP_RULES
+    for q in ("how many packets are on jangad?",
+              "give me report of department MFG - 1 for July 2026"):
+        assert tools.WRITEUP_RULES not in tools.system_prompt_for(q)
+
+
+def test_the_backend_sends_the_writeup_rules_with_the_data():
+    """...and they must actually be delivered, or answers lose their shape.
+    Checked at the source rather than by running a turn, because the delivery
+    point is one line inside the tool loop and that is exactly the kind of
+    wiring that gets lost in a refactor."""
+    import inspect
+
+    from app.agent import groq_backend
+
+    src = inspect.getsource(groq_backend)
+    assert "tools.WRITEUP_RULES" in src
+    assert "writeup_sent" in src
+
+
+def test_a_simple_question_does_not_pay_for_the_report_rules():
+    simple = tools.system_prompt_for("how many employees are there?")
+    assert tools._RULES_REPORT.strip() not in simple
 
 
 def test_the_static_block_no_longer_carries_every_note():
@@ -181,3 +259,53 @@ def test_exact_dimension_values_are_supplied():
 def test_dimension_values_are_memoised_so_the_prefix_stays_cacheable():
     assert tools.dimension_values() is tools.dimension_values()
     assert tools.static_prompt() is tools.static_prompt()
+
+
+# ---------------------------------------------------------------------------
+# RULES BUDGET (added 2026-08-21 after the Tier-A rewrite).
+#
+# This block grew by accretion: every client complaint added a bullet without
+# removing the one that already covered it, and by August it restated the same
+# ten concepts between three and fifteen times each across 49 bullets. It is
+# sent on EVERY model call, and a report question makes about six of them, so a
+# hundred tokens here is six hundred per question.
+#
+# The rewrite merged four overlapping report-shape bullets into one, folded the
+# three "no made-up data" bullets together, and cut the rules that a
+# deterministic code guard now enforces anyway (_enrichment_hint,
+# sanitize_export, sql_guard.selects_stale_copy, date_gate, name_guard).
+#
+# This is a ratchet, not a limit on writing rules: if a new rule is genuinely
+# needed, add it AND take the equivalent out of whatever already said it, then
+# raise this number deliberately in the same commit.
+# ---------------------------------------------------------------------------
+_RULES_TOKEN_CEILING = 7_900
+
+
+def test_rules_stays_within_budget():
+    approx_tokens = len(tools.RULES) // 4
+    assert approx_tokens <= _RULES_TOKEN_CEILING, (
+        f"RULES has grown to ~{approx_tokens} tokens (ceiling "
+        f"{_RULES_TOKEN_CEILING}). It ships on every call, ~6 calls per report "
+        "question. Before raising this, check whether the new rule is already "
+        "stated elsewhere in the block or already enforced in code."
+    )
+
+
+def test_the_report_shape_rules_stay_merged():
+    """Four bullets used to say this, and they drifted apart. One says it now."""
+    assert tools.RULES.count("DETAIL BY DEFAULT") == 1
+    assert tools.RULES.count("REPORT GRAIN") == 1
+    # ...and the merged bullet still carries every instruction the four had.
+    for fragment in ("lone COUNT/SUM", "bare total ONLY", "ORDER BY that column",
+                     "one row per KAPAN", "SHOW BOTH", "never hand-add"):
+        assert fragment in tools.RULES, f"lost in the merge: {fragment!r}"
+
+
+def test_rules_do_not_restate_what_code_now_enforces():
+    """The prose for these was cut because a guard runs regardless. If someone
+    re-adds the long version, the guard is still there and the tokens are not."""
+    # sql_guard.selects_stale_copy blocks these at execution.
+    assert "BLOCKED at execution" in tools.RULES
+    # ...so the old per-table exhaustive list should NOT come back.
+    assert "NEVER tblTimeAttendance_Demo" not in tools.RULES

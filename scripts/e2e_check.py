@@ -163,10 +163,15 @@ def check_agentcost_interceptors() -> bool:
     empty dashboard. The startup banner named exactly which interceptors loaded
     ("LangChain, OpenAI, Anthropic") and Gemini was simply absent from it.
     """
-    # provider -> the word the SDK prints in its "Tracking initialized" banner
+    # provider -> the word the SDK prints in its "Tracking initialized" banner.
+    # groq is "OpenAI" and not an exception any more: groq_backend reaches Groq
+    # through its OpenAI-COMPATIBLE endpoint, which the openai interceptor does
+    # patch. This used to pass with the note "provider=groq is NOT trackable",
+    # which is now the wrong answer - so groq is checked like the rest.
     needed = {
         "gemini": "Gemini",
         "anthropic": "Anthropic", "claude": "Anthropic",
+        "groq": "OpenAI", "openrouter": "OpenAI",
         "cerebras": "OpenAI", "nvidia": "OpenAI",
         "ollama": "OpenAI", "lmstudio": "OpenAI",
     }
@@ -178,11 +183,9 @@ def check_agentcost_interceptors() -> bool:
             return _record("AgentCost interceptors", False,
                            "no init banner - tracking is not enabled at all")
         loaded = line.split("Tracking initialized", 1)[1].strip()
-        want = needed.get(provider)
-        if want is None:
-            # groq: the native SDK is not patched by any version of the SDK.
-            return _record("AgentCost interceptors", True,
-                           f"loaded {loaded} - NOTE provider={provider} is NOT trackable")
+        # An unrecognised provider still routes to the OpenAI-dialect backend
+        # (see agent.ask), so that is the interceptor it needs.
+        want = needed.get(provider, "OpenAI")
         return _record("AgentCost interceptors", want in line,
                        f"provider={provider} needs {want}; loaded {loaded}")
     except Exception as exc:

@@ -153,9 +153,11 @@ def to_excel_sections(sections: list[dict], filename: str = "report.xlsx") -> st
     carried only the biggest one, so a client who asked for a full report
     downloaded 318 rows of production with the other sections silently missing.
 
-    Sheet names are derived from each section's columns: the model decides what
-    a "full report" contains, so there is no fixed list of section names to map
-    to, and the columns are the only honest description of what a sheet holds.
+    Sheet names use the section's own `title` when it has one - a report recipe
+    like department_report knows its sections are "Production by worker",
+    "Damage", "Incentive". For an ad-hoc run_sql there is no such name, so the
+    columns remain the fallback: the model decides what that "full report"
+    contains, and the columns are then the only honest description of the sheet.
     """
     usable = [s for s in (sections or []) if s.get("rows") and s.get("columns")]
     if not usable:
@@ -168,7 +170,8 @@ def to_excel_sections(sections: list[dict], filename: str = "report.xlsx") -> st
     used: set = set()
     for sec in usable:
         cols = sec["columns"]
-        title = _safe_sheet_name("-".join(str(c) for c in cols[:2]) or "Data", used)
+        raw = sec.get("title") or "-".join(str(c) for c in cols[:2]) or "Data"
+        title = _safe_sheet_name(raw, used)
         _write_sheet(wb.create_sheet(title=title), cols, sec["rows"])
 
     path = output_path(filename)

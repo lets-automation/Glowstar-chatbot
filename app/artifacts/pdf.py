@@ -31,6 +31,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     Image,
+    PageBreak,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -162,6 +163,95 @@ def to_pdf(
             elements.append(Image(img_path, width=560, height=336))
         except Exception:
             pass  # a chart failure must never break the data export
+
+    doc.build(elements)
+    return path
+
+
+def to_pdf_sections(
+    sections: list[dict],
+    filename: str = "report.pdf",
+    title: str = "Report",
+) -> str:
+    """Write EVERY section to one PDF - a titled table per section.
+
+    A full department report is eight results: workforce, headcount, production
+    summary, production by worker, production by kapan, damage, bonus,
+    incentive. The PDF branch of /export took only `columns, rows` - the single
+    widest table - so a client who downloaded the PDF got the worker roster and
+    none of the production, damage or bonus figures they had just been shown on
+    screen. Excel already carried one sheet per section; the PDF silently did
+    not, which is the worse failure of the two because nothing about the file
+    says anything is missing.
+
+    Each section keeps its own heading and its own row/column caps, and each
+    starts on a new page so a long section cannot bleed into the next one's
+    header.
+    """
+    usable = [s for s in (sections or []) if s.get("rows") and s.get("columns")]
+    if not usable:
+        raise ValueError("no sections to export")
+    if len(usable) == 1:
+        return to_pdf(usable[0]["columns"], usable[0]["rows"], filename, title)
+
+    path = output_path(filename)
+    doc = SimpleDocTemplate(path, pagesize=landscape(A4))
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("GsTitle", parent=styles["Title"], fontName=_FONT)
+    note_style = ParagraphStyle("GsNote", parent=styles["Italic"], fontName=_FONT)
+    heading_style = ParagraphStyle(
+        "GsHeading", parent=styles["Heading2"], fontName=_FONT
+    )
+    cell_style = ParagraphStyle(
+        "GsCell", fontName=_FONT, fontSize=7, leading=9, alignment=TA_LEFT,
+        wordWrap="CJK",
+    )
+    head_style = ParagraphStyle(
+        "GsHead", fontName=_FONT, fontSize=7, leading=9, textColor=colors.white,
+        wordWrap="CJK",
+    )
+
+    usable_width = landscape(A4)[0] - doc.leftMargin - doc.rightMargin
+    elements = [Paragraph(_esc(title), title_style), Spacer(1, 6)]
+    elements.append(Paragraph(
+        _esc(f"{len(usable)} sections: "
+             + ", ".join(str(s.get("title") or "Data") for s in usable)),
+        note_style,
+    ))
+
+    for i, sec in enumerate(usable):
+        cols = list(sec["columns"])[:MAX_PDF_COLS]
+        dropped = len(sec["columns"]) - len(cols)
+        rows = sec["rows"][:MAX_PDF_ROWS]
+
+        elements.append(PageBreak() if i else Spacer(1, 16))
+        elements.append(Paragraph(_esc(str(sec.get("title") or "Data")), heading_style))
+        elements.append(Spacer(1, 8))
+
+        data = [[Paragraph(_esc(str(c)), head_style) for c in cols]] + [
+            [Paragraph(_esc(_fmt(r.get(c, ""))), cell_style) for c in cols]
+            for r in rows
+        ]
+        table = Table(data, repeatRows=1,
+                      colWidths=[usable_width / max(1, len(cols))] * len(cols))
+        table.setStyle(_report_table_style())
+        elements.append(table)
+
+        notes = []
+        if len(sec["rows"]) > MAX_PDF_ROWS:
+            notes.append(
+                f"{len(sec['rows']) - MAX_PDF_ROWS} more rows omitted "
+                f"(showing first {MAX_PDF_ROWS}) - use the Excel export for the "
+                "complete list"
+            )
+        if dropped > 0:
+            notes.append(
+                f"{dropped} more columns omitted (showing first {MAX_PDF_COLS}) "
+                "- use the Excel export for all columns"
+            )
+        if notes:
+            elements.append(Spacer(1, 8))
+            elements.append(Paragraph("... " + "; ".join(notes) + ".", note_style))
 
     doc.build(elements)
     return path

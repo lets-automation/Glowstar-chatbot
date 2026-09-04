@@ -37,8 +37,18 @@ db_backup/*
 # in /docs and stay local. Only the READMEs are published. The whole folder is
 # ignored, so anything dropped in there is private by default - including the
 # question bank scripts/retest.py and scripts/run_test_suite.py read.
-/docs/
+
+
+#
+# THE RULES BELOW WERE MISSING. The comment above described the intent and
+# nothing implemented it: `git check-ignore docs/HANDOFF.md` matched nothing
+# and the !README negations were dangling with no ignore to negate. A plain
+# `git add .` would have committed the whole folder - the same client
+# material that had to be purged from history on 2026-08-05. Found
+# 2026-09-03 while writing docs/HANDOFF.md.
+docs/
 *.md
+
 !README.md
 !frontend/README.md
 

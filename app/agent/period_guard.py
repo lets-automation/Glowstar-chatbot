@@ -147,11 +147,31 @@ def constrains_date(sql: str) -> bool:
     return False
 
 
+# A pinned recipe (department_report, lab_results_report) reports its call as a
+# COMMENT - "-- lab_results_report('2026-05-01', '2026-06-01', '')" - because the
+# real work is several queries. _strip_noise removes comments, so constrains_date
+# saw an empty string and the scope banner fired on a report that WAS filtered:
+# the client was told "not filtered to that period" above correct May figures.
+# The recipes take an explicit half-open period, so a marker carrying dates is
+# proof of filtering, not the absence of it.
+_RECIPE_PERIOD_RE = re.compile(r"^\s*--\s*\w+\(.*\d{4}-\d{2}-\d{2}", re.MULTILINE)
+
+
 def unfiltered_period(question: str, sql_used: list[str], rows: list | None) -> bool:
     """True when the question names a period but NO query constrained a date."""
     from app.agent import date_gate
 
     if not rows or not sql_used:
+        return False
+    # IF WE CANNOT NAME THE PERIOD, WE CANNOT CLAIM THE USER ASKED FOR ONE.
+    #
+    # period_phrase() falls back to the literal string "that period", and the
+    # banner interpolates it: "you asked about **that period**, but this result
+    # is not filtered to that period". That is gibberish, and the cold test put
+    # it at the top of two client-facing answers (EDA-1, CT-05 on 2026-08-26).
+    # A banner we cannot phrase is a banner we have not earned - stay silent and
+    # let the pre-execution check in tools.tool_run_sql do the real work.
+    if period_phrase(question) == _UNKNOWN_PERIOD:
         return False
     if _GRANULARITY_RE.search(question or "") and not names_bounded_period(question):
         return False
@@ -159,17 +179,105 @@ def unfiltered_period(question: str, sql_used: list[str], rows: list | None) -> 
         return False
     if date_gate.asks_current_state(question):
         return False
+    if any(_RECIPE_PERIOD_RE.search(s or "") for s in sql_used):
+        return False
+    # A DISAMBIGUATION LOOKUP HAS NO TOTAL TO MIS-SCOPE.
+    #
+    # "total bonus of employee MAIYANI VIJAYABHAI in June 2026" is answered
+    # correctly by asking WHICH of the fifteen people with that name is meant
+    # (query_rules.employee_identity forces the code into the query so the
+    # ambiguity is visible). That reply reads the roster and returns
+    # ID / Code / DepartMentName - no measure at all - and the banner then sat
+    # on top of it announcing "treat the totals as all-time" when the answer
+    # contains no totals and is not claiming to. Seen live 2026-08-31.
+    #
+    # Suppressed only where the banner is unearnable: every query is a roster
+    # read with no aggregate in it. A COUNT or SUM over tblEmployee is still
+    # a figure and still warned about, and the pre-execution date check in
+    # tools.tool_run_sql is unaffected.
+    if sql_used and all(is_identity_lookup(s) for s in sql_used):
+        return False
     return not any(constrains_date(s) for s in sql_used)
 
 
+# A roster read that computes nothing: "which person did you mean?".
+_IDENTITY_LOOKUP_RE = re.compile(
+    r"^\s*SELECT\b(?![\s\S]*\b(?:SUM|COUNT|AVG)\s*\()"
+    r"[\s\S]*\bFROM\s+tblEmployee\b",
+    re.IGNORECASE,
+)
+
+
+def is_identity_lookup(sql: str) -> bool:
+    """True for a 'which person did you mean' read - roster, no measure."""
+    return bool(_IDENTITY_LOOKUP_RE.search(sql or ""))
+
+
+# Returned when no period can be named. Callers must treat it as "do not speak".
+_UNKNOWN_PERIOD = "that period"
+
+
+# Phrases the banner must be able to NAME. Tried in order, most specific first.
+#
+# "may month" and "aa mahine" both named a real period that period_phrase could
+# not render, so the banner came out as "you asked about **that period**" - which
+# is gibberish, and the cold test put it at the top of two client-facing answers.
+# Suppressing the banner instead was tried and lost a legitimate warning
+# (test_a_genuinely_unfiltered_query_still_warns), so the phrase is NAMED rather
+# than the warning dropped.
+_PHRASE_RES = (
+    re.compile(rf"\b({_MONTHS})\s+(?:month\s+)?(?:of\s+)?((?:19|20)\d{{2}})\b", re.IGNORECASE),
+    re.compile(rf"\b({_MONTHS})\s+month\b", re.IGNORECASE),
+    re.compile(r"\b(this|last|past|previous|current|next)\s+"
+               r"(month|week|year|quarter|fortnight)\b", re.IGNORECASE),
+    re.compile(r"\blast\s+\d+\s+(?:day|days|month|months|week|weeks|year|years)\b", re.IGNORECASE),
+    # Gujlish: aa mahine = this month, gaya mahine = last month, aa varsh = this year
+    re.compile(r"\b(aa|gaya|gaye|chalu)\s*(mahina|mahine|varsh|varas|varshe)\b", re.IGNORECASE),
+    re.compile(rf"\b({_MONTHS})\b", re.IGNORECASE),
+    re.compile(r"\b(mtd|ytd|q[1-4])\b", re.IGNORECASE),
+)
+
+# MAY IS A MONTH ONLY IN CONTEXT. _MONTHS deliberately omits bare "may" because
+# it is also a modal verb ("may I see the stock summary"), so these patterns
+# name it only where the context settles it - the same test _MAY_AS_MONTH_RE
+# applies for detection.
+_MAY_PHRASE_RES = (
+    re.compile(r"\bmay\s+(?:month\s+)?((?:19|20)\d{2})\b", re.IGNORECASE),
+    re.compile(r"\bmay\s+month\b", re.IGNORECASE),
+    re.compile(r"\b(?:in|for|during|of|since|from|till|until|month\s+of)\s+(may)\b",
+               re.IGNORECASE),
+)
+
+_GUJLISH_PERIOD = {
+    "aa mahina": "this month", "aa mahine": "this month",
+    "chalu mahina": "this month", "chalu mahine": "this month",
+    "gaya mahina": "last month", "gaya mahine": "last month",
+    "gaye mahine": "last month",
+    "aa varsh": "this year", "aa varas": "this year", "aa varshe": "this year",
+}
+
+
 def period_phrase(question: str) -> str:
-    """The period the user named, for the banner text."""
-    for r in (_BOUNDED_RES[4], _BOUNDED_RES[0], _BOUNDED_RES[3]):
-        m = r.search(question or "")
+    """The period the user named, rendered for the banner.
+
+    Returns _UNKNOWN_PERIOD only when nothing nameable is present - and callers
+    must then stay silent rather than print the placeholder.
+    """
+    q = question or ""
+    # "May" first: its patterns are context-qualified, so a hit is unambiguous.
+    for r in _MAY_PHRASE_RES:
+        m = r.search(q)
         if m:
-            return m.group(0)
-    m = _YEAR_CTX_RE.search(question or "")
-    return m.group(2) if m else "that period"
+            year = m.group(1) if m.lastindex and m.group(1).isdigit() else ""
+            return f"May {year}".strip()
+    for r in _PHRASE_RES:
+        m = r.search(q)
+        if not m:
+            continue
+        text = " ".join(m.group(0).split())
+        return _GUJLISH_PERIOD.get(text.lower(), text)
+    m = _YEAR_CTX_RE.search(q)
+    return m.group(2) if m else _UNKNOWN_PERIOD
 
 
 def scope_banner(period: str) -> str:
@@ -183,3 +291,90 @@ def scope_banner(period: str) -> str:
 
 def followup_option(period: str) -> str:
     return f"Show the same report filtered to {period}"
+
+
+# ---------------------------------------------------------------------------
+# PRE-EXECUTION: reject an unfiltered query instead of warning about it after.
+#
+# The banner above is the backstop, not the fix. By the time it renders, the
+# answer already says 179,990 packets for "production in May 2026" - the true
+# May figure is 3,227, a 56x inflation - and all the banner can do is tell the
+# user the number they are looking at is the wrong one. The code that adds it
+# says so: "We cannot fix the SQL from here."
+#
+# So the same check runs BEFORE execution, at the tool_run_sql choke point where
+# query_rules already rejects wrong-SOURCE queries. The model is handed the exact
+# column and asked to re-run. The wrong number is never produced.
+#
+# A WHITELIST, NOT AN INFERENCE. Every column below was read out of
+# INFORMATION_SCHEMA against the live database on 2026-08-26, not taken from the
+# data notes - the spellings are a minefield and one letter decides it:
+# tblFinalPacket has CreateDate, tblPlanMaster has CreatDate. A table that is
+# NOT in this map is never rejected, so an unverified table degrades to today's
+# behaviour (the banner) instead of blocking a legitimate query.
+# ---------------------------------------------------------------------------
+_PERIOD_DATE_COLUMN = {
+    "tblPacket": "CreDate",
+    "tblFinalPacket": "CreateDate",
+    "tblPlanMaster": "CreatDate",
+    "tblPlanReport": "CreatedDate",
+    "tblPointRateLabour": "ProcessDate",   # 928,063 rows, fully populated
+    "tblLabourResult": "ProcessDate",      # NOTE: this feed stops in 2023
+    "tblIncentiveAmount": "TransactTime",
+    "tblTimeAttendance": "Time",
+    "tblPacketHistory": "ReciveTime",
+    "tblJunk": "CreateDate",               # IssueDate is 99.5% NULL - never use it
+    "tblJangad": "JangadDate",
+    "tblKapan": "CreatDate",
+    "tblRepairCommentVision": "CreatDate",
+}
+
+_TABLE_REF_RE = re.compile(r"\b(?:FROM|JOIN)\s+\[?(\w+)\]?", re.IGNORECASE)
+
+
+def dated_tables(sql: str) -> list[str]:
+    """Whitelisted tables this query reads, in the order they appear."""
+    seen, out = set(), []
+    for m in _TABLE_REF_RE.finditer(_strip_noise(sql or "")):
+        t = m.group(1)
+        key = next((k for k in _PERIOD_DATE_COLUMN if k.lower() == t.lower()), None)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def missing_period_filter(question: str, sql: str) -> str:
+    """A rejection message when this query would answer a dated question
+    with all-time numbers, or "" when there is nothing to correct.
+
+    Deliberately does NOT compute the date range. Turning "last month" into two
+    literals is a date parser, and a wrong range would be a NEW wrong answer -
+    the model already has TODAY'S DATE in its prompt and converts a period
+    correctly; what it fails at is remembering to filter at all. So this supplies
+    the discipline and the column name, and leaves the arithmetic where it works.
+    """
+    from app.agent import date_gate
+
+    if not sql or not names_bounded_period(question or ""):
+        return ""
+    if date_gate.asks_current_state(question or ""):
+        return ""
+    if _RECIPE_PERIOD_RE.search(sql):
+        return ""
+    if constrains_date(sql):
+        return ""
+    tables = dated_tables(sql)
+    if not tables:
+        return ""
+    cols = ", ".join(f"{t}.{_PERIOD_DATE_COLUMN[t]}" for t in tables[:3])
+    period = period_phrase(question or "")
+    return (
+        f"BLOCKED: the question asks about {period}, but this query has NO date "
+        f"filter - it would return ALL history and the answer would be wrong by "
+        f"orders of magnitude. Add the period to the WHERE clause using the "
+        f"correct date column for this table: {cols}. Use a half-open range, "
+        f"e.g. >= '<start>' AND < '<day after the end>', with the dates for "
+        f"{period} worked out from TODAY'S DATE in your instructions. If the "
+        f"user genuinely wants all history, say so explicitly in your answer."
+    )

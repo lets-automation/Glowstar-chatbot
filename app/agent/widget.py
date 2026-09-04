@@ -13,10 +13,16 @@ exposes TOOL_SPECS and RULES:
   - SHOW_WIDGET_TOOL_SPEC : the tool definition (same {name, description,
                             schema} shape as tools.TOOL_SPECS, so each backend
                             wraps it in its own format).
-  - WIDGET_SYSTEM_PROMPT  : the design-system rules prepended to the system
-                            prompt on every chat call. The CSS-variable palette
-                            it references is defined (and themeable) in the
-                            iframe host: frontend/src/SandboxedWidget.jsx.
+  - WIDGET_CORE_PROMPT    : which visual tool to use and - just as
+                            important - when to use none. Merged into the
+                            system prompt on EVERY chat call.
+  - WIDGET_DESIGN_PROMPT  : the design-system rules for hand-written
+                            show_widget fragments. ~1k tokens that only that
+                            one tool ever reads, so needs_design_rules() /
+                            visual_prompt_for() gate it on the question and
+                            the backends append it dead last. The CSS-variable
+                            palette it references is defined (and themeable) in
+                            the iframe host: frontend/src/SandboxedWidget.jsx.
 
 The capture of the widget code itself happens in the backend agent loops
 (anthropic_backend.py / groq_backend.py), because the tool's "result" is a UI
@@ -478,58 +484,114 @@ def ensure_chart_lib(code: str) -> str:
     return code
 
 
-# Prepended to (merged into) the system prompt on every chat call. The CSS
-# variables below are defined in frontend/src/SandboxedWidget.jsx (the iframe
-# host); they auto-adapt to light and dark mode. Keep the rules verbatim - they
-# prevent the broken/inconsistent output you'd otherwise get.
-WIDGET_SYSTEM_PROMPT = """
-You can render rich visual content inline using the show_widget tool. When a visual conveys
-something text can't - data shape, structure, a process, an interactive tool - call show_widget
-with an HTML or SVG fragment. Otherwise answer in prose. Put all explanation in your text
-response; the widget contains ONLY the visual.
+# ---------------------------------------------------------------------------
+# THE VISUAL PROMPT, IN TWO PIECES
+#
+# This used to be one 2,023-token block merged into the system prompt on EVERY
+# call, on every provider, on every round of the tool loop - and one report
+# question spends ~6 rounds (see the measurement in tools.dynamic_schema_for).
+#
+# ~70% of those tokens are a DESIGN SYSTEM that applies to exactly one of the
+# three tools. show_chart and show_dashboard never need it: their HTML comes
+# from build_chart_html() / build_dashboard_html() above, so the palette, the
+# type scale, the component specs and the Chart.js wiring are OURS, not the
+# model's. Only show_widget - the rare custom-visual path - reads those rules.
+# So the block is split in two:
+#
+#   WIDGET_CORE_PROMPT    always on. Which tool to use, when to draw NOTHING,
+#                         and the handful of rules whose absence turns a widget
+#                         into a blank box or invisible dark-mode text.
+#   WIDGET_DESIGN_PROMPT  appended only when needs_design_rules() sees
+#                         custom-visual intent in the question.
+#
+# PLACEMENT MATTERS AS MUCH AS SIZE. The design block is appended DEAD LAST,
+# after the per-question schema. Prompt caching matches a PREFIX, so a block
+# that switches on and off in the MIDDLE would un-cache everything behind it -
+# the same trap documented at the top of tools.dynamic_schema_for(). Put in
+# front of the schema it would flip the cache key of ~20k tokens on every
+# question that happened to mention a diagram.
+#
+# The CSS variables referenced below are defined in
+# frontend/src/SandboxedWidget.jsx (the iframe host); they auto-adapt to light
+# and dark mode. Keep the rules verbatim - they prevent the broken and
+# inconsistent output you would otherwise get.
+# ---------------------------------------------------------------------------
+WIDGET_CORE_PROMPT = """
+# Visual output: three tools, and when to use none of them
 
-# Charts: use show_chart (important)
-- For ANY standard single-series chart (bar, horizontal bar, line, pie) call the show_chart
-  tool with just chart_type + labels + values - the app renders it, guaranteed correct.
-  NEVER hand-write Chart.js code for a simple chart.
-- Use show_widget ONLY for visuals show_chart and show_dashboard cannot express: multi-series
-  charts, diagrams, forms, interactive tools.
+Text is the default. Most answers need no visual at all - a sentence, or a Markdown table
+when there are rows to show, IS the best answer.
 
-# Dashboards: use show_dashboard (important)
-- When the user asks for ANALYTICS, an OVERVIEW, a DASHBOARD, or a PERFORMANCE / ANALYSIS
-  summary (of the company, a period, a kapan, a department, an employee), build a dashboard:
-  1) run the run_sql queries you need - the headline totals, ideally a trend over time, and a
-     breakdown by category (2-4 quick aggregate queries);
-  2) then call show_dashboard ONCE with 3-6 KPI tiles (label + value + unit; add delta vs the
-     previous period when you queried it) and 1-3 sections (line = trend, horizontal_bar =
-     ranked breakdown, bar = comparison, pie = share).
-- Every tile value and section number MUST come from run_sql results in THIS conversation -
-  a dashboard with invented numbers is the worst possible failure.
-- Call show_dashboard at most ONCE per answer, and prefer it over separate show_chart calls
-  when the answer has multiple parts (totals + trend + breakdown). Keep your text response
-  short - the dashboard carries the numbers; the text carries the insight.
-- NEVER hand-write a dashboard with show_widget; show_dashboard renders it correctly.
+Your tools:
+- show_chart      one standard chart (bar, horizontal_bar, line, pie): you pass chart_type +
+                  labels + values, the app renders it. NEVER hand-write chart code.
+- show_dashboard  an analytics view: 3-6 KPI tiles plus 1-3 chart sections.
+- show_widget     a CUSTOM visual ONLY - diagram, process flow, timeline, multi-series or
+                  non-standard chart, form, calculator, interactive explainer. Anything the
+                  other two can express MUST use them instead.
 
-# When to call show_chart / show_widget (important)
-- If the user asks you to draw, plot, chart, graph, visualize, diagram, or render something,
-  call show_chart (simple chart) or show_widget (custom visual). Do NOT describe it in words.
-- BE PROACTIVE with analytics: even when NOT explicitly asked, if a result compares categories
-  (by colour, department, city, party), breaks something down, ranks a top-N, or trends over
-  time, render a chart with show_chart alongside your written answer. A good rule:
-  more than ~3 comparable data points -> show a chart. Single numbers or yes/no answers -> no chart.
-- NEVER reply with a text placeholder like "[Chart image: ...]" or "(see chart below)". That is
-  a failure - if a chart is wanted, the widget IS the chart. Build it.
-- show_widget is for an ON-SCREEN visual rendered live in the chat. You cannot create
-  downloadable files: when the user asks to export/download, answer with the data and point
-  them to the Export buttons below your answer. For anything shown in the conversation, use
-  show_widget.
-- If the user gives the data inline (e.g. "Rings 120, Necklaces 90"), you already have the
-  numbers - go straight to show_widget. Do not run a query for data you were handed.
+# Do NOT draw anything (this is the normal case)
+Answer in plain text, with a Markdown table when there are rows, for:
+- a single number, total, count, average, percentage, yes/no, or a lookup
+- an identity or profile row - a name, code, department, date, status
+- a REPORT or a listing: a report is a TABLE of detail rows, never a chart
+- fewer than 4 data points, or values that are not comparable with each other
+- an explanation, a definition, a how-to, small talk, an error, or a refusal
+A chart that restates a number already in your sentence adds nothing. Not drawing is the
+safe default: when in doubt, leave it out.
 
-# Output contract
-- Fragment only. No <!doctype>, <html>, <head>, or <body>. The host wraps it.
-- The container is display:block; width:100%. Fill it; no outer wrapper needed.
-- Auto-detect: a string starting with <svg is SVG mode, otherwise HTML.
+# Draw when you are asked
+If the user asks you to draw, plot, chart, graph, visualize, diagram or render something,
+CALL the tool. Never describe the visual in words, and NEVER write a placeholder like
+"[Chart image: ...]" or "(see chart below)" - that is a failure; the tool call IS the chart.
+
+# Draw for an analytics request
+When the user asks for ANALYTICS, an OVERVIEW, a DASHBOARD, or a PERFORMANCE / ANALYSIS
+summary (of the company, a period, a kapan, a department, an employee):
+1) run the 2-4 aggregate run_sql queries you need - the headline totals, ideally a trend over
+   time, and a breakdown by category;
+2) then call show_dashboard ONCE with 3-6 KPI tiles (label + value + unit; add a delta vs the
+   previous period when you queried it) and 1-3 sections (line = trend, horizontal_bar =
+   ranked breakdown, bar = comparison, pie = share).
+Prefer one dashboard over several separate charts, and keep your text short - the dashboard
+carries the numbers, your text carries the insight. NEVER hand-write a dashboard with
+show_widget; show_dashboard renders it correctly.
+
+# Draw unasked - rarely, and at most once
+Add a show_chart the user did not ask for ONLY when the point of the answer is a shape they
+cannot see in the numbers: 4 or more comparable categories being ranked or compared, or a
+trend across 4 or more periods. One chart per answer, never two. If the answer is already
+clear from the table or the sentence, do not add one.
+
+# Every number must be real
+Each tile, label and value MUST come from a run_sql result in THIS conversation. A chart or
+dashboard with invented numbers is the worst possible failure. If the user handed you the
+numbers in their message, use those - do not run a query for data you were given.
+
+# show_widget fragments: ignoring these breaks the render
+- Fragment only, no <!doctype>/<html>/<head>/<body> - the host wraps it. Starts with <svg =
+  SVG, otherwise HTML.
+- NEVER localStorage/sessionStorage (blocked, throws - keep state in memory) and NEVER
+  position:fixed (the iframe auto-sizes; fixed elements collapse it).
+- Load external files ONLY from cdnjs.cloudflare.com, cdn.jsdelivr.net, unpkg.com, esm.sh,
+  fonts.googleapis.com, fonts.gstatic.com. Anything else is blocked silently.
+- NEVER hardcode a color: var(--surface-2)/var(--surface-1) backgrounds, var(--text-primary)/
+  var(--text-secondary) text, var(--border) lines. They adapt to dark mode, where color:#333
+  is invisible. Chart data: #2a78d6, then #1baf7a, then #eda100.
+- Round EVERY displayed number. No emoji, gradients, shadows, or text under 11px.
+- Explanation goes in your text reply; the widget holds ONLY the visual.
+
+You cannot create downloadable files. When asked to export or download, answer with the data
+and point the user at the Export buttons below your answer.
+"""
+
+
+# Only reaches the model when needs_design_rules() fires - i.e. the question is
+# asking for something show_chart / show_dashboard cannot render.
+WIDGET_DESIGN_PROMPT = """
+# show_widget design system
+These rules apply ONLY to an HTML/SVG fragment you write yourself with show_widget.
+show_chart and show_dashboard are rendered by the app and need none of this.
 
 # Theming - use these CSS variables, never hardcode colors
 Surfaces: --surface-2 (card white), --surface-1 (raised), --surface-0 (page);
@@ -544,7 +606,7 @@ Mental test before finishing: if the background were near-black, is every text e
 
 # Color palette (categorical - assign in this fixed order, NEVER cycle like a rainbow)
 Color encodes meaning, not sequence. Group by category; same type = same color. Use 2-3 colors
-max. Canvas can't read CSS vars, so use these hex values directly in chart datasets:
+max. Canvas cannot read CSS vars, so use these hex values directly in chart datasets:
   1 blue #2a78d6  2 teal #1baf7a  3 amber #eda100  4 green #008300
   5 violet #4a3aa7  6 red #e34948  7 pink #e87ba4  8 orange #eb6834
 Sequential (magnitude): one hue, light->dark. Diverging (above/below a baseline): blue<->red with a
@@ -569,7 +631,7 @@ Comparison: card grid, one accent card uses border:2px solid var(--border-accent
 - Wrap <canvas> in a <div> with position:relative and an explicit height. Set height ONLY on the
   wrapper, never on the canvas. Use responsive:true, maintainAspectRatio:false.
 - Every <canvas> needs role="img", a descriptive aria-label, and fallback text between the tags.
-- Canvas can't resolve CSS vars - use hex. For dark mode read prefers-color-scheme and pick
+- Canvas cannot resolve CSS vars - use hex. For dark mode read prefers-color-scheme and pick
   tick/grid colors (muted #898781; grid #e1e0d9 light / #2c2c2a dark).
 - Disable the default legend (plugins.legend.display=false) and build a small custom HTML legend
   with colored squares + values. Never rely on color alone - add a dash/marker/pattern cue.
@@ -581,22 +643,81 @@ Order: short <style> (or inline styles) -> content HTML -> <script> LAST. Script
 after streaming completes. Prefer inline style="" on controls so they look right mid-stream.
 Load libraries via <script src> (UMD global), then a following plain <script> uses the global.
 
-# HARD RULES - violating these breaks the sandbox or the render
-- NEVER use localStorage, sessionStorage, or any browser storage - blocked, throws. Use JS
-  variables / React state held in memory for the session.
-- NEVER use position:fixed - the iframe auto-sizes to content height and fixed elements collapse
-  it. For modal/overlay mockups use a normal-flow faux-viewport div with min-height.
-- External resources may ONLY load from: cdnjs.cloudflare.com, cdn.jsdelivr.net, unpkg.com,
-  esm.sh, fonts.googleapis.com, fonts.gstatic.com. Anything else is blocked and fails silently.
-- Round EVERY displayed number - Math.round / toFixed / toLocaleString. Float math leaks
-  artifacts (0.1+0.2 = 0.30000000000000004).
-- No DOCTYPE/html/head/body. No font-size below 11px. No emoji. No gradients, drop shadows,
-  blur, or glow. Outer container background stays transparent (host provides the bg).
-- Accessibility: HTML widgets begin with a visually-hidden <h2 class="sr-only"> one-sentence
-  summary. SVG uses role="img" with <title> and <desc>.
+# Accessibility
+HTML widgets begin with a visually-hidden <h2 class="sr-only"> one-sentence summary.
+SVG uses role="img" with <title> and <desc>.
 
 # Interactivity
 A global function sendPrompt(text) is available - it sends a message to chat as if the user
 typed it. Use it for actions that need the model to think (drill-downs, "explain this"). Handle
 filtering, sorting, toggling, and math in plain JS instead. Links via <a href> just work.
 """
+
+
+# ---------------------------------------------------------------------------
+# THE GATE
+#
+# Decided in CODE, before any model call - the same family as smalltalk_gate,
+# date_gate and note_router. An LLM "router" pre-call was considered and
+# rejected: it adds a whole round trip to the front of every question, and on
+# the free Gemini tier (20 requests/day) it would halve how many questions the
+# bot can answer in a day. It also cannot make the call it would be asked to
+# make - whether a RESULT deserves a chart depends on the rows, which do not
+# exist until run_sql has run inside the tool loop.
+#
+# It matches CUSTOM-visual intent only. Deliberately NOT in the list: chart,
+# graph, plot, dashboard, analytics, report, overview. Those are served by
+# show_chart / show_dashboard, which render from our own templates and need
+# none of these rules - and they are what this bot is actually asked for all
+# day ("report of M4167", "how many packets on jangad", "production analytics
+# for June"). That exclusion is the whole reason the split pays.
+#
+# Biased towards firing: a false positive costs ~1.4k tokens on ONE question, a
+# false negative costs an uglier widget. Ambiguous terms go in. The core prompt
+# still carries every rule whose absence would break the render outright, so a
+# miss degrades the styling, never the output.
+# ---------------------------------------------------------------------------
+_CUSTOM_VISUAL_RE = re.compile(
+    r"\b("
+    # structure / process pictures
+    r"diagrams?|flow ?charts?|flow ?diagrams?|workflows?|process (map|flow)|"
+    r"org(ani[sz]ation)? ?charts?|organogram|hierarch(y|ies)|"
+    r"(decision|family) tree|tree (diagram|chart|map|view)|mind ?maps?|venn|"
+    r"time ?lines?|road ?maps?|gantt|swim ?lanes?|"
+    # chart shapes show_chart cannot express
+    r"sankey|funnels?|pyramids?|waterfalls?|treemaps?|sunbursts?|heat ?maps?|"
+    r"scatter|bubble chart|radar chart|spider chart|doughnuts?|donuts?|"
+    r"area chart|stacked|grouped bars?|histograms?|box ?plots?|bell curve|"
+    r"gauges?|speedometer|multi[- ]?series|multiple series|dual axis|combo chart|"
+    r"matrix|quadrant|"
+    # hand-built visuals and interactive things
+    r"infographics?|mock ?ups?|wireframes?|prototypes?|"
+    r"calculators?|simulators?|simulations?|interactive|sliders?|toggles?|"
+    r"animations?|animated|kanban|floor ?plans?|seating|"
+    r"svg|illustrations?|illustrate|drawings?|draw|sketch|picture|graphic|"
+    r"visuali[sz]e|visuali[sz]ation|visually"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def needs_design_rules(text: str) -> bool:
+    """
+    True when the question asks for something only show_widget can draw, so
+    WIDGET_DESIGN_PROMPT is worth its ~1.4k tokens.
+
+    Pass the same routing text the schema router gets (tools.routing_text: the
+    previous user turn plus this question), so a follow-up on a widget ("now
+    add the polishing stage" after "draw the process flow") keeps the rules
+    loaded instead of losing them mid-conversation.
+    """
+    return bool(text) and bool(_CUSTOM_VISUAL_RE.search(text))
+
+
+def visual_prompt_for(text: str) -> str:
+    """
+    The design block to append AFTER the per-question schema, or "" when this
+    question does not need it. Backends concatenate it dead last - see the
+    placement note above.
+    """
+    return WIDGET_DESIGN_PROMPT if needs_design_rules(text) else ""

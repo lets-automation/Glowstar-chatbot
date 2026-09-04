@@ -118,3 +118,43 @@ def test_enrich_prepends_the_banner_and_keeps_the_data():
     assert out["clarify_options"], "a one-tap re-ask must be offered"
     # the rows are REAL — never strip them (silent-data-loss pattern)
     assert out["data_rows"] and out["export_query"]
+
+
+class TestDisambiguationLookupIsNotBannered:
+    """A "which person did you mean?" reply has no total to mis-scope.
+
+    Seen live 2026-08-31. "total bonus of employee MAIYANI VIJAYABHAI in June
+    2026" is answered CORRECTLY by asking which of the fifteen people with that
+    name is meant - query_rules.employee_identity forces the code into the
+    query so the ambiguity becomes visible. That reply reads the roster and
+    returns ID / Code / DepartMentName and nothing else, and the scope banner
+    sat on top of it announcing "treat the totals as all-time" above an answer
+    that contains no totals and claims none.
+    """
+
+    QUESTION = "total bonus of employee MAIYANI VIJAYABHAI in June 2026"
+    LOOKUP = ("SELECT TOP 5001 ID, Code, DepartMentName FROM tblEmployee "
+              "WHERE FirstName = 'MAIYANI' AND LastName = 'VIJAYABHAI'")
+    ROWS = [{"ID": 3229, "Code": "V001"}]
+
+    def test_the_banner_stays_off_a_disambiguation_reply(self):
+        assert not unfiltered_period(
+            self.QUESTION, [self.LOOKUP], self.ROWS)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT SUM(r.BonusAmount) FROM tblPointRateLabour r "
+        "JOIN tblEmployee e ON r.Emp_ID = e.ID",
+        "SELECT COUNT(*) FROM tblEmployee WHERE IsActive = 1",
+    ])
+    def test_a_figure_over_the_roster_is_still_warned_about(self, sql):
+        """The suppression is scoped to reads that COMPUTE NOTHING. A COUNT or
+        SUM is a figure and still earns the banner."""
+        assert unfiltered_period(self.QUESTION, [sql], self.ROWS)
+
+    def test_a_mixed_turn_is_still_warned_about(self):
+        """Suppressed only when EVERY query is a bare roster read - one real
+        aggregate anywhere in the turn brings the banner back."""
+        assert unfiltered_period(
+            self.QUESTION,
+            [self.LOOKUP, "SELECT SUM(BonusAmount) FROM tblPointRateLabour"],
+            self.ROWS)

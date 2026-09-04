@@ -190,3 +190,77 @@ if __name__ == "__main__":
 
     fks = get_foreign_keys()
     print(f"\nForeign-key links found: {len(fks)}")
+
+@lru_cache(maxsize=1)
+def data_cutoff() -> str:
+    """The newest packet timestamp in the database, as 'YYYY-MM-DD ~HH:MM'.
+
+    This DB is a restored backup, so "today" in the prompt must mean the last
+    day the data actually covers. It used to be a hardcoded date in the DATA
+    CUTOFF note, which went stale the moment a new backup was restored: after
+    the 2026-08-21 restore the bot was still telling users the data ended
+    2026-07-27, three and a half weeks early. Read it instead, and cache it -
+    a restored backup does not move while the app runs.
+
+    Returns "" if unavailable, and the note falls back to generic wording rather
+    than printing a wrong date.
+    """
+    from app.database.runner import run_select
+
+    try:
+        r = run_select("SELECT MAX(CreDate) AS Cutoff FROM tblPacket", max_rows=1)
+        if not r.get("ok") or not r.get("rows"):
+            return ""
+        value = list(r["rows"][0].values())[0]
+        if not value:
+            return ""
+        # run_select hands datetimes back as STRINGS ("2026-08-21 13:02:00"),
+        # so do not assume a datetime here - the first version called
+        # .strftime(), raised, and silently fell back to no date at all.
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y-%m-%d ~%H:%M")
+        text = str(value).strip().replace("T", " ")
+        date_part, _, time_part = text.partition(" ")
+        return f"{date_part} ~{time_part[:5]}" if time_part else date_part
+    except Exception:      # never let a prompt build fail on a freshness note
+        return ""
+
+@lru_cache(maxsize=32)
+def feed_end(table: str, column: str) -> str:
+    """The last date a feed actually carries, as 'YYYY-MM-DD' ("" if unknown).
+
+    Some tables are posted IN ARREARS (tblPointRateLabour lands ~2-6 weeks late),
+    so the note that warns about it needs a real date, not a literal one. A
+    hardcoded date here is actively dangerous rather than merely stale: the
+    glossary said "CAP any tblPointRateLabour query at 2026-06-30" because July
+    held 206 rows in the July backup - in the 21-Aug backup July holds 25,619,
+    a complete month, and obeying the old cap would have thrown all of it away
+    and reported a production collapse that never happened.
+
+    Identifiers are whitelisted against sys.tables/sys.columns before use, so a
+    caller cannot inject SQL through a note placeholder.
+    """
+    from app.database.runner import run_select
+
+    if not re.fullmatch(r"\w+", table or "") or not re.fullmatch(r"\w+", column or ""):
+        return ""
+    try:
+        ok = run_select(
+            "SELECT 1 AS ok FROM sys.columns c JOIN sys.tables t "
+            "ON t.object_id = c.object_id "
+            f"WHERE t.name = '{table}' AND c.name = '{column}'", max_rows=1)
+        if not ok.get("ok") or not ok.get("rows"):
+            return ""
+        r = run_select(f"SELECT MAX([{column}]) AS FeedEnd FROM [{table}] WITH (NOLOCK)",
+                       max_rows=1)
+        if not r.get("ok") or not r.get("rows"):
+            return ""
+        value = list(r["rows"][0].values())[0]
+        if not value:
+            return ""
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y-%m-%d")
+        return str(value).strip().replace("T", " ")[:10]
+    except Exception:
+        return ""
+

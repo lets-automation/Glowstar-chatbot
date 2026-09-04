@@ -132,14 +132,129 @@ def ensure_row_cap(sql: str, cap: int = DEFAULT_ROW_CAP) -> str:
     return text
 
 
+# Any tbl-prefixed identifier anywhere in the statement. Deliberately NOT
+# anchored to FROM/JOIN: that misses comma joins, APPLY, subqueries and CTE
+# bodies, and a backup table name has no legitimate reason to appear anywhere
+# else in a query. Validated against 252 real statements recovered from
+# logs/agent.log and the in-repo query corpus - zero false positives.
+#
+# Restricted to the "tbl" prefix on purpose. is_trap_table() also matches a
+# leading "temp", and an unanchored scan would then reject a perfectly good
+# CTE named `temp`. Every trap table in the live database is tbl-prefixed
+# (verified: all 14), so the narrower pattern loses no coverage.
+_TBL_REF_RE = re.compile(r"\btbl[A-Za-z0-9_]+\b", re.IGNORECASE)
+
+# Suffix/prefix that marks a copy, and what stripping it should leave.
+_COPY_MARKER_RE = re.compile(
+    r"(_BKP|_BAK|_Backup|Edit|_Compare|_Demo|_Update|_old|Temp|GIA)$", re.IGNORECASE
+)
+
+
+def _primary_of(table: str) -> str | None:
+    """The live table a backup/demo copy was made from, if it really exists.
+
+    Only returned when the stripped name is a genuine business table AND is not
+    itself a copy. Both conditions are load-bearing:
+      * a guess that does not exist sends the model chasing an invalid-object
+        error instead of correcting itself;
+      * a guess that is ALSO blocked sends it straight back into this guard.
+        Real case: tblLabourResultGIAEdit carries two markers, and stripping
+        only the last one suggested tblLabourResultGIA - a trap table. Markers
+        are therefore stripped repeatedly until the name is clean.
+    """
+    stripped = table
+    for _ in range(4):  # bounded: no real name carries more than a couple
+        nxt = _COPY_MARKER_RE.sub("", stripped).rstrip("_")
+        if not nxt or nxt == stripped:
+            break
+        stripped = nxt
+    if not stripped or stripped.lower() == table.lower():
+        return None
+    try:
+        from app.schema import extractor
+
+        if extractor.is_trap_table(stripped):
+            return None  # would just be blocked again
+        # get_tables() is lru_cached, so this is free after the first question.
+        if any(t["name"].lower() == stripped.lower() for t in extractor.get_tables()):
+            return stripped
+    except Exception:  # noqa: BLE001 - never let the hint break the guard
+        return None
+    return None
+
+
+def selects_stale_copy(sql: str) -> str:
+    """
+    Reject a query that reads a BACKUP / EDIT / DEMO / COMPARE / GIA copy.
+
+    Returns a rejection reason, or "" when the query is clean.
+
+    WHY THIS IS IN CODE AND NOT ONLY IN THE PROMPT. These copies hold stale,
+    partial or outright FAKE data, and the numbers they return look completely
+    plausible - tblPacket_BKP has 71,715 rows against tblPacket's 168,763, and
+    tblTimeAttendance_Demo has 45,636 rows of fabricated attendance against the
+    real table's 393,882. An answer built on one is confidently wrong in a way
+    no reader can catch.
+
+    extractor.is_trap_table() already hides them from find_tables() and from the
+    schema router, so the model cannot DISCOVER one. Nothing stopped it naming
+    one from memory: before this, run_select("SELECT COUNT(*) FROM
+    tblLabourResultGIA") returned 121,337 rows quite happily. The RULES block
+    forbids it in prose, which is a ~80%-reliable guard costing ~230 tokens on
+    every model call; this is a 100%-reliable guard costing none.
+
+    The reason text is written FOR THE MODEL: run_select hands the error string
+    straight back into the tool loop, and the RULES already tell it to read an
+    error and fix its SQL. Naming the primary table turns a dead end into a
+    self-correction.
+    """
+    try:
+        from app.schema import extractor
+
+        is_trap = extractor.is_trap_table
+    except Exception:  # noqa: BLE001 - degrade to the prompt rule, never break a query
+        return ""
+
+    seen: list[str] = []
+    for name in _TBL_REF_RE.findall(sql or ""):
+        if name.lower() in {s.lower() for s in seen}:
+            continue
+        if is_trap(name):
+            seen.append(name)
+
+    if not seen:
+        return ""
+
+    parts = []
+    for name in seen:
+        primary = _primary_of(name)
+        parts.append(
+            f"'{name}' is a backup/demo/edit copy holding stale or fake data"
+            + (f" - query '{primary}' instead" if primary else "")
+        )
+    return (
+        "Blocked: " + "; ".join(parts) + ". Re-run the query against the primary "
+        "table. Never report figures from a backup, demo, edit or compare copy."
+    )
+
+
 def validate_and_prepare(sql: str, cap: int = DEFAULT_ROW_CAP) -> tuple[bool, str]:
     """
     Convenience: validate read-only, then apply the row cap.
     Returns (True, safe_sql) or (False, reason).
+
+    The stale-copy check lives HERE rather than in is_read_only() because the
+    two answer different questions: is_read_only() is about safety (can this
+    statement change anything?), this is about data quality (would this answer
+    be a lie?). runner.run_select() is the only production caller, so every
+    query the agent runs passes through both.
     """
     ok, reason = is_read_only(sql)
     if not ok:
         return False, reason
+    stale = selects_stale_copy(sql)
+    if stale:
+        return False, stale
     return True, ensure_row_cap(sql, cap)
 
 
