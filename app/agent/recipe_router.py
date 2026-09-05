@@ -101,6 +101,29 @@ _YESTERDAY_RE = re.compile(r"\byesterday\b|\bkale\b|\bgai kale\b",
                            re.IGNORECASE)
 
 
+# PERIODS date_gate ALREADY ACCEPTS BUT resolve_period COULD NOT RESOLVE.
+#
+# Audit 2026-09-05: date_gate._PERIOD_RE matches week / quarter / fortnight /
+# "last N days" / mtd / ytd / q1-q4, so the picker stays QUIET - but
+# resolve_period returned None for every one of them, so match() declined and
+# the question fell silently to free SQL with no period at all. Six phrasings
+# in that state. A period one layer accepts must be one the next can resolve.
+_LAST_WEEK_RE = re.compile(r"\blast\s+week\b|\bpast\s+week\b"
+                           r"|\bgaya\s+athvadiya\b", re.IGNORECASE)
+_THIS_WEEK_RE = re.compile(r"\bthis\s+week\b|\bcurrent\s+week\b"
+                           r"|\bchalu\s+athvadiya\b", re.IGNORECASE)
+_LAST_N_RE = re.compile(r"\blast\s+([0-9]{1,3})\s+(day|week|month)s?\b"
+                        r"|\bpast\s+([0-9]{1,3})\s+(day|week|month)s?\b",
+                        re.IGNORECASE)
+_FORTNIGHT_RE = re.compile(r"\bfortnight\b|\blast\s+two\s+weeks\b",
+                           re.IGNORECASE)
+_QUARTER_RE = re.compile(r"\bq([1-4])\b(?:\s*(20[0-9]{2}))?"
+                         r"|\b(this|last|current|previous)\s+quarter\b",
+                         re.IGNORECASE)
+_MTD_RE = re.compile(r"\bmtd\b|\bmonth\s+to\s+date\b", re.IGNORECASE)
+_YTD_RE = re.compile(r"\bytd\b|\byear\s+to\s+date\b", re.IGNORECASE)
+
+
 def resolve_period(question: str, today: date | None = None):
     """The period this question names, as (from, to) with `to` EXCLUSIVE.
 
@@ -119,6 +142,47 @@ def resolve_period(question: str, today: date | None = None):
     if _YESTERDAY_RE.search(q):
         y = today - timedelta(days=1)
         return y.isoformat(), today.isoformat()
+
+    # A "week" is the CALENDAR week, Monday to Monday - not a rolling 7 days.
+    # "last 7 days" is the rolling one and is handled separately below, because
+    # the client means different things by the two.
+    if _LAST_WEEK_RE.search(q):
+        mon = today - timedelta(days=today.weekday() + 7)
+        return mon.isoformat(), (mon + timedelta(days=7)).isoformat()
+    if _THIS_WEEK_RE.search(q):
+        mon = today - timedelta(days=today.weekday())
+        return mon.isoformat(), (mon + timedelta(days=7)).isoformat()
+    if _FORTNIGHT_RE.search(q):
+        return (today - timedelta(days=14)).isoformat(), today.isoformat()
+
+    m = _LAST_N_RE.search(q)
+    if m:
+        n = int(m.group(1) or m.group(3))
+        unit = (m.group(2) or m.group(4)).lower()
+        if 0 < n <= 400:
+            days = n * (1 if unit == "day" else 7 if unit == "week" else 31)
+            return (today - timedelta(days=days)).isoformat(), today.isoformat()
+
+    m = _QUARTER_RE.search(q)
+    if m:
+        if m.group(1):                      # "Q3", optionally "Q3 2026"
+            qn, yr = int(m.group(1)), int(m.group(2) or today.year)
+        else:                               # "this quarter" / "last quarter"
+            qn, yr = (today.month - 1) // 3 + 1, today.year
+            if m.group(3).lower() in ("last", "previous"):
+                qn -= 1
+                if qn == 0:
+                    qn, yr = 4, yr - 1
+        start = date(yr, 3 * (qn - 1) + 1, 1)
+        end = date(yr + 1, 1, 1) if qn == 4 else date(yr, 3 * qn + 1, 1)
+        return start.isoformat(), end.isoformat()
+
+    if _MTD_RE.search(q):
+        return (date(today.year, today.month, 1).isoformat(),
+                (today + timedelta(days=1)).isoformat())
+    if _YTD_RE.search(q):
+        return (date(today.year, 1, 1).isoformat(),
+                (today + timedelta(days=1)).isoformat())
 
     if _LAST_MONTH_RE.search(q):
         y, mo = ((today.year - 1, 12) if today.month == 1
@@ -184,6 +248,12 @@ from app.agent.lab_gate import (            # noqa: E402  (after the docstring)
 # so "department MFG - 1" becomes "MFG 1", which reports.resolve_department
 # does understand. Month names are in here too: "july month report of
 # department MFG - 1" must not offer "july" as a candidate department.
+# NOTE 2026-09-05: "polish" and "data" were REMOVED from this set. They are
+# parts of real department names (Polish Checker, VL Polish Checker, Helium
+# Polish, Data Entry) and stripping them made those four unreachable - and
+# worse, reduced "Brooter Polish" to "Brooter", a different department.
+# gia/hrd/igi STAY: those words mean the LAB in almost every question, and
+# treating them as departments would hijack lab_results.
 _FILLER = frozenset({
     "give", "me", "my", "provide", "show", "get", "please", "want", "need",
     "report", "reports", "reporting", "summary", "detail", "details", "data",
@@ -191,7 +261,7 @@ _FILLER = frozenset({
     "last", "past", "previous", "prev", "this", "current", "month", "months",
     "year", "years", "week", "day", "days",
     "employee", "employees", "worker", "workers", "karigar", "wise",
-    "results", "result", "gia", "hrd", "igi", "lab", "polished", "polish",
+    "results", "result", "gia", "hrd", "igi", "lab", "polish",
     "department", "departments", "dept", "vibhag",
     "nu", "no", "na", "ni", "ma", "aapo", "kadho", "joie", "batavo", "che",
     "chhe", "ketla", "ketlu", "aa", "gaya", "gai", "mahine", "mahina", "varsh",
@@ -213,6 +283,45 @@ _DEPT_HINT_RE = re.compile(
 )
 
 
+# Departments that EXIST in tblDepartMent but have no rows in tblEmployee.
+# resolve_department reads tblEmployee, so it cannot see these at all - and the
+# window fallback then resolves a SHORTER name that does exist, answering about
+# different people. Naming one of these must DECLINE, not degrade.
+_DEPT_CACHE = {}
+
+
+def _department_candidates():
+    """[(name, employs_nobody)] for every department in the database.
+
+    tblDepartMent is the full list; resolve_department only ever sees the
+    subset that appears in tblEmployee, which is why a staffless department
+    used to degrade into a shorter staffed one instead of declining.
+    """
+    if _DEPT_CACHE:
+        return _DEPT_CACHE.get("rows", [])
+    from app.database.runner import run_select
+
+    sq = lambda v: "".join(ch for ch in (v or "").lower() if ch.isalnum())
+    try:
+        a = run_select("SELECT DISTINCT Name AS n FROM tblDepartMent WITH (NOLOCK) "
+                       "WHERE Name IS NOT NULL AND Name <> ''", max_rows=500)
+        b = run_select("SELECT DISTINCT DepartMentName AS n FROM tblEmployee "
+                       "WITH (NOLOCK) WHERE DepartMentName IS NOT NULL "
+                       "AND DepartMentName <> ''", max_rows=500)
+        if not (a.get("ok") and b.get("ok")):
+            return []
+        staffed = {sq(r["n"]): r["n"] for r in b["rows"] if r.get("n")}
+        rows = [(n, False) for n in staffed.values()]
+        for r in a["rows"]:
+            nm = r.get("n")
+            if nm and sq(nm) not in staffed:
+                rows.append((nm.strip(), True))
+    except Exception:
+        rows = []
+    _DEPT_CACHE["rows"] = rows
+    return rows
+
+
 def department_in(question: str):
     """(resolved department, a department was NAMED).
 
@@ -228,6 +337,38 @@ def department_in(question: str):
     q = question or ""
     if not _DEPT_HINT_RE.search(q):
         return None, False
+
+    # A DEPARTMENT NAME, MATCHED WHOLE, BEFORE ANY TOKENISING.
+    # Tokenising strips filler, and a filler word inside a department name
+    # ("Polish Checker") destroys the name before it can be matched. Looking
+    # for the longest known name as a literal substring is immune to that.
+    sq = lambda v: "".join(ch for ch in (v or "").lower() if ch.isalnum())
+    qsq = sq(q)
+    # THE LONGEST DEPARTMENT NAME IN THE QUESTION WINS - staffed or not.
+    #
+    # Matched with word boundaries, NOT on a squashed string: squashing
+    # "report of Dhar" to "reportofdhar" makes the department "FDhar" appear
+    # out of "of"+"Dhar", and "Brooter" appear inside "Brooter Polish".
+    # Each name becomes a pattern whose alphanumeric runs may be separated by
+    # anything, so "MFG - 1", "mfg-1" and "MFG 1" all match the one department.
+    #
+    # If the longest match is a department that employs NOBODY, decline: no
+    # recipe can answer about it, and falling back to a shorter name the user
+    # did not type is how "Brooter Polish" became "Brooter" - a different
+    # department with different people.
+    best_name, best_len, best_dead = None, 0, False
+    for cand, dead in _department_candidates():
+        runs = [t for t in re.split(r"[^A-Za-z0-9]+", cand) if t]
+        if not runs:
+            continue
+        pat = (r"(?<![A-Za-z0-9])" + r"[^A-Za-z0-9]*".join(re.escape(t) for t in runs)
+               + r"(?![A-Za-z0-9])")
+        if re.search(pat, q, re.IGNORECASE):
+            n = sum(len(t) for t in runs)
+            if n > best_len:
+                best_name, best_len, best_dead = cand, n, dead
+    if best_name is not None:
+        return (None, True) if best_dead else (best_name, True)
 
     # DECIMALS FIRST. Splitting on non-alphanumerics turns "0.80" into the two
     # tokens "0" and "80", which then join a neighbouring word into windows
@@ -525,7 +666,7 @@ _EMP_NAME_RE = re.compile(r"\bemplo?y?ee\b[\s:]*"
 
 _NOT_A_NAME = frozenset({
     "code", "id", "ids", "name", "names", "wise", "report", "reports",
-    "list", "details", "detail", "data", "for", "of", "the", "who",
+    "list", "details", "detail", "for", "of", "the", "who",
 })
 
 

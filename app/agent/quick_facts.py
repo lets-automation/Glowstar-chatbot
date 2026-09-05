@@ -450,13 +450,45 @@ def _recency_note(fact, rows, scope) -> str:
             f"real figures.")
 
 
+# A NEGATED QUESTION ASKS FOR THE COMPLEMENT, AND EVERY FACT HERE IS A SCALAR.
+#
+# Audit 2026-09-05. "how many packets are NOT on jangad?" matched the on_jangad
+# trigger and answered 1,072 - the packets that ARE on jangad. The true answer
+# is 172,233 - 1,072 = 171,161. Off by 160x, stated with full confidence, no
+# error anywhere. Same for "not out on memo" and "not on hold".
+#
+# A scalar fact cannot answer a complement, and inverting it here would be
+# guessing at what the user meant by "not" (not on jangad = in stock? finished?
+# never issued?). So a negated question DECLINES and falls through to the
+# normal path, which can ask or reason about it.
+#
+# NO BACKSLASHES in this pattern - see the note in query_rules.py; a literal
+# [b] in this project has twice become a 0x08 BACKSPACE byte.
+_NEGATED_RE = re.compile(
+    r"(?<![a-z])(?:not|isn't|aren't|never|except|excluding|other than|"
+    r"apart from|besides|without)(?![a-z])"
+    r"|(?<![a-z])(?:nathi|nahi|nai)(?![a-z])",       # Gujlish "not"
+    re.IGNORECASE,
+)
+
+
+def is_negated(question: str) -> bool:
+    """True when the question asks for the COMPLEMENT of a fact."""
+    return bool(_NEGATED_RE.search(question or ""))
+
+
 def match(question: str) -> dict | None:
     """The fact this question asks for, or None.
 
     Returns {"fact": key, "needs": "period"|"kapan"|""}. The ROUTER resolves
     the scope - keeping period and kapan parsing in one place there rather than
     duplicating it here.
+
+    A NEGATED question never matches: every fact here is a scalar and would
+    answer the opposite of what was asked.
     """
+    if is_negated(question):
+        return None
     for fact in FACTS:
         if fact.applies(question or ""):
             return {"fact": fact.key, "needs": fact.needs}
